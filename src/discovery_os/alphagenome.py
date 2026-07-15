@@ -193,3 +193,37 @@ class AlphaGenomeClient:
 def evaluate_genomic_candidates(candidates: Iterable[VariantCandidate], *, api_key: str | None = None) -> list[AlphaGenomeEvaluation]:
     """Evaluate and rank a batch without ever persisting the API key."""
     return AlphaGenomeClient(api_key).evaluate_many(candidates)
+
+
+def build_alphagenome_from_environment(*, required: bool = False) -> AlphaGenomeClient | None:
+    """Build the optional client from ``ALPHAGENOME_API_KEY``.
+
+    ``required=False`` is intended for mixed material/genomic runs: absence
+    of the key disables only the genomic branch instead of breaking the run.
+    """
+    key = os.environ.get("ALPHAGENOME_API_KEY", "").strip()
+    if not key and not required:
+        return None
+    return AlphaGenomeClient(key)
+
+
+class GenomicEvaluationPipeline:
+    """Deterministic intermediate evaluation stage for a candidate batch."""
+
+    def __init__(self, *, client: AlphaGenomeClient | None = None, cross_checkers: Iterable[Any] = ()) -> None:
+        self.client = client or build_alphagenome_from_environment(required=True)
+        self.cross_checkers = tuple(cross_checkers)
+
+    def run(self, candidates: Iterable[VariantCandidate]) -> list[dict[str, Any]]:
+        candidate_list = list(candidates)
+        alpha_rows = {row.candidate_id: row.as_dict() for row in self.client.evaluate_many(candidate_list)}
+        for checker in self.cross_checkers:
+            for candidate, check in zip(candidate_list, checker(candidate_list)):
+                row = alpha_rows[candidate.candidate_id]
+                row.setdefault("cross_checks", []).append(check)
+                if isinstance(check, Mapping) and isinstance(check.get("effect"), (int, float)):
+                    effect = float(check["effect"])
+                    alpha = row.get("expression_change")
+                    if isinstance(alpha, (int, float)):
+                        row["model_disagreement"] = abs(float(alpha) - effect)
+        return sorted(alpha_rows.values(), key=lambda row: float(row.get("priority_score") or 0.0), reverse=True)

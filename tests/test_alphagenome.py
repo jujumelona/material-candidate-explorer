@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from discovery_os.alphagenome import (
     AlphaGenomeClient,
+    GenomicEvaluationPipeline,
     GenomicMode,
     VariantCandidate,
 )
@@ -45,3 +46,18 @@ def test_fake_model_variant_evaluation_is_rankable():
     assert result.chromatin_change == 1.0
     assert result.provenance["api_key"] == "runtime_only"
 
+
+def test_pipeline_runs_alpha_then_optional_cross_check():
+    output = SimpleNamespace(rna_seq=SimpleNamespace(
+        reference=SimpleNamespace(values=[0.0]),
+        alternate=SimpleNamespace(values=[2.0]),
+    ))
+    model = SimpleNamespace(predict_variant=lambda **kwargs: output)
+    pipeline = GenomicEvaluationPipeline(
+        client=AlphaGenomeClient(model=model),
+        cross_checkers=[lambda rows: [{"effect": 1.0} for _ in rows]],
+    )
+    row = pipeline.run([candidate()])[0]
+    assert row["status"] == "success"
+    assert row["cross_checks"] == [{"effect": 1.0}]
+    assert row["model_disagreement"] == 1.0
