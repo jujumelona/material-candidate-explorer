@@ -51,6 +51,11 @@ Actual candidate selection is performed by the evidence store, deterministic exp
 
 ## Quick start
 
+## Interactive notebook
+
+- [View the notebook on GitHub](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
+- [Open the notebook in Google Colab](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
+
 Use Python 3.11 or 3.12 on Windows PowerShell:
 
 ~~~powershell
