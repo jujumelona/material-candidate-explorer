@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "source_revision": "4a16c68a7da707c521019067dec51c227c10de45",
+  "model_version": "QHNet_w_bias",
+  "dataset_id": "water-dft",
+  "dtype": "float32",
+  "basis": "PBE/def2-SVP with the QHNet transformed orbital order",
+  "hamiltonian_unit": "hartree",
+  "position_unit": "angstrom",
+  "position_scale_to_bohr": 1.8897261258369282,
+  "molecular_charge": 0,
+  "spin_multiplicity": 1,
+  "allowed_atomic_number_sequences": [
+    [8, 1, 1]
+  ]
+}

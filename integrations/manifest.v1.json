@@ -1,0 +1,845 @@
+{
+  "schema_version": "1.0",
+  "manifest_revision": "31d60868f07110d2303651376b4129921a3043c30ba8da82b170f61a9333a607",
+  "generated_at": "2026-07-15T00:00:00+09:00",
+  "resolution_cutoff": "2026-07-14T15:00:00Z",
+  "uv_version": "0.11.28",
+  "huggingface_hub_version": "1.23.0",
+  "profiles": {
+    "core": {
+      "schema_version": "1.0",
+      "description": "Discovery OS, RDKit, tests, and the fusion/API contracts.",
+      "components": ["core"]
+    },
+    "fusion": {
+      "schema_version": "1.0",
+      "description": "Core contracts used to connect a user-trained Unified Scientific Fusion model.",
+      "components": ["core"]
+    },
+    "molecule-modern": {
+      "schema_version": "1.0",
+      "description": "Modern molecular representation and property environments.",
+      "components": ["unimol", "chemprop"]
+    },
+    "molecule-generation": {
+      "schema_version": "1.0",
+      "description": "Open molecular generation environment isolated from predictor stacks.",
+      "components": ["reinvent4"]
+    },
+    "materials-open": {
+      "schema_version": "1.0",
+      "description": "Open crystal generation and materials feature/potential environments.",
+      "components": ["mattergen", "mattersim", "chgnet"]
+    },
+    "biology-open": {
+      "schema_version": "1.0",
+      "description": "Protein, RNA, and cell specialist environments; model terms still apply.",
+      "components": ["boltz", "esm", "rnafm", "scgpt"]
+    },
+    "electronic-open": {
+      "schema_version": "1.0",
+      "description": "Electronic-structure calculation plus a pinned, dataset-scoped QHNet inference sidecar.",
+      "components": ["pyscf", "qhnet-source"]
+    },
+    "uma": {
+      "schema_version": "1.0",
+      "description": "FAIR Chemistry UMA code and gated weight manifest.",
+      "components": ["uma"]
+    },
+    "all-open": {
+      "schema_version": "1.0",
+      "description": "Every publicly downloadable source/package in isolated environments; gated UMA is excluded.",
+      "components": [
+        "mattergen",
+        "unimol",
+        "boltz",
+        "esm",
+        "rnafm",
+        "scgpt",
+        "qhnet-source",
+        "pyscf",
+        "mattersim",
+        "chgnet",
+        "chemprop",
+        "reinvent4"
+      ]
+    },
+    "all": {
+      "schema_version": "1.0",
+      "description": "All public components plus the gated UMA integration; terms and credentials are never auto-accepted.",
+      "components": [
+        "mattergen",
+        "unimol",
+        "boltz",
+        "esm",
+        "rnafm",
+        "scgpt",
+        "qhnet-source",
+        "pyscf",
+        "uma",
+        "mattersim",
+        "chgnet",
+        "chemprop",
+        "reinvent4"
+      ]
+    }
+  },
+  "components": [
+    {
+      "schema_version": "1.0",
+      "component_id": "core",
+      "display_name": "Discovery OS Core and Fusion Contracts",
+      "role": "core",
+      "modalities": [],
+      "platforms": ["windows", "linux", "darwin"],
+      "accelerators": ["cpu", "cuda", "mps"],
+      "dependencies": [],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "local_project",
+        "python": "3.11",
+        "import_name": "discovery_os",
+        "local_path": ".",
+        "constraints": [
+          "pydantic==2.13.4",
+          "requests==2.34.2",
+          "rdkit==2026.3.3",
+          "httpx2==2.6.0",
+          "pytest==9.1.1"
+        ]
+      },
+      "source": null,
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "User-owned workspace code; redistribution terms not declared.",
+        "code_license_url": null
+      },
+      "weights": [],
+      "api": null,
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 2.0,
+        "memory_gb": 4.0,
+        "vram_gb": 0.0
+      },
+      "status": "stable",
+      "notes": ["Fusion diagnostics never become EvidenceRecord entries."]
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "mattergen",
+      "display_name": "MatterGen 1.0.3",
+      "role": "generator",
+      "modalities": ["crystal_material"],
+      "platforms": ["linux"],
+      "accelerators": ["cuda"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.10",
+        "package": "mattergen",
+        "version": "1.0.3",
+        "import_name": "mattergen",
+        "constraints": ["mattersim==1.1.2"],
+        "extra_index_urls": ["https://download.pytorch.org/whl/cu118"],
+        "find_links": ["https://data.pyg.org/whl/torch-2.2.0+cu118.html"]
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/microsoft/mattergen",
+        "revision": "842ffe735f7d06cec89d56aa23d9f001e1124b30",
+        "release": "v1.0.3"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "MIT",
+        "code_license_url": "https://github.com/microsoft/mattergen/blob/v1.0.3/LICENSE",
+        "model_license": "MIT; training/reference datasets retain their own terms.",
+        "model_license_url": "https://huggingface.co/microsoft/mattergen"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "mattergen-checkpoints",
+          "kind": "huggingface",
+          "repository": "microsoft/mattergen",
+          "revision": "ea430eab64b80855029c2941b9fda15f245a771a",
+          "gated": false,
+          "notes": ["Use TRI2024-compatible reference data for new stability evaluation work."]
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "generator-v1",
+        "base_url_env": "MATTERGEN_API_URL",
+        "default_port": 8101
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 25.0,
+        "memory_gb": 16.0,
+        "vram_gb": 16.0
+      },
+      "status": "stable",
+      "notes": ["MatterSim is pinned to 1.1.2 inside this legacy NumPy<2 environment."]
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "unimol",
+      "display_name": "Uni-Mol Tools 0.1.6",
+      "role": "expert",
+      "modalities": ["molecule_2d", "molecule_3d"],
+      "platforms": ["windows", "linux", "darwin"],
+      "accelerators": ["cpu", "cuda", "mps"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.11",
+        "package": "unimol-tools",
+        "version": "0.1.6",
+        "import_name": "unimol_tools"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/deepmodeling/unimol_tools",
+        "revision": "4596596aa8f73eb462d5cc5a921d79966d0465da",
+        "release": "v0.1.6"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "MIT",
+        "code_license_url": "https://github.com/deepmodeling/unimol_tools/blob/v0.1.6/LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "unimol-models",
+          "kind": "huggingface",
+          "repository": "dptech/Uni-Mol-Models",
+          "revision": "9f19c45c718192888a1c8a1c905f69f0755ea502",
+          "gated": false
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "UNIMOL_API_URL",
+        "default_port": 8102
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 8.0,
+        "memory_gb": 8.0,
+        "vram_gb": 6.0
+      },
+      "status": "stable"
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "chgnet",
+      "display_name": "CHGNet 0.4.2",
+      "role": "expert",
+      "modalities": ["crystal_material"],
+      "platforms": ["windows", "linux", "darwin"],
+      "accelerators": ["cpu", "cuda", "mps"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.12",
+        "package": "chgnet",
+        "version": "0.4.2",
+        "import_name": "chgnet"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/CederGroupHub/chgnet",
+        "revision": "8d04abc467630b30cd8349c2fe12eeab10f62171",
+        "release": "v0.4.2"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "BSD-3-Clause",
+        "code_license_url": "https://github.com/CederGroupHub/chgnet/blob/v0.4.2/LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "chgnet-0p3p0-default",
+          "kind": "managed",
+          "gated": false,
+          "notes": ["CHGNet.load() selects the packaged/upstream-managed 0.3.0 checkpoint; record the runtime model name and file hash."]
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "CHGNET_API_URL",
+        "default_port": 8113
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 8.0,
+        "memory_gb": 8.0,
+        "vram_gb": 6.0
+      },
+      "status": "stable",
+      "notes": ["MPtrj predictions use MaterialsProject2020Compatibility-style GGA/GGA+U corrections; do not mix energy conventions silently."]
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "boltz",
+      "display_name": "Boltz 2.2.1",
+      "role": "expert",
+      "modalities": ["protein_structure", "rna_structure", "molecule_3d"],
+      "platforms": ["linux"],
+      "accelerators": ["cpu", "cuda"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.11",
+        "package": "boltz",
+        "version": "2.2.1",
+        "import_name": "boltz",
+        "cuda_extra": "cuda"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/jwohlwend/boltz",
+        "revision": "cb04aeccdd480fd4db707f0bbafde538397fa2ac",
+        "release": "v2.2.1"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "MIT",
+        "code_license_url": "https://github.com/jwohlwend/boltz/blob/v2.2.1/LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "boltz-2-checkpoints",
+          "kind": "huggingface",
+          "repository": "boltz-community/boltz-2",
+          "revision": "6fdef46d763fee7fbb83ca5501ccceff43b85607",
+          "gated": false,
+          "notes": ["The package may also manage its own BOLTZ_CACHE downloads."]
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "BOLTZ_API_URL",
+        "default_port": 8103
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 20.0,
+        "memory_gb": 16.0,
+        "vram_gb": 12.0
+      },
+      "status": "stable"
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "esm",
+      "display_name": "Biohub ESM 3.2.3",
+      "role": "expert",
+      "modalities": ["protein_sequence"],
+      "platforms": ["windows", "linux", "darwin"],
+      "accelerators": ["cpu", "cuda", "mps", "remote"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.12",
+        "package": "esm",
+        "version": "3.2.3",
+        "import_name": "esm"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/Biohub/esm",
+        "revision": "23b084b94f3b5f6fd700ae41f46a2787a9a5c12b",
+        "release": "v3.2.3"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "Cambrian Open License Agreement",
+        "code_license_url": "https://www.evolutionaryscale.ai/policies/cambrian-open-license-agreement",
+        "model_license": "Cambrian Non-Commercial License Agreement for ESM-3 Open Model",
+        "model_license_url": "https://www.evolutionaryscale.ai/policies/cambrian-non-commercial-license-agreement",
+        "requires_acceptance": true,
+        "acceptance_env": "ACCEPT_ESM_LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "esm3-sm-open-v1",
+          "kind": "huggingface",
+          "repository": "biohub/esm3-sm-open-v1",
+          "revision": "47f0545b2b6daf26a93439a3cd610f4f7f3d5478",
+          "gated": false,
+          "acceptance_env": "ACCEPT_ESM_LICENSE"
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "ESM_API_URL",
+        "default_port": 8104
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 18.0,
+        "memory_gb": 16.0,
+        "vram_gb": 16.0
+      },
+      "status": "stable",
+      "notes": ["API usage is governed separately by the provider terms."]
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "rnafm",
+      "display_name": "RNA-FM 0.2.2",
+      "role": "expert",
+      "modalities": ["rna_sequence"],
+      "platforms": ["windows", "linux", "darwin"],
+      "accelerators": ["cpu", "cuda"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.10",
+        "package": "rna-fm",
+        "version": "0.2.2",
+        "import_name": "fm"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/ml4bio/RNA-FM",
+        "revision": "348951516e0963d22bbb33b3c9fc18c89081d38e"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "MIT",
+        "code_license_url": "https://github.com/ml4bio/RNA-FM/blob/main/LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "rnafm-pretrained",
+          "kind": "huggingface",
+          "repository": "cuhkaih/rnafm",
+          "revision": "91d4a46d28d8054a7b429955e8fc0c253ba0afd6",
+          "gated": false
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "RNAFM_API_URL",
+        "default_port": 8105
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 8.0,
+        "memory_gb": 12.0,
+        "vram_gb": 8.0
+      },
+      "status": "research",
+      "notes": ["The full RhoFold ecosystem uses a separate legacy environment."]
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "scgpt",
+      "display_name": "scGPT 0.2.4",
+      "role": "expert",
+      "modalities": ["cell_state"],
+      "platforms": ["windows", "linux", "darwin"],
+      "accelerators": ["cpu", "cuda", "mps"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.11",
+        "package": "scgpt",
+        "version": "0.2.4",
+        "import_name": "scgpt"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/bowang-lab/scGPT",
+        "revision": "0cd3c73779e93e999789d52b4412e6c23baaa02b",
+        "release": "v0.2.4"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "MIT",
+        "code_license_url": "https://github.com/bowang-lab/scGPT/blob/v0.2.4/LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "scgpt-model-zoo",
+          "kind": "manual",
+          "download_url": "https://github.com/bowang-lab/scGPT/blob/v0.2.4/README.md",
+          "gated": false,
+          "notes": ["The official model zoo uses Google Drive. The reviewed adapter requires one selected directory containing args.json, vocab.json, and best_model.pt; launch binds its complete file inventory SHA-256."]
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "SCGPT_API_URL",
+        "default_port": 8106
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 15.0,
+        "memory_gb": 24.0,
+        "vram_gb": 12.0
+      },
+      "status": "research"
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "qhnet-source",
+      "display_name": "QHNet AIRS Pinned Research Runtime",
+      "role": "expert",
+      "modalities": ["electronic_structure"],
+      "platforms": ["linux"],
+      "accelerators": ["cuda"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "github_archive",
+        "python": "3.10",
+        "import_name": "torch",
+        "archive_url": "https://codeload.github.com/DiveLab/AIRS/tar.gz/4a16c68a7da707c521019067dec51c227c10de45",
+        "archive_sha256": "221b693b15decd084bb2595ea924d9b59f75ec72f5f2048d7cc1f27c5c56e528",
+        "archive_size_bytes": 433652423,
+        "archive_subdirectory": "OpenDFT/QHNet",
+        "install_local": false,
+        "constraints": [
+          "torch==2.2.0",
+          "torch-geometric==2.5.3",
+          "torch-scatter==2.1.2",
+          "torch-cluster==1.6.3",
+          "e3nn==0.5.1",
+          "numpy==1.26.4",
+          "scipy==1.12.0",
+          "ase==3.23.0"
+        ],
+        "extra_index_urls": ["https://download.pytorch.org/whl/cu118"],
+        "find_links": ["https://data.pyg.org/whl/torch-2.2.0+cu118.html"]
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/divelab/AIRS",
+        "revision": "4a16c68a7da707c521019067dec51c227c10de45"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "GPL-3.0",
+        "code_license_url": "https://github.com/divelab/AIRS/blob/main/LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "qhnet-md17-models",
+          "kind": "manual",
+          "download_url": "https://github.com/divelab/AIRS/tree/main/OpenDFT/QHNet",
+          "gated": false,
+          "notes": [
+            "Official parameters are linked through Google Drive.",
+            "QHNET_CHECKPOINT_PATH and a strict QHNET_CONFIG_PATH are inseparable and are attested as one bundle."
+          ]
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "QHNET_API_URL",
+        "default_port": 8107
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 8.0,
+        "memory_gb": 8.0,
+        "vram_gb": 8.0
+      },
+      "status": "research",
+      "notes": [
+        "The exact AIRS source is imported by confined file path; it is not installed as a package.",
+        "The compatibility runtime is isolated and pinned. Checkpoints remain dataset-specific manual artifacts."
+      ]
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "pyscf",
+      "display_name": "PySCF 2.13.1",
+      "role": "quantum",
+      "modalities": ["electronic_structure"],
+      "platforms": ["linux", "darwin"],
+      "accelerators": ["cpu"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.11",
+        "package": "pyscf",
+        "version": "2.13.1",
+        "import_name": "pyscf"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/pyscf/pyscf",
+        "revision": "f3754ed5baad778280dba5ad3f4982a8bed0ec2f",
+        "release": "v2.13.1"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "Apache-2.0",
+        "code_license_url": "https://github.com/pyscf/pyscf/blob/v2.13.1/LICENSE"
+      },
+      "weights": [],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "PYSCF_API_URL",
+        "default_port": 8108
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 5.0,
+        "memory_gb": 16.0,
+        "vram_gb": 0.0
+      },
+      "status": "stable",
+      "notes": ["Use WSL2 or Linux on Windows hosts; upstream does not support native Windows."]
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "uma",
+      "display_name": "UMA via fairchem-core 2.21.0",
+      "role": "expert",
+      "modalities": ["crystal_material", "molecule_3d"],
+      "platforms": ["linux"],
+      "accelerators": ["cuda"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.12",
+        "package": "fairchem-core",
+        "version": "2.21.0",
+        "import_name": "fairchem.core"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/facebookresearch/fairchem",
+        "revision": "f47a0a6f0f594ea051b70091304864242df933e1",
+        "release": "fairchem_core-2.21.0"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "MIT",
+        "code_license_url": "https://github.com/facebookresearch/fairchem/blob/fairchem_core-2.21.0/LICENSE.md",
+        "model_license": "FAIR Chemistry License and Acceptable Use Policy",
+        "model_license_url": "https://huggingface.co/facebook/UMA",
+        "requires_acceptance": true,
+        "acceptance_env": "ACCEPT_UMA_LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "uma-s-1p2",
+          "kind": "huggingface",
+          "repository": "facebook/UMA",
+          "revision": "7210de6fe86ad94854b21b881fefbcfdfeab373b",
+          "gated": true,
+          "token_env": "HF_TOKEN",
+          "acceptance_env": "ACCEPT_UMA_LICENSE",
+          "notes": ["Access must be approved on the model card before download."]
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "UMA_API_URL",
+        "default_port": 8109
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 30.0,
+        "memory_gb": 24.0,
+        "vram_gb": 16.0
+      },
+      "status": "stable",
+      "notes": ["Do not combine OMat24 energies with Materials Project corrections without compatibility treatment."]
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "mattersim",
+      "display_name": "MatterSim 1.2.5",
+      "role": "expert",
+      "modalities": ["crystal_material"],
+      "platforms": ["linux"],
+      "accelerators": ["cpu", "cuda"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.12",
+        "package": "mattersim",
+        "version": "1.2.5",
+        "import_name": "mattersim"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/microsoft/mattersim",
+        "revision": "40a1eb8f1189a53af310957b4f2c5dfbfe68d647",
+        "release": "v1.2.5"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "MIT",
+        "code_license_url": "https://github.com/microsoft/mattersim/blob/v1.2.5/LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "mattersim-default",
+          "kind": "managed",
+          "gated": false,
+          "notes": ["The upstream package downloads 1M/5M checkpoints on first use."]
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "MATTERSIM_API_URL",
+        "default_port": 8110
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 15.0,
+        "memory_gb": 16.0,
+        "vram_gb": 10.0
+      },
+      "status": "stable"
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "chemprop",
+      "display_name": "Chemprop 2.2.4",
+      "role": "predictor",
+      "modalities": ["molecule_2d"],
+      "platforms": ["windows", "linux", "darwin"],
+      "accelerators": ["cpu", "cuda", "mps"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "pypi",
+        "python": "3.11",
+        "package": "chemprop",
+        "version": "2.2.4",
+        "import_name": "chemprop"
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/chemprop/chemprop",
+        "revision": "7033cac6ebc1a66f885705c7fa3e2cb960f96e49",
+        "release": "v2.2.4"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "MIT",
+        "code_license_url": "https://github.com/chemprop/chemprop/blob/v2.2.4/LICENSE.txt"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "chemprop-task-checkpoint",
+          "kind": "manual",
+          "download_url": "https://chemprop.readthedocs.io/en/latest/tutorial/python/predicting.html",
+          "gated": false,
+          "notes": ["Supply a task-specific .ckpt, record its SHA-256 in CHEMPROP_WEIGHT_REVISION, and declare property names/units."]
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "expert-feature-v1",
+        "base_url_env": "CHEMPROP_API_URL",
+        "default_port": 8111
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 8.0,
+        "memory_gb": 8.0,
+        "vram_gb": 6.0
+      },
+      "status": "stable",
+      "notes": ["Chemprop is a training framework; a task-specific checkpoint must be supplied and versioned."]
+    },
+    {
+      "schema_version": "1.0",
+      "component_id": "reinvent4",
+      "display_name": "REINVENT4 v4.8",
+      "role": "generator",
+      "modalities": ["molecule_2d"],
+      "platforms": ["linux", "darwin"],
+      "accelerators": ["cpu", "cuda", "mps"],
+      "dependencies": ["core"],
+      "install": {
+        "schema_version": "1.0",
+        "kind": "github_archive",
+        "python": "3.11",
+        "import_name": "reinvent",
+        "archive_url": "https://codeload.github.com/MolecularAI/REINVENT4/tar.gz/80a8d21aefd9c0d3ec806377522effb30cfca12a",
+        "archive_sha256": "fe9d0636282a203a8211a5c9184e71c172acf387a9d6fdb9657ebfb319c85baf",
+        "archive_size_bytes": 159243713,
+        "install_local": true,
+        "extra_index_urls": ["https://download.pytorch.org/whl/cu126"]
+      },
+      "source": {
+        "schema_version": "1.0",
+        "repository": "https://github.com/MolecularAI/REINVENT4",
+        "revision": "80a8d21aefd9c0d3ec806377522effb30cfca12a",
+        "release": "v4.8"
+      },
+      "license": {
+        "schema_version": "1.0",
+        "code_license": "Apache-2.0",
+        "code_license_url": "https://github.com/MolecularAI/REINVENT4/blob/v4.8/LICENSE"
+      },
+      "weights": [
+        {
+          "schema_version": "1.0",
+          "weight_id": "reinvent4-priors",
+          "kind": "manual",
+          "download_url": "https://github.com/MolecularAI/REINVENT4/blob/v4.8/README.md",
+          "gated": false,
+          "notes": ["Select an official Zenodo prior and record its DOI and SHA-256 before use."]
+        }
+      ],
+      "api": {
+        "schema_version": "1.0",
+        "protocol": "generator-v1",
+        "base_url_env": "REINVENT_API_URL",
+        "default_port": 8112
+      },
+      "resources": {
+        "schema_version": "1.0",
+        "storage_gb": 20.0,
+        "memory_gb": 16.0,
+        "vram_gb": 12.0
+      },
+      "status": "stable",
+      "notes": ["Torch 2.12 is isolated from all other specialist environments."]
+    }
+  ]
+}

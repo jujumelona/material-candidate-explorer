@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+runs/
+artifacts/
+.discovery_cache/
+.discovery/
+
+# Credentials and local environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.token
+*credentials*
+*secrets*
+
+# Model weights, checkpoints, caches, and downloaded archives
+checkpoints/
+weights/
+models/
+cache/
+inventories/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.onnx
+*.bin
+*.zip
+*.tar
+*.tar.gz
+*.whl
+
+# Runtime logs and local sidecar state
+*.log
+*.freeze.txt
+sidecars.env.ps1
+sidecars.env.sh
