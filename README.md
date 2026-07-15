@@ -1,5 +1,7 @@
 # Material Candidate Explorer
 
+[![Open in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb) [![View Notebook](https://img.shields.io/badge/Notebook-GitHub-181717?logo=github)](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
+
 Material Candidate Explorer is a model-agnostic orchestration engine for exploring and prioritizing material candidates across chemistry, crystal materials, superconductors, batteries, catalysts, polymers, and medicinal chemistry.
 
 It connects isolated expert and generator sidecars through strict JSON contracts. Expert properties, units, status, and provenance are preserved; incompatible embeddings are never averaged into a fake scientific score.
