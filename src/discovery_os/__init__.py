@@ -1,6 +1,7 @@
 """Evidence-driven, model-agnostic material discovery orchestration."""
 
 from .engine import DiscoveryEngine
+from .alphagenome import AlphaGenomeClient, AlphaGenomeEvaluation, GenomicMode, VariantCandidate, evaluate_genomic_candidates
 from .evidence_fusion import EvidenceDrivenFusionBackend
 from .configured_fusion import (
     build_fusion_backend_from_environment,
@@ -78,6 +79,8 @@ from .protocols import DiscoveryModel
 __version__ = "0.4.0"
 
 __all__ = [
+    "AlphaGenomeClient",
+    "AlphaGenomeEvaluation",
     "AdaptiveGenerationScheduler",
     "CandidatePool",
     "CandidatePoolEntry",
@@ -122,6 +125,7 @@ __all__ = [
     "FusionSearchRunner",
     "FusionSearchStatus",
     "GenerationControlScheduler",
+    "GenomicMode",
     "HttpExpertEncoder",
     "HttpFusionCandidateGenerator",
     "LocalDiscoveryModel",
@@ -147,6 +151,8 @@ __all__ = [
     "SelectedCandidate",
     "StoredExpertEvidence",
     "WorkspaceBenchmarkRunner",
+    "VariantCandidate",
+    "evaluate_genomic_candidates",
     "build_fusion_backend_from_environment",
     "build_generator_from_environment",
     "build_generators_from_environment",
