@@ -49,3 +49,23 @@ def candidate_content_hash(candidate: Any) -> str:
     if not payload.get("parent_candidate_refs"):
         payload.pop("parent_candidate_refs", None)
     return stable_hash(payload)
+
+
+def crystal_fingerprint(structure: Any, **kwargs: Any) -> dict[str, Any]:
+    """Return a crystallographic fingerprint without changing candidate hashing.
+
+    pymatgen remains an optional dependency and is imported only when this helper
+    is called.  See :mod:`discovery_os.crystal_identity` for tolerance controls.
+    """
+
+    from .crystal_identity import crystal_structure_fingerprint
+
+    return crystal_structure_fingerprint(structure, **kwargs)
+
+
+def canonical_structure_hash(structure: Any, **kwargs: Any) -> str:
+    """Return the scientific crystal-identity hash for a periodic structure."""
+
+    from .crystal_identity import canonical_structure_hash as _canonical_structure_hash
+
+    return _canonical_structure_hash(structure, **kwargs)

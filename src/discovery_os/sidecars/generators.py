@@ -14,6 +14,14 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+from discovery_os.crystal_identity import (
+    CrystalIdentityError,
+    InvalidCrystalGeometryError,
+    PymatgenRequiredError,
+    canonicalize_crystal_structure,
+    exact_file_hash,
+    group_crystal_structures,
+)
 from discovery_os.fusion_schemas import FusionGenerationRequest
 from discovery_os.schemas import CandidateRepresentation, RepresentationKind
 
@@ -57,6 +65,11 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
         objective_map: dict[str, str] | None = None,
         guidance_max: float = 4.0,
         max_cif_bytes: int = 20_000,
+        deduplication_max_generation_rounds: int = 4,
+        minimum_distance_angstrom: float = 0.5,
+        matcher_ltol: float = 0.2,
+        matcher_stol: float = 0.3,
+        matcher_angle_tol: float = 5.0,
         device: str = "auto",
     ) -> None:
         super().__init__(device=device)
@@ -64,11 +77,24 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
             raise ValueError("pretrained_name must not be blank")
         if not 0.0 <= guidance_max <= 100.0:
             raise ValueError("guidance_max must be between 0 and 100")
+        if not 1 <= deduplication_max_generation_rounds <= 16:
+            raise ValueError("deduplication_max_generation_rounds must be between 1 and 16")
+        if not 0.0 < minimum_distance_angstrom <= 10.0:
+            raise ValueError("minimum_distance_angstrom must be between 0 and 10")
+        if not 0.0 < matcher_ltol <= 1.0 or not 0.0 < matcher_stol <= 1.0:
+            raise ValueError("StructureMatcher length/site tolerances must be between 0 and 1")
+        if not 0.0 < matcher_angle_tol <= 180.0:
+            raise ValueError("matcher_angle_tol must be between 0 and 180")
         self.pretrained_name = pretrained_name
         self.checkpoint_path = checkpoint_path
         self.objective_map = dict(objective_map or {})
         self.guidance_max = guidance_max
         self.max_cif_bytes = max_cif_bytes
+        self.deduplication_max_generation_rounds = deduplication_max_generation_rounds
+        self.minimum_distance_angstrom = minimum_distance_angstrom
+        self.matcher_ltol = matcher_ltol
+        self.matcher_stol = matcher_stol
+        self.matcher_angle_tol = matcher_angle_tol
         self._inference_lock = threading.Lock()
         self.checkpoint_inventory_sha256 = (
             directory_inventory_sha256(checkpoint_path) if checkpoint_path else None
@@ -136,53 +162,213 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
             "diversity_strength; those controls were preserved in provenance but not applied.",
             *condition_warnings,
         ]
+        raw_records: list[dict[str, Any]] = []
+        rejected_details: list[str] = []
+        raw_structure_count = 0
+        parsed_structure_count = 0
+        geometry_rejected_count = 0
+        canonicalization_rejected_count = 0
+        exact_file_hashes: set[str] = set()
+        generation_rounds = 0
+        grouping = group_crystal_structures(())
         with tempfile.TemporaryDirectory(prefix="discovery-mattergen-") as temporary:
             root = Path(temporary)
-            try:
-                with self._inference_lock:
-                    _seed_mattergen(request.run_config.effective_generator_seed)
-                    generator.properties_to_condition_on = conditions
-                    generator.diffusion_guidance_factor = (
-                        round(controls.alpha * self.guidance_max, 8) if conditions else 0.0
+            with self._inference_lock:
+                generator.properties_to_condition_on = conditions
+                generator.diffusion_guidance_factor = (
+                    round(controls.alpha * self.guidance_max, 8) if conditions else 0.0
+                )
+                while (
+                    len(grouping.groups) < count
+                    and generation_rounds < self.deduplication_max_generation_rounds
+                ):
+                    missing = count - len(grouping.groups)
+                    round_index = generation_rounds
+                    round_seed = (
+                        request.run_config.effective_generator_seed + round_index
                     )
-                    structures = generator.generate(
-                        batch_size=count,
-                        num_batches=1,
-                        output_dir=str(root / "output"),
-                    )
-            except Exception as exc:
-                raise ModelExecutionError(
-                    f"MatterGen generation failed: {type(exc).__name__}: {exc}"
-                ) from exc
-        if len(structures) != count:
+                    try:
+                        _seed_mattergen(round_seed)
+                        structures = generator.generate(
+                            batch_size=missing,
+                            num_batches=1,
+                            output_dir=str(root / f"output-{round_index}"),
+                        )
+                    except Exception as exc:
+                        raise ModelExecutionError(
+                            f"MatterGen generation failed: {type(exc).__name__}: {exc}"
+                        ) from exc
+                    generation_rounds += 1
+                    if len(structures) != missing:
+                        raise ModelOutputError(
+                            f"MatterGen returned {len(structures)} structures, expected {missing} "
+                            f"in generation round {generation_rounds}"
+                        )
+                    for structure in structures:
+                        raw_index = raw_structure_count
+                        raw_structure_count += 1
+                        try:
+                            raw_cif = pymatgen_to_cif(
+                                structure,
+                                max_bytes=self.max_cif_bytes,
+                            )
+                        except ModelOutputError as exc:
+                            rejected_details.append(
+                                f"raw structure {raw_index} could not be serialized/parsed: {exc}"
+                            )
+                            continue
+                        parsed_structure_count += 1
+                        source_exact_sha256 = exact_file_hash(raw_cif)
+                        exact_file_hashes.add(source_exact_sha256)
+                        try:
+                            canonical = canonicalize_crystal_structure(
+                                structure,
+                                minimum_distance_angstrom=self.minimum_distance_angstrom,
+                                max_cif_bytes=self.max_cif_bytes,
+                            )
+                        except PymatgenRequiredError as exc:
+                            raise OptionalDependencyError(str(exc)) from exc
+                        except InvalidCrystalGeometryError as exc:
+                            geometry_rejected_count += 1
+                            rejected_details.append(
+                                f"raw structure {raw_index} rejected: {type(exc).__name__}: {exc}"
+                            )
+                            continue
+                        except CrystalIdentityError as exc:
+                            canonicalization_rejected_count += 1
+                            rejected_details.append(
+                                f"raw structure {raw_index} rejected: {type(exc).__name__}: {exc}"
+                            )
+                            continue
+                        raw_records.append(
+                            {
+                                "raw_index": raw_index,
+                                "generation_round": generation_rounds,
+                                "generation_seed": round_seed,
+                                "raw_cif": raw_cif,
+                                "source_exact_sha256": source_exact_sha256,
+                                "canonical": canonical,
+                            }
+                        )
+                    try:
+                        grouping = group_crystal_structures(
+                            tuple(item["canonical"] for item in raw_records),
+                            ltol=self.matcher_ltol,
+                            stol=self.matcher_stol,
+                            angle_tol=self.matcher_angle_tol,
+                        )
+                    except PymatgenRequiredError as exc:
+                        raise OptionalDependencyError(str(exc)) from exc
+                    except CrystalIdentityError as exc:
+                        raise ModelOutputError(
+                            f"MatterGen crystal deduplication failed: {exc}"
+                        ) from exc
+        unique_count = len(grouping.groups)
+        raw_geometry_valid_count = len(raw_records)
+        # The public funnel reports geometry-valid candidates after the
+        # crystallographic grouping stage.  The pre-dedup count is retained
+        # separately for auditability.
+        geometry_valid_count = unique_count
+        duplicate_count = raw_geometry_valid_count - unique_count
+        if unique_count != count:
             raise ModelOutputError(
-                f"MatterGen returned {len(structures)} structures, expected {count}"
+                "MatterGen could not satisfy the requested crystallographically unique "
+                f"candidate count after {generation_rounds} generation rounds: "
+                f"requested_samples={count}, raw_model_structures={raw_structure_count}, "
+                f"parsed_structures={parsed_structure_count}, "
+                f"exact_file_unique={len(exact_file_hashes)}, "
+                f"raw_geometry_valid={raw_geometry_valid_count}, "
+                f"geometry_valid={geometry_valid_count}, "
+                f"crystallographically_unique={unique_count}, duplicates_removed="
+                f"{duplicate_count}"
             )
-        cifs = [
-            (f"generated-{index}.cif", pymatgen_to_cif(structure, max_bytes=self.max_cif_bytes))
-            for index, structure in enumerate(structures)
-        ]
+        funnel = {
+            "requested_samples": count,
+            "raw_model_structures": raw_structure_count,
+            "parsed_structures": parsed_structure_count,
+            "exact_file_unique": len(exact_file_hashes),
+            "crystallographically_unique": unique_count,
+            "geometry_valid": geometry_valid_count,
+            "raw_geometry_valid": raw_geometry_valid_count,
+            "requested_unique_candidates": count,
+            "parse_rejected": raw_structure_count - parsed_structure_count,
+            "geometry_rejected": geometry_rejected_count,
+            "canonicalization_rejected": canonicalization_rejected_count,
+            "duplicates_removed": duplicate_count,
+            "generation_rounds": generation_rounds,
+        }
+        warnings.append(
+            "MatterGen crystal identity funnel: "
+            + ", ".join(f"{key}={value}" for key, value in funnel.items())
+            + "."
+        )
+        if rejected_details:
+            warnings.extend(rejected_details[:3])
+            if len(rejected_details) > 3:
+                warnings.append(
+                    f"{len(rejected_details) - 3} additional invalid raw structures were rejected"
+                )
+        if duplicate_count:
+            warnings.append(
+                f"StructureMatcher removed {duplicate_count} crystallographic duplicate(s); "
+                "deterministic replacement generation retained the requested unique count."
+            )
+        representatives = [raw_records[item.representative_index] for item in grouping.groups]
         candidates = tuple(
             GeneratedCandidateData(
                 name=f"MatterGen candidate {index + 1}",
                 representations=(
                     CandidateRepresentation(
                         kind=RepresentationKind.CIF,
-                        value=cif,
+                        # Preserve the direct MatterGen structure serialization as
+                        # the authoritative candidate.  Canonicalization is used
+                        # for identity and deduplication, not to silently replace
+                        # the generated geometry delivered to downstream experts.
+                        value=record["raw_cif"],
                         media_type="chemical/x-cif",
                         format_version="CIF",
                         canonical=False,
-                        metadata={"source_entry": name},
+                        metadata={
+                            "source_entry": f"generated-{record['raw_index']}.cif",
+                            "source_exact_sha256": record["source_exact_sha256"],
+                            "canonical_structure_sha256": record["canonical"].structure_hash,
+                            "identity_canonicalization": "primitive-niggli-v1",
+                        },
                     ),
                 ),
                 attributes={
                     "mattergen_pretrained_name": self.pretrained_name,
                     "conditions": conditions,
                     "generation_controls": controls.model_dump(mode="json"),
+                    "crystal_identity": {
+                        "canonical_structure_sha256": record["canonical"].structure_hash,
+                        "source_atom_count": record["canonical"].source_atom_count,
+                        "primitive_atom_count": record["canonical"].primitive_atom_count,
+                        "conventional_atom_count": record[
+                            "canonical"
+                        ].conventional_atom_count,
+                        "space_group_symbol": record["canonical"].space_group_symbol,
+                        "space_group_number": record["canonical"].space_group_number,
+                    },
+                    "generation_funnel": funnel,
+                    "generation_funnel_hashes": {
+                        # Structured hashes let an orchestrator compute exact
+                        # uniqueness across independently generated profiles
+                        # without reopening temporary MatterGen output files.
+                        "exact_file_sha256s": sorted(exact_file_hashes),
+                    },
                 },
-                provenance={"adapter": "mattergen-crystal-generator-v1"},
+                provenance={
+                    "adapter": "mattergen-crystal-generator-v1",
+                    "raw_generation_stream_position": record["raw_index"],
+                    "raw_generation_round": record["generation_round"],
+                    "raw_generation_seed": record["generation_seed"],
+                    "source_exact_sha256": record["source_exact_sha256"],
+                    "canonical_structure_sha256": record["canonical"].structure_hash,
+                    "deduplication": funnel,
+                },
             )
-            for index, (name, cif) in enumerate(cifs)
+            for index, record in enumerate(representatives)
         )
         return GeneratedBatch(candidates=candidates, warnings=tuple(warnings))
 
@@ -194,6 +380,11 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
             "objective_map": dict(sorted(self.objective_map.items())),
             "guidance_max": self.guidance_max,
             "max_cif_bytes": self.max_cif_bytes,
+            "deduplication_max_generation_rounds": self.deduplication_max_generation_rounds,
+            "minimum_distance_angstrom": self.minimum_distance_angstrom,
+            "matcher_ltol": self.matcher_ltol,
+            "matcher_stol": self.matcher_stol,
+            "matcher_angle_tol": self.matcher_angle_tol,
             "requested_device": self._requested_device,
         }
 

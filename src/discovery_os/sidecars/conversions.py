@@ -257,6 +257,63 @@ def atom_entity_ids(atoms_or_structure: Any) -> tuple[str, ...]:
     return tuple(f"atom:{index}" for index in range(count))
 
 
+def periodic_atom_entity_ids(atoms_or_structure: Any) -> tuple[str, ...]:
+    """Bind periodic atom rows by species and wrapped fractional position.
+
+    Index-only labels cannot detect a parser that reorders sites.  MatterSim,
+    CHGNet, and UMA use these coordinate-bearing IDs so downstream force
+    comparisons must explicitly realign the same physical sites.
+    """
+
+    try:
+        if callable(getattr(atoms_or_structure, "get_scaled_positions", None)):
+            symbols = [str(item) for item in atoms_or_structure.get_chemical_symbols()]
+            coordinates = atoms_or_structure.get_scaled_positions(wrap=True)
+        else:
+            sites = list(atoms_or_structure)
+            symbols = []
+            coordinates = []
+            for site in sites:
+                specie = getattr(site, "specie", None)
+                symbol = getattr(specie, "symbol", None)
+                if symbol is None:
+                    raise ValueError("periodic site is not an ordered elemental species")
+                symbols.append(str(symbol))
+                coordinates.append(site.frac_coords)
+    except Exception as exc:
+        raise ModelOutputError(
+            "periodic structure does not expose species and fractional coordinates"
+        ) from exc
+    if not symbols or len(symbols) != len(coordinates):
+        raise ModelOutputError("periodic atom identity has an invalid site count")
+
+    identifiers: list[str] = []
+    occurrences: dict[str, int] = {}
+    for symbol, coordinate in zip(symbols, coordinates, strict=True):
+        values = [_wrapped_fractional_coordinate(item) for item in coordinate]
+        if len(values) != 3:
+            raise ModelOutputError("periodic atom identity requires three coordinates")
+        base = f"site:{symbol}:" + ":".join(f"{item:.8f}" for item in values)
+        occurrence = occurrences.get(base, 0)
+        occurrences[base] = occurrence + 1
+        identifiers.append(base if occurrence == 0 else f"{base}#{occurrence}")
+    if len(identifiers) != len(set(identifiers)):
+        raise ModelOutputError("periodic atom identities are not unique")
+    return tuple(identifiers)
+
+
+def _wrapped_fractional_coordinate(value: Any) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("fractional coordinate is not finite")
+    wrapped = round(number % 1.0, 8)
+    if math.isclose(wrapped, 0.0, abs_tol=1e-8) or math.isclose(
+        wrapped, 1.0, abs_tol=1e-8
+    ):
+        return 0.0
+    return wrapped
+
+
 def ase_chemical_system(atoms: Any) -> str:
     try:
         symbols = sorted(set(str(item) for item in atoms.get_chemical_symbols()))
@@ -359,6 +416,7 @@ __all__ = [
     "candidate_to_pymatgen",
     "cell_expression",
     "pymatgen_to_cif",
+    "periodic_atom_entity_ids",
     "protein_sequence_from_pdb",
     "representation",
 ]

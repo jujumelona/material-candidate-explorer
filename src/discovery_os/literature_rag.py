@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -561,7 +562,10 @@ class MultiSourceLiteratureRetriever:
         mcp_client: StreamableHttpMcpClient | None = None,
         mcp_tool: str | None = None,
         max_workers: int = 5,
+        arxiv_min_interval_seconds: float = 3.0,
     ) -> None:
+        if not 0.0 <= arxiv_min_interval_seconds <= 60.0:
+            raise ValueError("arxiv_min_interval_seconds must be between 0 and 60")
         self.session = session or requests.Session()
         self.timeout = timeout
         self.user_agent = user_agent
@@ -571,6 +575,9 @@ class MultiSourceLiteratureRetriever:
         self.mcp_client = mcp_client
         self.mcp_tool = mcp_tool
         self.max_workers = max(1, min(max_workers, 10))
+        self.arxiv_min_interval_seconds = float(arxiv_min_interval_seconds)
+        self._arxiv_rate_lock = threading.Lock()
+        self._arxiv_last_request: float | None = None
 
     def retrieve(
         self, plan: RagSearchPlan
@@ -857,6 +864,7 @@ class MultiSourceLiteratureRetriever:
         ]
 
     def _search_arxiv(self, query: LiteratureQuery) -> list[LiteratureRecord]:
+        self._wait_for_arxiv_slot()
         response = self._get(
             self.ARXIV_ENDPOINT,
             params={
@@ -874,6 +882,19 @@ class MultiSourceLiteratureRetriever:
             if (query.from_date is None or item.publication_date is None or item.publication_date >= query.from_date)
             and (query.to_date is None or item.publication_date is None or item.publication_date <= query.to_date)
         ]
+
+    def _wait_for_arxiv_slot(self) -> None:
+        """Apply arXiv's documented inter-request courtesy interval."""
+
+        with self._arxiv_rate_lock:
+            now = time.monotonic()
+            if self._arxiv_last_request is not None:
+                delay = self.arxiv_min_interval_seconds - (
+                    now - self._arxiv_last_request
+                )
+                if delay > 0.0:
+                    time.sleep(delay)
+            self._arxiv_last_request = time.monotonic()
 
 
 class EvidenceClaimExtractor:
@@ -1416,6 +1437,9 @@ def build_literature_rag_from_environment(
         mcp_tool=mcp_tool or None,
         user_agent=values.get(
             "LITERATURE_USER_AGENT", "discovery-os-literature-rag/1.0"
+        ),
+        arxiv_min_interval_seconds=float(
+            values.get("LITERATURE_ARXIV_MIN_INTERVAL_SECONDS", "3")
         ),
     )
     return LiteratureRagPipeline(

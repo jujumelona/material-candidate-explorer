@@ -30,4 +30,4 @@ The key is read only at runtime. It is never written to a candidate record, prov
 - Do not commit API keys, personal genomic data, or AlphaGenome server weights.
 - A high-ranked candidate still requires independent model checks, genomic controls, functional experiments, and appropriate ethics/privacy review.
 
-The Colab notebook contains a separate optional cell for hidden-key, multi-candidate evaluation; it does not run automatically as part of the MatterGen material workflow.
+The genomic adapter is a separate Python/CLI workflow. It is not included in the MatterGen T4 material notebook.

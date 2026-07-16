@@ -19,21 +19,23 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from discovery_os.fusion_schemas import ExpertFeatureRequest, TensorRole
 from discovery_os.fusion_schemas import ScientificModality
+from discovery_os.relaxation import PeriodicRelaxationRequest, PeriodicRelaxationResult
 from discovery_os.schemas import CandidateType, RepresentationKind
 
 from .base import LazyModelAdapter, require_module, to_plain_data
 from .conversions import (
-    atom_entity_ids,
+    ase_to_cif,
     candidate_sequence,
     candidate_smiles,
     candidate_to_ase,
     candidate_to_pymatgen,
     cell_expression,
     representation,
+    periodic_atom_entity_ids,
 )
 from .errors import (
     CandidateConversionError,
@@ -65,6 +67,34 @@ _PERIODIC_MATERIAL_TYPES = frozenset(
     }
 )
 _MOLECULAR_TYPES = frozenset({CandidateType.SMALL_MOLECULE, CandidateType.CUSTOM})
+
+
+class MatterSimRelaxer:
+    """Separate MatterSim periodic-relaxation facade sharing a bound calculator."""
+
+    def __init__(self, calculator_factory: Callable[[], Any]) -> None:
+        self._calculator_factory = calculator_factory
+
+    def relax(self, request: PeriodicRelaxationRequest) -> PeriodicRelaxationResult:
+        return _relax_periodic_with_ase(
+            request,
+            calculator=self._calculator_factory(),
+            source="MatterSim",
+        )
+
+
+class CHGNetRelaxer:
+    """Separate CHGNet periodic-relaxation facade sharing a bound model."""
+
+    def __init__(self, calculator_factory: Callable[[], Any]) -> None:
+        self._calculator_factory = calculator_factory
+
+    def relax(self, request: PeriodicRelaxationRequest) -> PeriodicRelaxationResult:
+        return _relax_periodic_with_ase(
+            request,
+            calculator=self._calculator_factory(),
+            source="CHGNet",
+        )
 
 
 def _require_request_route(
@@ -267,6 +297,11 @@ class MatterSimExpert(LazyModelAdapter[Any]):
                 f"MatterSim inference failed: {type(exc).__name__}: {exc}"
             ) from exc
 
+    def relax(self, request: PeriodicRelaxationRequest) -> PeriodicRelaxationResult:
+        """Run the separate periodic-relaxation contract with the bound calculator."""
+
+        return MatterSimRelaxer(self._ensure_loaded).relax(request)
+
     def provenance_parameters(self) -> dict[str, Any]:
         return {
             "runtime_class": type(self).__name__,
@@ -324,6 +359,7 @@ class CHGNetExpert(LazyModelAdapter[Any]):
             prediction = model.predict_structure(structure)
         except Exception as exc:
             raise ModelExecutionError(f"CHGNet inference failed: {type(exc).__name__}: {exc}") from exc
+
         try:
             forces = _matrix(prediction.get("f", prediction.get("forces")), columns=3)
             magmom_raw = prediction.get("m", prediction.get("magmom"))
@@ -346,7 +382,7 @@ class CHGNetExpert(LazyModelAdapter[Any]):
                 tensor_role=TensorRole.CUSTOM,
                 projection_id="chgnet-force-magmom-v1",
                 entity_type="atom",
-                entity_ids=atom_entity_ids(structure),
+                entity_ids=periodic_atom_entity_ids(structure),
                 normalization="none",
                 coordinate_frame="Cartesian; force xyz then magnetic moment",
                 unit_semantics={
@@ -363,6 +399,24 @@ class CHGNetExpert(LazyModelAdapter[Any]):
             raise ModelOutputError(
                 f"CHGNet returned an invalid result: {type(exc).__name__}: {exc}"
             ) from exc
+
+    def relax(self, request: PeriodicRelaxationRequest) -> PeriodicRelaxationResult:
+        """Run CHGNet relaxation separately from single-point feature inference."""
+
+        model = self._ensure_loaded()
+        dynamics = require_module(
+            "chgnet.model.dynamics",
+            install_hint="install the pinned CHGNet release with ASE support",
+        )
+
+        def calculator() -> Any:
+            try:
+                return dynamics.CHGNetCalculator(model=model, use_device=self.device)
+            except TypeError:
+                # Older reviewed releases infer the device from the bound model.
+                return dynamics.CHGNetCalculator(model=model)
+
+        return CHGNetRelaxer(calculator).relax(request)
 
     def provenance_parameters(self) -> dict[str, Any]:
         return {
@@ -2531,10 +2585,147 @@ def _mmcif_structure_summary(value: str) -> dict[str, int]:
     return {"atom_count": atoms, "chain_count": len(chains), "residue_count": len(residues)}
 
 
+def _relax_periodic_with_ase(
+    request: PeriodicRelaxationRequest,
+    *,
+    calculator: Any,
+    source: str,
+) -> PeriodicRelaxationResult:
+    """Execute one bounded ASE optimizer and retain convergence diagnostics."""
+
+    atoms = candidate_to_ase(
+        request.candidate,
+        kinds=(RepresentationKind.CIF, RepresentationKind.POSCAR),
+    )
+    _require_atoms_periodicity(atoms, periodic=True, model_name=source)
+    optimize = require_module(
+        "ase.optimize",
+        install_hint=f"install ASE in the {source} sidecar environment",
+    )
+    filters = require_module(
+        "ase.filters",
+        install_hint=f"install ASE cell filters in the {source} sidecar environment",
+    )
+    settings = request.settings
+    try:
+        atoms.calc = calculator
+        initial_energy = _finite_float(atoms.get_potential_energy())
+        initial_forces = _matrix(atoms.get_forces(), columns=3)
+        initial_max_force = _max_row_norm(initial_forces)
+        initial_volume = _finite_float(atoms.get_volume())
+        if initial_volume <= 0.0:
+            raise ModelOutputError("periodic relaxation requires positive cell volume")
+        minimum_before = _minimum_periodic_distance(atoms)
+
+        target: Any = atoms
+        if settings.relax_cell:
+            filter_class = getattr(filters, "FrechetCellFilter", None)
+            if filter_class is None:
+                filter_class = getattr(filters, "ExpCellFilter", None)
+            if filter_class is None:
+                raise ModelExecutionError("ASE exposes no reviewed periodic cell filter")
+            target = filter_class(atoms)
+        optimizer_class = getattr(optimize, settings.optimizer, None)
+        if optimizer_class is None:
+            raise ModelExecutionError(
+                f"ASE optimizer {settings.optimizer!r} is unavailable"
+            )
+        optimizer = optimizer_class(target, logfile=None)
+        converged = bool(
+            optimizer.run(
+                fmax=settings.target_fmax_eV_A,
+                steps=settings.requested_steps,
+            )
+        )
+        get_steps = getattr(optimizer, "get_number_of_steps", None)
+        completed_steps = int(
+            get_steps() if callable(get_steps) else getattr(optimizer, "nsteps", 0)
+        )
+
+        final_energy = _finite_float(atoms.get_potential_energy())
+        final_forces = _matrix(atoms.get_forces(), columns=3)
+        final_max_force = _max_row_norm(final_forces)
+        final_volume = _finite_float(atoms.get_volume())
+        volume_change = _finite_float((final_volume - initial_volume) / initial_volume)
+        minimum_after = _minimum_periodic_distance(atoms)
+        relaxed_cif = ase_to_cif(atoms)
+    except SidecarError:
+        raise
+    except Exception as exc:
+        raise ModelExecutionError(
+            f"{source} relaxation failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    warnings = () if converged else ("optimizer exhausted its step budget",)
+    return PeriodicRelaxationResult(
+        completed_steps=completed_steps,
+        converged=converged,
+        initial_max_force_eV_A=initial_max_force,
+        final_max_force_eV_A=final_max_force,
+        initial_energy_eV=initial_energy,
+        final_energy_eV=final_energy,
+        volume_change_fraction=volume_change,
+        minimum_distance_before_A=minimum_before,
+        minimum_distance_after_A=minimum_after,
+        relaxed_cif=relaxed_cif,
+        warnings=warnings,
+        runtime_metadata={
+            "relax_cell": settings.relax_cell,
+            "optimizer_contract": "ase-periodic-relaxation-v1",
+        },
+    )
+
+
+def _minimum_periodic_distance(atoms: Any) -> float:
+    """Return the finite shortest MIC distance, including a one-atom cell."""
+
+    count = len(atoms)
+    if count <= 0:
+        raise ModelOutputError("periodic structure contains no atoms")
+    cell_translation = _minimum_reduced_cell_translation(atoms)
+    if count == 1:
+        return cell_translation
+    distances = _matrix(atoms.get_all_distances(mic=True))
+    values = [
+        value
+        for row_index, row in enumerate(distances)
+        for column_index, value in enumerate(row)
+        if row_index != column_index
+    ]
+    values.append(cell_translation)
+    if not values:
+        raise ModelOutputError("periodic minimum distance could not be computed")
+    result = min(values)
+    if not math.isfinite(result) or result <= 0.0:
+        raise ModelOutputError("periodic structure has a non-positive atom distance")
+    return result
+
+
+def _minimum_reduced_cell_translation(atoms: Any) -> float:
+    try:
+        reduced_result = atoms.get_cell().niggli_reduce()
+        reduced_cell = (
+            reduced_result[0] if isinstance(reduced_result, tuple) else reduced_result
+        )
+        cell = _matrix(reduced_cell, columns=3)
+    except Exception as exc:
+        raise ModelOutputError(
+            "periodic distance requires a Niggli-reduced cell"
+        ) from exc
+    value = min(_row_norm(row) for row in cell)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ModelOutputError("periodic structure has a degenerate cell")
+    return value
+
+
+def _row_norm(row: list[float]) -> float:
+    return math.sqrt(sum(value * value for value in row))
+
+
 def _ase_force_result(atoms: Any, *, source: str) -> ExpertResult:
     energy = float(atoms.get_potential_energy())
     forces = _matrix(atoms.get_forces(), columns=3)
-    entity_ids = atom_entity_ids(atoms)
+    entity_ids = periodic_atom_entity_ids(atoms)
     atom_count = len(entity_ids)
     if atom_count != len(forces):
         raise ModelOutputError(
@@ -2651,9 +2842,11 @@ def _integer_attribute(attributes: dict[str, Any], name: str, *, default: int) -
 __all__ = [
     "BoltzExpert",
     "CHGNetExpert",
+    "CHGNetRelaxer",
     "ChempropExpert",
     "ESMExpert",
     "MatterSimExpert",
+    "MatterSimRelaxer",
     "PySCFExpert",
     "QHNetExpert",
     "RNAFMExpert",

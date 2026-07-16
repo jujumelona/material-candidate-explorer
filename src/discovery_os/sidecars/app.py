@@ -26,6 +26,11 @@ from discovery_os.fusion_schemas import (
     NumericTensor,
 )
 from discovery_os.hashing import candidate_content_hash, stable_hash
+from discovery_os.relaxation import (
+    PeriodicRelaxationPayload,
+    PeriodicRelaxationRequest,
+    PeriodicRelaxationResult,
+)
 from discovery_os.schemas import (
     Candidate,
     CandidateRef,
@@ -113,6 +118,11 @@ def create_sidecar_app(
                 "code_revision": identity.code_revision,
                 "weight_revision": identity.weight_revision,
                 "capabilities": sorted(identity.capabilities),
+                "operations": [
+                    *(["features"] if "features" in identity.capabilities else []),
+                    *(["generate"] if "generate" in identity.capabilities else []),
+                    *(["relax"] if callable(getattr(runtime, "relax", None)) else []),
+                ],
                 "device": str(getattr(runtime, "device", "unknown")),
                 "limits": {
                     "max_request_bytes": configured_limits.max_request_bytes,
@@ -125,6 +135,51 @@ def create_sidecar_app(
         )
 
     app.get("/health", include_in_schema=True)(health)
+
+    if callable(getattr(runtime, "relax", None)):
+
+        async def relax(request: Any) -> Any:
+            try:
+                relaxation_request = await _strict_request(
+                    request,
+                    PeriodicRelaxationRequest,
+                    max_bytes=configured_limits.max_request_bytes,
+                )
+                raw = await executor.run(runtime.relax, relaxation_request)
+                if not isinstance(raw, PeriodicRelaxationResult):
+                    raise ModelOutputError(
+                        "relaxation runtime must return PeriodicRelaxationResult"
+                    )
+                payload = _relaxation_payload(
+                    identity,
+                    runtime,
+                    relaxation_request,
+                    raw,
+                )
+                return JSONResponse(
+                    content=payload.model_dump(mode="json", exclude_none=False)
+                )
+            except SidecarError as exc:
+                return _error_response(JSONResponse, exc)
+            except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                LOGGER.info("rejected invalid relaxation request: %s", type(exc).__name__)
+                return _error_response(
+                    JSONResponse,
+                    RequestLimitError(
+                        "request failed strict periodic-relaxation-v1 validation"
+                    ),
+                    status_code=422,
+                    code="invalid_request",
+                )
+            except Exception:
+                LOGGER.exception("unhandled relaxation sidecar failure")
+                return _error_response(
+                    JSONResponse,
+                    SidecarError("relaxation runtime failed; inspect sidecar logs"),
+                )
+
+        relax.__annotations__["request"] = Request
+        app.post("/v1/relax", include_in_schema=True)(relax)
 
     if "features" in identity.capabilities:
 
@@ -264,6 +319,66 @@ def _feature_payload(
             device=str(getattr(runtime, "device", "unknown")),
             seed=request.seed,
         ),
+    )
+    return _strict_roundtrip(payload)
+
+
+def _relaxation_payload(
+    identity: ModelIdentity,
+    runtime: Any,
+    request: PeriodicRelaxationRequest,
+    result: PeriodicRelaxationResult,
+) -> PeriodicRelaxationPayload:
+    settings = request.settings
+    failures: list[str] = []
+    if not result.converged:
+        failures.append("optimizer_not_converged")
+    if result.final_max_force_eV_A > settings.target_fmax_eV_A:
+        failures.append("final_force_above_target")
+    if result.minimum_distance_after_A < settings.minimum_distance_safety_A:
+        failures.append("minimum_distance_below_safety_threshold")
+    if abs(result.volume_change_fraction) > settings.max_abs_volume_change_fraction:
+        failures.append("volume_change_above_allowed_limit")
+    representation = CandidateRepresentation(
+        kind=RepresentationKind.CIF,
+        value=result.relaxed_cif,
+        media_type="chemical/x-cif",
+        format_version="CIF",
+        canonical=False,
+        metadata={"source": f"{identity.model_id}-periodic-relaxation-v1"},
+    )
+    payload = PeriodicRelaxationPayload(
+        candidate_ref=request.candidate.candidate_ref,
+        expert_id=identity.model_id,
+        execution_succeeded=True,
+        optimizer=settings.optimizer,
+        requested_steps=settings.requested_steps,
+        completed_steps=result.completed_steps,
+        converged=result.converged,
+        target_fmax_eV_A=settings.target_fmax_eV_A,
+        initial_max_force_eV_A=result.initial_max_force_eV_A,
+        final_max_force_eV_A=result.final_max_force_eV_A,
+        initial_energy_eV=result.initial_energy_eV,
+        final_energy_eV=result.final_energy_eV,
+        volume_change_fraction=result.volume_change_fraction,
+        minimum_distance_before_A=result.minimum_distance_before_A,
+        minimum_distance_after_A=result.minimum_distance_after_A,
+        relaxed_structure=representation,
+        strict_gate_passed=not failures,
+        gate_failures=failures,
+        warnings=list(result.warnings),
+        provenance={
+            "adapter": f"{identity.model_id}-periodic-relaxation-v1",
+            "model_version": identity.model_version,
+            "adapter_version": identity.adapter_version,
+            "code_revision": identity.code_revision,
+            "weight_revision": identity.weight_revision,
+            "runtime_parameters_hash": stable_hash(
+                runtime_provenance_parameters(runtime)
+            ),
+            "seed": request.seed,
+            **result.runtime_metadata,
+        },
     )
     return _strict_roundtrip(payload)
 

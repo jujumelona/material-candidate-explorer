@@ -14,9 +14,11 @@ from .errors import (
 from .experts import (
     BoltzExpert,
     CHGNetExpert,
+    CHGNetRelaxer,
     ChempropExpert,
     ESMExpert,
     MatterSimExpert,
+    MatterSimRelaxer,
     PySCFExpert,
     QHNetExpert,
     RNAFMExpert,
@@ -38,6 +40,7 @@ from .types import (
 __all__ = [
     "BoltzExpert",
     "CHGNetExpert",
+    "CHGNetRelaxer",
     "CandidateConversionError",
     "ChempropExpert",
     "ESMExpert",
@@ -46,6 +49,7 @@ __all__ = [
     "GeneratedCandidateData",
     "MatterGenGenerator",
     "MatterSimExpert",
+    "MatterSimRelaxer",
     "ModelExecutionError",
     "ModelIdentity",
     "ModelOutputError",

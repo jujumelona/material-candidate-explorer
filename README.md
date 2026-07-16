@@ -1,8 +1,6 @@
 # Material Candidate Explorer
 
-[📓 Open the notebook on GitHub](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb) · [▶ Run it in Google Colab](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
-
-[![Open in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb) [![View Notebook](https://img.shields.io/badge/Notebook-GitHub-181717?logo=github)](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
+[![Run T4 Discovery in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb) [![View T4 Notebook](https://img.shields.io/badge/T4%20Discovery-GitHub-181717?logo=github)](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb)
 
 Material Candidate Explorer is a model-agnostic orchestration engine for exploring and prioritizing material candidates across chemistry, crystal materials, superconductors, batteries, catalysts, polymers, and medicinal chemistry.
 
@@ -48,26 +46,48 @@ Actual candidate selection is performed by the evidence store, deterministic exp
 - Candidate batches and paired OFF/ON runs support candidate_count from 1 to 1024.
 - Fusion search keeps stability, target-property, novelty, expert-disagreement, and Pareto branches.
 - Every generated candidate is evaluated again by the configured experts.
+- MatterGen output is canonicalized for identity and deduplicated with pymatgen `StructureMatcher`; the direct generated CIF serialization is retained as the candidate, and exact-file hashes remain separate from scientific structure identity.
+- MatterSim and CHGNet expose a separate `/v1/relax` operation, so model execution, optimizer convergence, and the strict geometry gate are recorded independently.
+- Staged novelty assessment distinguishes current-batch matches, project-history matches, external structure matches, and `unknown` external status.
+- The portable DFT handoff writes reviewable CIF/POSCAR/Quantum ESPRESSO input packages for a top-1-to-5 shortlist without bundling pseudopotentials or claiming a calculation ran.
 - Goal-hashed feature caching prevents duplicate expert calculations.
 - CIF, SMILES, sequences, original expert payloads, generator provenance, latent states, scheduler controls, and search history are persisted under the artifact root.
 - If FUSION_API_URL is unset, the deterministic local EvidenceDrivenFusionBackend is selected automatically.
 - Remote Fusion requests keep the legacy strict payload by default. Extended local search context requires FUSION_SEND_EXTENDED_REQUEST_CONTEXT=1.
 
-## Quick start
-
 ## Interactive notebook
 
-- [View the notebook on GitHub](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
-- [Open the notebook in Google Colab](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
+- [View the T4 material-discovery notebook on GitHub](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb)
+- [Open the T4 material-discovery notebook in Google Colab](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb)
+- [View the legacy adaptive-loop notebook](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
 
-The notebook runs the real closed search loop. It retrieves one source-grounded evidence bundle, then uses that evidence during every adaptive round:
+`MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb` is the recommended material-candidate workflow. It allocates 8-32 requested candidates across several MatterGen guidance and target profiles, evaluates every unique crystal with MatterSim and CHGNet, runs explicit MLIP relaxations, performs composition-scoped Pareto ranking, checks staged novelty, and creates DFT input packages for the top 1-5 candidates. The same stage-evidence router is available from the Python package and CLI; it is not notebook-only code.
 
 ~~~text
-evaluate parent -> generate candidate batch -> re-evaluate every child
--> update five branch pools -> adapt controls -> feed selected children into the next round
+multiple guidance/target profiles -> authoritative MatterGen CIF candidates
+-> exact-file and crystallographic deduplication -> geometry gate
+-> MatterSim + CHGNet screening and relaxation -> model disagreement
+-> composition-scoped Pareto ranking -> staged novelty lookup
+-> top 1-5 DFT input packages
 ~~~
 
-Blank optional API fields are skipped. A configured MCP tool joins the scholarly evidence sources through the same strict record and claim-validation path.
+At five intermediate boundaries the notebook also runs source-grounded validation context:
+
+| Stage | Numerical or structural authority | RAG/MCP role |
+|---|---|---|
+| generation prior | MatterGen-supported conditions only | reported phases, failed synthesis, and bounded condition priors |
+| identity and novelty | pymatgen `StructureMatcher` plus optional Materials Project structure lookup | crystallographic reports and aliases |
+| MLIP disagreement | separate MatterSim and CHGNet outputs with unit normalization | applicability limits and possible disagreement causes |
+| relaxation validation | separate MatterSim and CHGNet `/v1/relax` results and strict geometry gates | phase transformations, instability, pressure/temperature, and phonon context |
+| DFT handoff | portable periodic DFT input contract; no calculation claim | reference phases, magnetism, functional/U, pseudopotential, convergence, and phonon review |
+
+Crossref, arXiv, and OpenAlex are bounded scholarly metadata sources. One optional MCP Streamable HTTP tool may be added only through the configured `MATERIAL_RAG_MCP_URL` and `MATERIAL_RAG_MCP_TOOL`; a prompt or model output cannot select an endpoint. Missing providers, missing credentials, empty retrieval, or errors are recorded as `partial`, `skipped`, or `unknown`. They never become a candidate property score.
+
+The notebook form exposes the non-secret RAG/MCP settings. OpenAlex requires its free API key when that source is used; pressing Enter skips OpenAlex while the other sources continue. OpenAlex, optional RAG-model, and optional MCP credentials appear as hidden `getpass` prompts in the Setup cell and are scanned out of the archive. Leave the paired RAG or MCP endpoint fields blank to skip that integration.
+
+The notebook never merges official CIF output with an EXTXYZ conversion path. It reports `requested_samples`, `raw_model_structures`, `parsed_structures`, `exact_file_unique`, `crystallographically_unique`, `geometry_valid`, `mlip_evaluated`, `relaxation_converged`, and `ranked_candidates` separately. A blank Materials Project API key is allowed; external novelty then remains `unknown`, never `novel=true`.
+
+The legacy V11 notebook remains available for the older adaptive-loop interface. Blank optional API fields are skipped.
 
 Linux and Colab use the POSIX launchers; PowerShell is not required:
 
@@ -167,6 +187,20 @@ To add live RAG to the same search, configure any optional scholarly credentials
 
 The evidence bundle is not converted into a material score. It allocates and adapts search branches, while MatterSim and CHGNet remain the candidate evaluators.
 
+Run one stage route directly from code or automation with a strict request JSON:
+
+~~~bash
+export VALIDATION_EVIDENCE_ENABLED=1
+export VALIDATION_EVIDENCE_MAX_RESULTS=8
+export LITERATURE_CONTACT_EMAIL="researcher@example.org"
+discovery-os validation-evidence \
+  --request validation-stage.json \
+  --goal goal.json \
+  --artifacts runs/material-run-001
+~~~
+
+See [Stage-specific validation evidence](docs/STAGE_VALIDATION_EVIDENCE.md) for request examples, environment variables, route semantics, and artifact layout.
+
 ## Genomic candidate evaluation with AlphaGenome
 
 AlphaGenome is connected as an intermediate genomic expert, not as a sequence generator:
@@ -187,7 +221,7 @@ python -m pip install -e ".[genomics,dev]"
 export ALPHAGENOME_API_KEY="..."  # runtime secret; never commit this value
 ~~~
 
-The Colab notebook includes a separate AlphaGenome batch-evaluation cell. It requests the key with hidden input, evaluates every candidate, and writes a ranked JSON table. AlphaGenome API use is subject to Google's terms and non-commercial restrictions; this project does not make clinical claims or redistribute model weights.
+The AlphaGenome adapter is a separate Python/CLI genomic workflow and is not part of the material T4 notebook. AlphaGenome API use is subject to Google's terms and non-commercial restrictions; this project does not make clinical claims or redistribute model weights.
 
 ## Fusion and generator controls
 
@@ -215,7 +249,7 @@ validation_handoff_candidate_refs is a bounded shortlist for a separately config
 
 MatterSim and UMA expose total energy (eV) and energy_per_atom (eV/atom); the latter is comparable as an expert property axis with CHGNet. energy_per_atom is not energy_above_hull. Convex-hull stability requires reference phases, relaxation, and a dedicated validated hull connector.
 
-Symmetry- and tolerance-aware crystal matching is not part of exact-content deduplication yet; use a dedicated structure-standardization connector for that boundary.
+Symmetry- and tolerance-aware crystal matching is implemented in `discovery_os.crystal_identity`. `candidate_content_hash` remains the immutable-record integrity hash; `canonical_structure_hash` and `StructureMatcher` grouping are separate scientific-identity operations.
 
 ## Sidecars and dependencies
 
@@ -243,6 +277,7 @@ The repository excludes local environments, caches, run artifacts, logs, credent
 - Validation matrix: docs/VALIDATION_MATRIX.md
 - Literature RAG workflow: docs/LITERATURE_RAG.md
 - MCP evidence source for RAG: docs/MCP_RAG.md
+- Stage-specific validation evidence: docs/STAGE_VALIDATION_EVIDENCE.md
 - Genomic AlphaGenome evaluation branch: docs/GENOMIC_ALPHAGENOME.md
 
 Material Candidate Explorer is an exploration and orchestration system. Scientific validity still comes from independent, domain-appropriate computation and experiment.

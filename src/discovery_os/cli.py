@@ -33,6 +33,7 @@ from .fusion_schemas import (
     ExpertFeaturePayload,
     FeatureSemantics,
     FusionBatchIterationReport,
+    FusionDecisionContext,
     FusionGenerationRequest,
     FusionGenerationResponse,
     FusionIterationReport,
@@ -62,7 +63,15 @@ from .literature_rag import (
     save_evidence_bundle,
 )
 from .mock_model import MockDiscoveryModel
+from .dft_handoff import DFTInputHandoffReport, DFTInputManifest
+from .novelty import ScientificNoveltyAssessment
 from .profiles import VALIDATION_PROFILES
+from .relaxation import PeriodicRelaxationPayload, PeriodicRelaxationRequest
+from .validation_evidence import (
+    ValidationEvidenceReport,
+    ValidationEvidenceRequest,
+    build_validation_evidence_router_from_environment,
+)
 from .runtime import ToolRuntime
 from .schemas import (
     Candidate,
@@ -81,6 +90,8 @@ SCHEMA_TYPES = {
     item.__name__: item
     for item in [
         Candidate,
+        DFTInputHandoffReport,
+        DFTInputManifest,
         DiscoveryGoal,
         RagSearchPlan,
         RagEvidenceBundle,
@@ -93,17 +104,23 @@ SCHEMA_TYPES = {
         FusionGenerationRequest,
         FusionGenerationResponse,
         FusionBatchIterationReport,
+        FusionDecisionContext,
         FusionIterationReport,
         FusionRequest,
         FusionRevisionProposal,
         FusionWorkspaceSnapshot,
         FusionSearchReport,
         PersistedFusionSearchReport,
+        PeriodicRelaxationPayload,
+        PeriodicRelaxationRequest,
         SearchControlPoint,
         SearchControlSweep,
+        ScientificNoveltyAssessment,
         ToolCall,
         UnifiedLatentStateRef,
         ValidationPlan,
+        ValidationEvidenceReport,
+        ValidationEvidenceRequest,
         WorkspaceComparisonReport,
         WorkspaceEntityInput,
         WorkspacePairedRunReport,
@@ -313,6 +330,11 @@ def _fusion_iterate(args: argparse.Namespace) -> int:
         if args.previous_state
         else None
     )
+    decision_context = (
+        _model_from_file(FusionDecisionContext, args.decision_context)
+        if args.decision_context
+        else None
+    )
     runtime = _fusion_runtime_from_environment(args.artifacts)
     generator = build_generator_from_environment(args.generator, required=True)
     if generator is None:
@@ -327,8 +349,19 @@ def _fusion_iterate(args: argparse.Namespace) -> int:
         context_entities=_model_list_from_file(WorkspaceEntityInput, args.context),
         relations=_model_list_from_file(WorkspaceRelation, args.relations),
         workspace_id=args.workspace_id,
+        decision_context=decision_context,
     )
     print(report.model_dump_json(indent=2))
+    return 0
+
+
+def _validation_evidence(args: argparse.Namespace) -> int:
+    request = _model_from_file(ValidationEvidenceRequest, args.request)
+    goal = _model_from_file(DiscoveryGoal, args.goal) if args.goal else None
+    run = build_validation_evidence_router_from_environment(
+        artifact_root=args.artifacts,
+    ).run(request, goal=goal)
+    print(run.report.model_dump_json(indent=2))
     return 0
 
 
@@ -587,6 +620,10 @@ def make_parser() -> argparse.ArgumentParser:
     fusion_iterate.add_argument("--generator", required=True)
     fusion_iterate.add_argument("--cycle", type=int, default=0)
     fusion_iterate.add_argument("--previous-state")
+    fusion_iterate.add_argument(
+        "--decision-context",
+        help="optional FusionDecisionContext JSON with source-closed evidence hints",
+    )
     fusion_iterate.add_argument("--context", help="JSON array of WorkspaceEntityInput")
     fusion_iterate.add_argument("--relations", help="JSON array of WorkspaceRelation")
     fusion_iterate.add_argument("--workspace-id")
@@ -610,6 +647,18 @@ def make_parser() -> argparse.ArgumentParser:
     fusion_pair.add_argument("--expert", action="append")
     fusion_pair.add_argument("--artifacts", default=".discovery/fusion")
     fusion_pair.set_defaults(handler=_fusion_pair)
+
+    validation_evidence = subparsers.add_parser(
+        "validation-evidence",
+        help="run one stage-specific official/RAG/MCP evidence retrieval",
+    )
+    validation_evidence.add_argument("--request", required=True)
+    validation_evidence.add_argument("--goal")
+    validation_evidence.add_argument(
+        "--artifacts",
+        default=".discovery",
+    )
+    validation_evidence.set_defaults(handler=_validation_evidence)
 
     fusion_search = subparsers.add_parser(
         "fusion-search",

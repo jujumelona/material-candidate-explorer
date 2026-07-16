@@ -330,6 +330,13 @@ def test_ase_force_experts_report_total_and_per_atom_energy_without_claiming_hul
         def __len__(self) -> int:
             return 3
 
+        def get_chemical_symbols(self) -> list[str]:
+            return ["Li", "O", "Li"]
+
+        def get_scaled_positions(self, *, wrap: bool) -> list[list[float]]:
+            assert wrap is True
+            return [[0.0, 0.0, 0.0], [0.5, 0.5, 0.5], [0.25, 0.25, 0.25]]
+
         def get_potential_energy(self) -> float:
             return -12.0
 

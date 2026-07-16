@@ -14,6 +14,7 @@ from discovery_os.literature_rag import (
     LiteratureQuery,
     LiteratureRecord,
     LiteratureSource,
+    MultiSourceLiteratureRetriever,
     PromptSearchPlanner,
     RagEvidenceBundle,
     RagSearchPlan,
@@ -21,6 +22,7 @@ from discovery_os.literature_rag import (
     SourceRunStatus,
     deduplicate_records,
 )
+from discovery_os import literature_rag as literature_rag_module
 from discovery_os.schemas import (
     CandidateType,
     DiscoveryDomain,
@@ -230,3 +232,28 @@ def test_evidence_policy_changes_branch_weight_from_real_search_observation() ->
         structural_collapse_rate=0.0,
     )
     assert policy.weights[assignment.branch_id] > before
+
+
+def test_arxiv_requests_use_the_documented_courtesy_interval(monkeypatch) -> None:
+    clock = {"now": 0.0}
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(
+        literature_rag_module.time,
+        "monotonic",
+        lambda: clock["now"],
+    )
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(literature_rag_module.time, "sleep", advance)
+    retriever = MultiSourceLiteratureRetriever(arxiv_min_interval_seconds=3.0)
+
+    retriever._wait_for_arxiv_slot()
+    clock["now"] = 0.5
+    retriever._wait_for_arxiv_slot()
+
+    assert sleeps == [2.5]
+    assert retriever._arxiv_last_request == 3.0

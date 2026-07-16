@@ -54,9 +54,72 @@ from discovery_os.sidecars import (
     create_sidecar_app,
 )
 from discovery_os.sidecars.base import LazyModelAdapter, numeric_tensor_data
+from discovery_os.sidecars.conversions import periodic_atom_entity_ids
 from discovery_os.sidecars.generators import MatterGenGenerator
 from discovery_os.sidecars.app import _BoundedExecutor
 from discovery_os.sidecars.errors import SidecarBusyError, UnsupportedModelError
+from discovery_os.sidecars.experts import _minimum_periodic_distance
+
+
+def test_periodic_atom_ids_survive_parser_reordering() -> None:
+    class AseLike:
+        def get_chemical_symbols(self):
+            return ["Li", "O"]
+
+        def get_scaled_positions(self, *, wrap: bool):
+            assert wrap is True
+            return [[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]]
+
+    pymatgen_like = [
+        SimpleNamespace(
+            specie=SimpleNamespace(symbol="O"),
+            frac_coords=[0.25, 0.25, 0.25],
+        ),
+        SimpleNamespace(
+            specie=SimpleNamespace(symbol="Li"),
+            frac_coords=[1.0, 0.0, 0.0],
+        ),
+    ]
+
+    ase_ids = periodic_atom_entity_ids(AseLike())
+    pymatgen_ids = periodic_atom_entity_ids(pymatgen_like)
+
+    assert ase_ids != pymatgen_ids
+    assert set(ase_ids) == set(pymatgen_ids)
+
+
+def test_single_atom_distance_uses_reduced_cell() -> None:
+    class Cell:
+        def niggli_reduce(self):
+            return ([[0.1, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]], None)
+
+    class Atoms:
+        def __len__(self):
+            return 1
+
+        def get_cell(self):
+            return Cell()
+
+    assert _minimum_periodic_distance(Atoms()) == 0.1
+
+
+def test_multi_atom_distance_includes_nearest_periodic_self_image() -> None:
+    class Cell:
+        def niggli_reduce(self):
+            return ([[0.4, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 8.0]], None)
+
+    class Atoms:
+        def __len__(self):
+            return 2
+
+        def get_cell(self):
+            return Cell()
+
+        def get_all_distances(self, *, mic: bool):
+            assert mic is True
+            return [[0.0, 2.0], [2.0, 0.0]]
+
+    assert _minimum_periodic_distance(Atoms()) == 0.4
 
 
 def _candidate() -> Candidate:
@@ -635,6 +698,36 @@ def test_mattergen_python_runtime_loads_checkpoint_once(monkeypatch, tmp_path: P
         "discovery_os.sidecars.generators.pymatgen_to_cif",
         lambda structure, *, max_bytes: "data_fixture\n_cell_length_a 1\n",
     )
+    canonical_counter = iter(range(10_000))
+
+    def fake_canonicalize(structure: object, **_kwargs: Any) -> Any:
+        index = next(canonical_counter)
+        return SimpleNamespace(
+            canonical_cif=f"data_fixture_{index}\n_cell_length_a 1\n",
+            structure_hash=f"hash-{index}",
+            source_atom_count=1,
+            primitive_atom_count=1,
+            conventional_atom_count=1,
+            space_group_symbol="P1",
+            space_group_number=1,
+        )
+
+    def fake_group(structures: tuple[Any, ...], **_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            groups=tuple(
+                SimpleNamespace(representative_index=index)
+                for index, _structure in enumerate(structures)
+            )
+        )
+
+    monkeypatch.setattr(
+        "discovery_os.sidecars.generators.canonicalize_crystal_structure",
+        fake_canonicalize,
+    )
+    monkeypatch.setattr(
+        "discovery_os.sidecars.generators.group_crystal_structures",
+        fake_group,
+    )
     checkpoint_path = tmp_path / "mattergen-checkpoint"
     checkpoint_path.mkdir()
     (checkpoint_path / "last.ckpt").write_bytes(b"fixture")
@@ -650,6 +743,109 @@ def test_mattergen_python_runtime_loads_checkpoint_once(monkeypatch, tmp_path: P
 
     assert len(first.candidates) == len(second.candidates) == 2
     assert counts == {"checkpoint": 1, "prepare": 1, "generate": 2}
+
+
+def test_mattergen_replaces_structurematcher_duplicates_before_returning_batch(
+    monkeypatch,
+) -> None:
+    class RawStructure:
+        def __init__(self, identity: str) -> None:
+            self.identity = identity
+
+    class FakeGenerator:
+        properties_to_condition_on: dict[str, object] = {}
+        diffusion_guidance_factor: float = 0.0
+
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def generate(self, *, batch_size: int, num_batches: int, output_dir: str) -> list[Any]:
+            assert num_batches == 1
+            assert output_dir
+            self.batch_sizes.append(batch_size)
+            if len(self.batch_sizes) == 1:
+                return [RawStructure("duplicate"), RawStructure("duplicate")]
+            return [RawStructure("replacement")]
+
+    def fake_canonicalize(structure: RawStructure, **_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            canonical_cif=f"data_{structure.identity}\n_cell_length_a 4\n",
+            structure_hash=f"hash-{structure.identity}",
+            source_atom_count=2,
+            primitive_atom_count=2,
+            conventional_atom_count=2,
+            space_group_symbol="P1",
+            space_group_number=1,
+        )
+
+    def fake_group(structures: tuple[Any, ...], **_kwargs: Any) -> Any:
+        indexes: dict[str, list[int]] = {}
+        for index, structure in enumerate(structures):
+            indexes.setdefault(structure.structure_hash, []).append(index)
+        return SimpleNamespace(
+            groups=tuple(
+                SimpleNamespace(representative_index=members[0], member_indices=tuple(members))
+                for members in indexes.values()
+            )
+        )
+
+    monkeypatch.setattr(
+        "discovery_os.sidecars.generators.pymatgen_to_cif",
+        lambda structure, *, max_bytes: f"data_raw_{structure.identity}\n",
+    )
+    monkeypatch.setattr(
+        "discovery_os.sidecars.generators.canonicalize_crystal_structure",
+        fake_canonicalize,
+    )
+    monkeypatch.setattr(
+        "discovery_os.sidecars.generators.group_crystal_structures",
+        fake_group,
+    )
+    monkeypatch.setattr("discovery_os.sidecars.generators._seed_mattergen", lambda _seed: None)
+    model = FakeGenerator()
+    runtime = MatterGenGenerator(device="cpu")
+    runtime._model = model
+    runtime._resolved_device = "cpu"
+
+    batch = runtime.generate(_generation_request(candidate_count=2))
+
+    assert model.batch_sizes == [2, 1]
+    assert len(batch.candidates) == 2
+    assert {
+        item.attributes["crystal_identity"]["canonical_structure_sha256"]
+        for item in batch.candidates
+    } == {"hash-duplicate", "hash-replacement"}
+    assert all(not item.representations[0].canonical for item in batch.candidates)
+    assert {
+        item.representations[0].value for item in batch.candidates
+    } == {"data_raw_duplicate", "data_raw_replacement"}
+    assert [item.provenance["raw_generation_seed"] for item in batch.candidates] == [7, 8]
+    funnel = batch.candidates[0].attributes["generation_funnel"]
+    assert funnel == {
+        "requested_samples": 2,
+        "raw_model_structures": 3,
+        "parsed_structures": 3,
+        "exact_file_unique": 2,
+        "crystallographically_unique": 2,
+        "geometry_valid": 2,
+        "raw_geometry_valid": 3,
+        "requested_unique_candidates": 2,
+        "parse_rejected": 0,
+        "geometry_rejected": 0,
+        "canonicalization_rejected": 0,
+        "duplicates_removed": 1,
+        "generation_rounds": 2,
+    }
+    assert any("duplicates_removed=1" in warning for warning in batch.warnings)
+    assert any("StructureMatcher removed 1" in warning for warning in batch.warnings)
+    assert batch.candidates[0].attributes["generation_funnel_hashes"] == {
+        "exact_file_sha256s": sorted(
+            {
+                item.provenance["source_exact_sha256"]
+                for item in batch.candidates
+            }
+        )
+    }
 
 
 def test_esm_adapter_uses_pinned_biohub_esm3_api(monkeypatch, tmp_path: Path) -> None:

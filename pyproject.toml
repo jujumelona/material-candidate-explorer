@@ -18,6 +18,7 @@ chem = ["rdkit>=2023.9"]
 sidecar = ["fastapi==0.139.0", "uvicorn==0.51.0"]
 dev = ["pytest>=8,<10", "httpx2==2.6.0"]
 genomics = ["alphagenome @ git+https://github.com/google-deepmind/alphagenome.git"]
+materials = ["pymatgen==2026.5.4", "mp-api==0.46.4"]
 
 [project.scripts]
 discovery-os = "discovery_os.cli:main"

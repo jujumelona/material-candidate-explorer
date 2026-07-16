@@ -39,6 +39,7 @@ export LITERATURE_CONTACT_EMAIL="researcher@example.com"
 export NCBI_API_KEY=""                       # optional
 export OPENALEX_API_KEY=""                   # optional; OpenAlex is skipped when blank
 export LITERATURE_USER_AGENT="DiscoveryOS/0.4 researcher@example.com"
+export LITERATURE_ARXIV_MIN_INTERVAL_SECONDS="3"  # official courtesy interval
 ```
 
 ## Optional planning and extraction model
@@ -107,5 +108,7 @@ You can replace `--rag-bundle` with `--rag-prompt` and the `--rag-*` retrieval o
 `LiteratureEvidencePolicy` assigns an evidence branch to each exploration branch in every round. After expert evaluation, it updates that branch's weight from objective improvement, structural collapse, and execution failure. The same immutable evidence bundle is therefore used adaptively throughout the closed loop; the search does not repeatedly query the network and discard earlier results.
 
 ## Validation boundary
+
+For the material T4 workflow and the reusable `validation-evidence` CLI, see [Stage-specific validation evidence](STAGE_VALIDATION_EVIDENCE.md). It binds separate retrieval reports to generation, identity/novelty, dual-MLIP disagreement, relaxation, and DFT-handoff boundaries while keeping all scientific property scores under their numerical validators.
 
 Search rank is diagnostic. Candidate properties come from the configured expert panel, and thermodynamic stability still requires reference phases, relaxation, a validated convex-hull workflow, and appropriate higher-fidelity or experimental checks. Literature recency, citation count, and model confidence are not material-property scores.
