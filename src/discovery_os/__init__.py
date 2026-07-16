@@ -82,6 +82,15 @@ from .literature_rag import (
     load_evidence_bundle,
 )
 from .model_adapters import LocalDiscoveryModel, RemoteDiscoveryModel
+from .stage_rag import (
+    RagStage,
+    StageAwareMultiRag,
+    StageAwareRagRouter,
+    StageEvidence,
+    StageEvidenceStatus,
+    StageRagQuery,
+    StageRoute,
+)
 from .protocols import DiscoveryModel
 
 __version__ = "0.4.0"
@@ -140,6 +149,13 @@ __all__ = [
     "LocalDiscoveryModel",
     "PersistedFusionSearchReport",
     "RemoteDiscoveryModel",
+    "RagStage",
+    "StageAwareMultiRag",
+    "StageAwareRagRouter",
+    "StageEvidence",
+    "StageEvidenceStatus",
+    "StageRagQuery",
+    "StageRoute",
     "RemoteFusionBackend",
     "SchedulerDecision",
     "SchedulerObservation",

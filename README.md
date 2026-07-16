@@ -202,6 +202,7 @@ The repository excludes local environments, caches, run artifacts, logs, credent
 - Sidecar operation guide: docs/SIDECARS.md
 - Validation matrix: docs/VALIDATION_MATRIX.md
 - Literature RAG workflow: docs/LITERATURE_RAG.md
+- Stage-aware multi-RAG contracts: docs/STAGE_AWARE_MULTI_RAG.md
 - Genomic AlphaGenome evaluation branch: docs/GENOMIC_ALPHAGENOME.md
 
 Material Candidate Explorer is an exploration and orchestration system. Scientific validity still comes from independent, domain-appropriate computation and experiment.
