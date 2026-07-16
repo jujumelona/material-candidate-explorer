@@ -28,13 +28,14 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
 from ._compat import StrEnum
 from .hashing import stable_hash
+from .mcp_client import StreamableHttpMcpClient
 from .schemas import (
     CandidateType,
     DiscoveryDomain,
@@ -56,6 +57,7 @@ class LiteratureSource(StrEnum):
     OPENALEX = "openalex"
     CROSSREF = "crossref"
     ARXIV = "arxiv"
+    MCP = "mcp"
 
 
 class SourceRunStatus(StrEnum):
@@ -556,6 +558,8 @@ class MultiSourceLiteratureRetriever:
         email: str | None = None,
         ncbi_api_key: str | None = None,
         openalex_api_key: str | None = None,
+        mcp_client: StreamableHttpMcpClient | None = None,
+        mcp_tool: str | None = None,
         max_workers: int = 5,
     ) -> None:
         self.session = session or requests.Session()
@@ -564,6 +568,8 @@ class MultiSourceLiteratureRetriever:
         self.email = email
         self.ncbi_api_key = ncbi_api_key
         self.openalex_api_key = openalex_api_key
+        self.mcp_client = mcp_client
+        self.mcp_tool = mcp_tool
         self.max_workers = max(1, min(max_workers, 10))
 
     def retrieve(
@@ -610,12 +616,22 @@ class MultiSourceLiteratureRetriever:
                 error="OPENALEX_API_KEY is not configured",
                 endpoint=self.OPENALEX_ENDPOINT,
             )
+        if source == LiteratureSource.MCP and (self.mcp_client is None or not self.mcp_tool):
+            return [], SourceRetrievalStatus(
+                source=source,
+                status=SourceRunStatus.SKIPPED,
+                query_ids=[item.query_id for item in queries],
+                elapsed_seconds=time.monotonic() - started,
+                error="MATERIAL_RAG_MCP_URL and MATERIAL_RAG_MCP_TOOL are not configured",
+                endpoint=None,
+            )
         handlers = {
             LiteratureSource.EUROPE_PMC: self._search_europe_pmc,
             LiteratureSource.PUBMED: self._search_pubmed,
             LiteratureSource.OPENALEX: self._search_openalex,
             LiteratureSource.CROSSREF: self._search_crossref,
             LiteratureSource.ARXIV: self._search_arxiv,
+            LiteratureSource.MCP: self._search_mcp,
         }
         records: list[LiteratureRecord] = []
         errors: list[str] = []
@@ -625,6 +641,7 @@ class MultiSourceLiteratureRetriever:
             LiteratureSource.OPENALEX: self.OPENALEX_ENDPOINT,
             LiteratureSource.CROSSREF: self.CROSSREF_ENDPOINT,
             LiteratureSource.ARXIV: self.ARXIV_ENDPOINT,
+            LiteratureSource.MCP: self.mcp_client.endpoint if self.mcp_client else "mcp:unconfigured",
         }[source]
         for query in queries:
             try:
@@ -646,6 +663,73 @@ class MultiSourceLiteratureRetriever:
             error="; ".join(errors)[:4000] or None,
             endpoint=endpoint,
         )
+
+    def _search_mcp(self, query: LiteratureQuery) -> list[LiteratureRecord]:
+        if self.mcp_client is None or not self.mcp_tool:
+            return []
+        payload = self.mcp_client.call_tool(
+            self.mcp_tool,
+            {
+                "query": query.query,
+                "max_results": query.max_results,
+                "from_date": query.from_date.isoformat() if query.from_date else None,
+                "to_date": query.to_date.isoformat() if query.to_date else None,
+            },
+        )
+        rows = payload.get("records")
+        if not isinstance(rows, list):
+            raise LiteratureRagError("MCP evidence tool result requires a records array")
+        records: list[LiteratureRecord] = []
+        invalid_rows = 0
+        for item in rows[: query.max_results]:
+            if not isinstance(item, dict):
+                invalid_rows += 1
+                continue
+            raw_title = item.get("title")
+            raw_source_id = item.get("source_id")
+            if not isinstance(raw_title, str) or not isinstance(raw_source_id, str):
+                invalid_rows += 1
+                continue
+            title = _clean_markup(raw_title)
+            source_id = raw_source_id.strip()
+            if not title or not source_id or len(source_id) > 2_000:
+                invalid_rows += 1
+                continue
+            raw_abstract = item.get("abstract")
+            if raw_abstract is None:
+                raw_abstract = item.get("support_text", "")
+            abstract = _clean_markup(raw_abstract) if isinstance(raw_abstract, str) else ""
+            pub_date = _parse_date(item.get("publication_date"))
+            url = _optional_text(item.get("url")) if isinstance(item.get("url"), str) else None
+            if url and urlparse(url).scheme.lower() not in {"http", "https"}:
+                url = None
+            records.append(
+                LiteratureRecord(
+                    record_id=f"LIT-{stable_hash(['mcp', source_id, title])[:24]}",
+                    title=title,
+                    abstract=abstract,
+                    publication_date=pub_date,
+                    publication_year=_year(pub_date, item.get("publication_year")),
+                    authors=_clean_string_list(item.get("authors", [])),
+                    venue=_optional_text(item.get("venue")),
+                    doi=_normalize_doi(item.get("doi")),
+                    pmid=_optional_text(item.get("pmid")),
+                    pmcid=_optional_text(item.get("pmcid")),
+                    source_ids={LiteratureSource.MCP.value: source_id},
+                    source_queries=[query.query_id],
+                    urls=[url] if url else [],
+                    is_retracted=_bool_or_none(item.get("is_retracted")),
+                    citation_count=_int_or_none(item.get("citation_count")),
+                    open_access=_bool_or_none(item.get("open_access")),
+                    retrieved_at=datetime.now(timezone.utc),
+                    raw_metadata={"mcp_tool": self.mcp_tool},
+                )
+            )
+        if invalid_rows and not records:
+            raise LiteratureRagError(
+                f"MCP evidence tool returned {invalid_rows} invalid record(s)"
+            )
+        return records
 
     def _headers(self) -> dict[str, str]:
         return {"User-Agent": self.user_agent, "Accept": "application/json, application/xml"}
@@ -1303,10 +1387,33 @@ def build_literature_rag_from_environment(
             "A RAG planning/extraction model is required but RAG_MODEL_API_URL and "
             "RAG_MODEL_NAME are not configured"
         )
+    mcp_url = str(values.get("MATERIAL_RAG_MCP_URL", "")).strip()
+    mcp_tool = str(values.get("MATERIAL_RAG_MCP_TOOL", "")).strip()
+    if bool(mcp_url) != bool(mcp_tool):
+        raise LiteratureRagError(
+            "MATERIAL_RAG_MCP_URL and MATERIAL_RAG_MCP_TOOL must be configured together"
+        )
+    mcp_client = None
+    if mcp_url:
+        try:
+            StreamableHttpMcpClient.validate_tool_name(mcp_tool)
+            mcp_client = StreamableHttpMcpClient(
+                mcp_url,
+                token=values.get("MATERIAL_RAG_MCP_TOKEN"),
+                timeout=float(values.get("MATERIAL_RAG_MCP_TIMEOUT_SECONDS", "60")),
+                allow_loopback_http=str(
+                    values.get("MATERIAL_RAG_MCP_ALLOW_LOOPBACK_HTTP", "")
+                ).strip()
+                == "1",
+            )
+        except (TypeError, ValueError) as exc:
+            raise LiteratureRagError(f"Invalid MCP RAG configuration: {exc}") from exc
     retriever = MultiSourceLiteratureRetriever(
         email=values.get("LITERATURE_CONTACT_EMAIL"),
         ncbi_api_key=values.get("NCBI_API_KEY"),
         openalex_api_key=values.get("OPENALEX_API_KEY"),
+        mcp_client=mcp_client,
+        mcp_tool=mcp_tool or None,
         user_agent=values.get(
             "LITERATURE_USER_AGENT", "discovery-os-literature-rag/1.0"
         ),
