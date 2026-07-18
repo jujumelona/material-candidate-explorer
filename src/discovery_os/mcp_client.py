@@ -2,8 +2,10 @@
 
 The endpoint and tool name are configuration-owned. Model output can never
 select an arbitrary MCP server or tool. This client implements the stable
-2025-11-25 initialize/initialized/tools-call lifecycle and accepts JSON or SSE
-responses. Task-augmented and elicitation flows are intentionally unsupported.
+2025-11-25 initialize/initialized/tools-list/tools-call lifecycle and accepts
+JSON or SSE responses.  The configured tool must be advertised by the server;
+its top-level input and output schemas are enforced before evidence is used.
+Task-augmented and elicitation flows are intentionally unsupported.
 """
 
 from __future__ import annotations
@@ -73,6 +75,7 @@ class StreamableHttpMcpClient:
         self._session_id: str | None = None
         self._initialized = False
         self._next_id = 1
+        self._tool_definitions: dict[str, dict[str, Any]] | None = None
 
     def initialize(self) -> None:
         if self._initialized:
@@ -114,6 +117,7 @@ class StreamableHttpMcpClient:
         except Exception:
             self._session_id = None
             self._initialized = False
+            self._tool_definitions = None
             raise
         self._initialized = True
 
@@ -122,6 +126,17 @@ class StreamableHttpMcpClient:
         for attempt in range(2):
             if not self._initialized:
                 self.initialize()
+            definitions = {item["name"]: item for item in self.list_tools()}
+            definition = definitions.get(name)
+            if definition is None:
+                raise McpClientError(
+                    f"Configured MCP evidence tool {name!r} is not advertised by the server"
+                )
+            self._validate_top_level_schema(
+                arguments,
+                definition["inputSchema"],
+                label=f"MCP tool {name!r} arguments",
+            )
             try:
                 response = self._post(
                     {
@@ -142,8 +157,10 @@ class StreamableHttpMcpClient:
             raise McpClientError("MCP evidence tool returned isError=true")
         structured = result.get("structuredContent")
         if isinstance(structured, dict):
-            return structured
-        for item in result.get("content", []):
+            value = structured
+        else:
+            value = None
+        for item in result.get("content", []) if value is None else []:
             if (
                 isinstance(item, dict)
                 and item.get("type") == "text"
@@ -154,8 +171,158 @@ class StreamableHttpMcpClient:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(value, dict):
-                    return value
-        raise McpClientError("MCP evidence tool did not return a JSON object")
+                    break
+        if not isinstance(value, dict):
+            raise McpClientError("MCP evidence tool did not return a JSON object")
+        output_schema = definition.get("outputSchema")
+        if isinstance(output_schema, dict):
+            self._validate_top_level_schema(
+                value,
+                output_schema,
+                label=f"MCP tool {name!r} result",
+            )
+        return value
+
+    def require_tool_contract(
+        self,
+        name: str,
+        *,
+        accepted_arguments: tuple[str, ...],
+        result_collection: str,
+    ) -> dict[str, Any]:
+        """Resolve an allow-listed tool and verify the input/output shape we use.
+
+        MCP ``outputSchema`` is optional, so its absence does not weaken the
+        runtime boundary: :meth:`call_tool` still requires structured JSON and
+        the literature adapter validates every returned record.  If a server
+        does publish an output schema, however, a conflicting schema is
+        rejected before any evidence query is sent.
+        """
+
+        self.validate_tool_name(name)
+        matching = [item for item in self.list_tools() if item["name"] == name]
+        if len(matching) != 1:
+            raise McpClientError(
+                f"configured MCP tool {name!r} was not advertised exactly once"
+            )
+        tool = matching[0]
+        input_schema = tool["inputSchema"]
+        properties = input_schema.get("properties")
+        if not isinstance(properties, dict):
+            raise McpClientError(
+                f"MCP tool {name!r} inputSchema must declare object properties"
+            )
+        missing = sorted(set(accepted_arguments) - set(properties))
+        if missing:
+            raise McpClientError(
+                f"MCP tool {name!r} does not declare required adapter arguments: {missing}"
+            )
+        output_schema = tool.get("outputSchema")
+        output_contract = "runtime-validated"
+        if output_schema is not None:
+            output_properties = output_schema.get("properties")
+            if not isinstance(output_properties, dict) or result_collection not in output_properties:
+                raise McpClientError(
+                    f"MCP tool {name!r} outputSchema does not declare {result_collection!r}"
+                )
+            collection_schema = output_properties[result_collection]
+            if not isinstance(collection_schema, dict) or collection_schema.get("type") != "array":
+                raise McpClientError(
+                    f"MCP tool {name!r} output {result_collection!r} must be an array"
+                )
+            output_contract = "schema-and-runtime-validated"
+        return {
+            "tool_name": name,
+            "input_contract": "schema-validated",
+            "output_contract": output_contract,
+        }
+
+    def list_tools(
+        self, *, max_pages: int = 10, max_tools: int = 1_000
+    ) -> list[dict[str, Any]]:
+        """Return a bounded, strictly shaped MCP tool catalog."""
+
+        if max_pages <= 0 or max_tools <= 0:
+            raise ValueError("MCP tool catalog bounds must be positive")
+        if self._tool_definitions is not None:
+            return [dict(item) for item in self._tool_definitions.values()]
+        for attempt in range(2):
+            if not self._initialized:
+                self.initialize()
+            try:
+                cursor: str | None = None
+                tools: dict[str, dict[str, Any]] = {}
+                seen_cursors: set[str] = set()
+                for _ in range(max_pages):
+                    params = {"cursor": cursor} if cursor is not None else {}
+                    response = self._post(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": self._id(),
+                            "method": "tools/list",
+                            "params": params,
+                        }
+                    )
+                    result = self._result(response)
+                    rows = result.get("tools")
+                    if not isinstance(rows, list):
+                        raise McpClientError("MCP tools/list result requires a tools array")
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            raise McpClientError("MCP tools/list returned a non-object tool")
+                        name = row.get("name")
+                        input_schema = row.get("inputSchema")
+                        if not isinstance(name, str):
+                            raise McpClientError("MCP tool descriptor requires a string name")
+                        self.validate_tool_name(name)
+                        if name in tools:
+                            raise McpClientError(
+                                f"MCP server advertised duplicate tool {name!r}"
+                            )
+                        if (
+                            not isinstance(input_schema, dict)
+                            or input_schema.get("type") != "object"
+                        ):
+                            raise McpClientError(
+                                f"MCP tool {name!r} requires an object inputSchema"
+                            )
+                        output_schema = row.get("outputSchema")
+                        if output_schema is not None and not isinstance(
+                            output_schema, dict
+                        ):
+                            raise McpClientError(
+                                f"MCP tool {name!r} outputSchema must be an object"
+                            )
+                        tools[name] = dict(row)
+                        if len(tools) > max_tools:
+                            raise McpClientError(
+                                "MCP tool catalog exceeds the configured limit"
+                            )
+                    raw_cursor = result.get("nextCursor")
+                    if raw_cursor is None:
+                        self._tool_definitions = tools
+                        return [dict(item) for item in tools.values()]
+                    if (
+                        not isinstance(raw_cursor, str)
+                        or not raw_cursor
+                        or len(raw_cursor) > 2_000
+                    ):
+                        raise McpClientError(
+                            "MCP tools/list returned an invalid nextCursor"
+                        )
+                    if raw_cursor in seen_cursors:
+                        raise McpClientError(
+                            "MCP tools/list repeated a pagination cursor"
+                        )
+                    seen_cursors.add(raw_cursor)
+                    cursor = raw_cursor
+                raise McpClientError(
+                    "MCP tools/list exceeded the configured page limit"
+                )
+            except _McpSessionExpired:
+                if attempt:
+                    raise
+        raise McpClientError("MCP tools/list could not establish a session")
 
     def close(self) -> None:
         session_id = self._session_id
@@ -175,6 +342,7 @@ class StreamableHttpMcpClient:
         finally:
             self._session_id = None
             self._initialized = False
+            self._tool_definitions = None
 
     def _id(self) -> int:
         value = self._next_id
@@ -206,6 +374,7 @@ class StreamableHttpMcpClient:
             if response.status_code == 404 and include_session and self._session_id:
                 self._session_id = None
                 self._initialized = False
+                self._tool_definitions = None
                 raise _McpSessionExpired("MCP session expired")
             if 300 <= response.status_code < 400:
                 raise McpClientError(
@@ -260,6 +429,43 @@ class StreamableHttpMcpClient:
                 "MCP tool name must use 1-128 ASCII letters, digits, dots, "
                 "hyphens, or underscores"
             )
+
+    @staticmethod
+    def _validate_top_level_schema(
+        value: Mapping[str, Any],
+        schema: Mapping[str, Any],
+        *,
+        label: str,
+    ) -> None:
+        """Enforce the safe object boundary used by this evidence client.
+
+        Servers remain responsible for complete JSON Schema validation.  This
+        client independently checks the high-value top-level constraints before
+        sending data and before handing structured output to the RAG pipeline.
+        """
+
+        declared_type = schema.get("type")
+        if declared_type not in {None, "object"}:
+            raise McpClientError(f"{label} schema must describe an object")
+        required = schema.get("required", [])
+        if not isinstance(required, list) or any(
+            not isinstance(item, str) for item in required
+        ):
+            raise McpClientError(f"{label} schema has an invalid required list")
+        missing = sorted(set(required).difference(value))
+        if missing:
+            raise McpClientError(
+                f"{label} is missing required field(s): {', '.join(missing)}"
+            )
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            raise McpClientError(f"{label} schema has invalid properties")
+        if schema.get("additionalProperties") is False:
+            unexpected = sorted(set(value).difference(properties))
+            if unexpected:
+                raise McpClientError(
+                    f"{label} contains unexpected field(s): {', '.join(unexpected)}"
+                )
 
     def _read_bounded(self, response: requests.Response) -> bytes:
         declared_length = response.headers.get("Content-Length")

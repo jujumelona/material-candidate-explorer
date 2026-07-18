@@ -1,18 +1,18 @@
 # Stage-specific validation evidence
 
-`discovery_os.validation_evidence` connects numerical and structural validation stages to bounded scholarly retrieval and one configuration-owned MCP evidence tool. It is shared by the library, CLI, and `MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb`.
+`discovery_os.validation_evidence` connects numerical and structural validation stages to bounded scholarly retrieval and administrator-configured, stage-specific MCP evidence tools. It is shared by the library, CLI, and `MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb`.
 
 The evidence router supplements a validator; it never replaces one. Literature record counts, citation counts, model summaries, and MCP responses cannot become energies, forces, hull values, novelty booleans, relaxation convergence, Pareto utilities, or DFT results.
 
 ## Routes
 
-| Stage value | Runtime authority | Scholarly sources | Context retrieved |
-|---|---|---|---|
-| `generation_prior` | MatterGen-supported condition allowlist and deterministic Fusion controller | Crossref, arXiv, OpenAlex, optional configured MCP | phases, negative synthesis evidence, composition ranges, stability constraints |
-| `identity_novelty` | pymatgen `StructureMatcher` and optional Materials Project `find_structure` | Crossref, arXiv, OpenAlex, optional configured MCP | reported phases, crystallographic aliases, scoped database context |
-| `mlip_disagreement` | separate MatterSim and CHGNet properties with explicit units | Crossref, arXiv, optional configured MCP | applicability limits, out-of-domain chemistry, magnetic and charge-state caveats |
-| `relaxation_validation` | separate `/v1/relax` payloads, optimizer convergence, and strict geometry gates | Crossref, arXiv, optional configured MCP | transformations, mechanical/dynamical instability, pressure/temperature, phonons |
-| `dft_handoff` | `PeriodicDFTBackend` input/output contract | Crossref, arXiv, optional configured MCP | reference phases, magnetic order, functional/U, pseudopotential and convergence review |
+| Stage value | Runtime authority | Scholarly sources | Stage MCP variable | Context retrieved |
+|---|---|---|---|---|
+| `generation_prior` | MatterGen-supported condition allowlist and deterministic Fusion controller | Crossref, arXiv, OpenAlex, optional MCP | `MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR` | phases, negative synthesis evidence, composition ranges, stability constraints |
+| `identity_novelty` | pymatgen `StructureMatcher` and optional Materials Project `find_structure` | Crossref, arXiv, OpenAlex, optional MCP | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` | reported phases, crystallographic aliases, scoped database context |
+| `mlip_disagreement` | separate MatterSim and CHGNet properties with explicit units | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT` | applicability limits, out-of-domain chemistry, magnetic and charge-state caveats |
+| `relaxation_validation` | separate `/v1/relax` payloads, optimizer convergence, and strict geometry gates | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION` | transformations, mechanical/dynamical instability, pressure/temperature, phonons |
+| `dft_handoff` | actual selected `PeriodicDFTBackend` execution; an input package alone is not a calculation | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF` | reference phases, magnetic order, functional/U, pseudopotential and convergence review |
 
 The route stores its official-validator identifiers as provenance. Actual candidate values still come from the corresponding structure matcher, database lookup, expert sidecar, relaxation endpoint, or DFT backend.
 
@@ -34,13 +34,20 @@ export RAG_MODEL_API_URL="https://YOUR-ENDPOINT/v1"
 export RAG_MODEL_NAME="YOUR-MODEL"
 export RAG_MODEL_API_KEY=""                   # runtime secret when required
 
-# Optional MCP evidence source; set URL and tool together.
+# Optional MCP evidence source. A dedicated stage tool overrides the fallback.
 export MATERIAL_RAG_MCP_URL="https://YOUR-MCP-SERVER/mcp"
 export MATERIAL_RAG_MCP_TOOL="search_material_evidence"
+export MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR="search_generation_prior"
+export MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY="search_crystal_identity"
+export MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT="search_mlip_limits"
+export MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION="search_relaxation_instability"
+export MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF="search_periodic_dft_methods"
 export MATERIAL_RAG_MCP_TOKEN=""              # runtime secret when required
 ~~~
 
-The MCP endpoint and tool name are administrator configuration. They are not accepted from the discovery prompt, RAG-model output, stage observations, or an MCP response. HTTPS is required outside an explicitly opted-in loopback development endpoint.
+The MCP endpoint and tool names are administrator configuration. They are not accepted from the discovery prompt, RAG-model output, stage observations, or an MCP response. Each route selects its dedicated tool first and `MATERIAL_RAG_MCP_TOOL` second. If any dedicated variable is set, the URL is required; a stage with neither a dedicated tool nor the fallback records MCP as unconfigured and continues its other sources. HTTPS is required outside an explicitly opted-in loopback development endpoint.
+
+Before retrieval, the MCP client performs bounded `tools/list` discovery and requires the selected tool to be advertised exactly once. Its object `inputSchema` must declare `query`, `max_results`, `from_date`, and `to_date`. A published `outputSchema` must declare a `records` array; output is still runtime-validated when that optional schema is absent. Contract failure omits MCP for that stage and never falls back to model memory. See [MCP evidence sources for material RAG](MCP_RAG.md).
 
 ## CLI
 
@@ -71,7 +78,21 @@ discovery-os validation-evidence \
   --artifacts runs/material-run-001
 ~~~
 
-The command prints a strict `ValidationEvidenceReport` and persists both the report and any source-grounded bundle under `validation-evidence/<stage>/`.
+The command prints a strict `ValidationEvidenceReport` and persists both the report and any source-grounded bundle under `validation-evidence/<stage>/`. The report records MCP contract verification, the selected tool name, validator authorities, and a typed evidence handoff. `validator_execution_state="not_executed"` is intentional: the evidence router describes the required validator but does not pretend to have run it.
+
+## Typed handoffs
+
+Every route emits a fail-closed `ValidationEvidenceHandoff`. It keeps candidate/composition identity, evidence status, bundle identity, the expected consumer and payload schema, and the required validator authority IDs together.
+
+| Stage | Handoff kind | Consumer | Validator payload/result contract |
+|---|---|---|---|
+| `generation_prior` | `generation_constraint_context` | `FusionDecisionContext` | `FusionDecisionContext`; usable source-closed evidence may steer generation |
+| `identity_novelty` | `identity_novelty_context` | `StagedNoveltyAssessor` | `ScientificNoveltyAssessment` |
+| `mlip_disagreement` | `mlip_disagreement_context` | `classify_model_disagreement` | `ModelDisagreement` |
+| `relaxation_validation` | `relaxation_gate_context` | `PeriodicRelaxationResult` | `PeriodicRelaxationPayload` |
+| `dft_handoff` | `dft_preparation_context` | `PeriodicDFTBackend` | `DFTInputHandoffReport`, followed by separately recorded backend execution |
+
+All handoffs require a validator result, fix `evidence_can_replace_validator` to `false`, and use `unknown-not-pass` failure semantics. Only a `generation_prior` handoff with persisted usable evidence can set `can_steer_generation=true`; all later-stage handoffs are context for their named validator, not generator instructions.
 
 ## Generation binding
 
@@ -97,10 +118,17 @@ Non-generation evidence cannot steer a generator. The Evidence Fusion backend al
 - disabled route: `skipped` with a reason
 - missing pipeline or failed retrieval: `unknown` with a reason
 - no source-grounded records: `unknown`
+- failed or incompatible stage MCP tool contract: omit MCP, preserve a failed contract status, and do not use model memory
 - one or more unavailable sources with some records: `partial`
 - every requested source successful with records: `completed`
+- validator unavailable or failed: `unknown-not-pass`, regardless of retrieved literature
+- absence from literature or a structure database: not proof of novelty or validity
 
 Every report keeps source statuses and hashes, sets `scientific_role` to `search_and_validation_context_only`, and fixes `property_score_created` to `false`. Requests reject secret-like observation keys. The T4 notebook separately scans all hidden credentials against every exported artifact before creating the result archive.
+
+## Codex skill
+
+Use the repository-local [`$material-candidate-validation`](../.codex/skills/material-candidate-validation/SKILL.md) skill when Codex implements, audits, or documents this workflow. It provides procedural routing guidance for the same five stage IDs. It is not a runtime expert, does not invoke MCP by itself, and cannot replace the schemas, sidecars, databases, or DFT backend above.
 
 ## Official references
 

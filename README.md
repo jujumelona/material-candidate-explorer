@@ -73,15 +73,17 @@ multiple guidance/target profiles -> authoritative MatterGen CIF candidates
 
 At five intermediate boundaries the notebook also runs source-grounded validation context:
 
-| Stage | Numerical or structural authority | RAG/MCP role |
-|---|---|---|
-| generation prior | MatterGen-supported conditions only | reported phases, failed synthesis, and bounded condition priors |
-| identity and novelty | pymatgen `StructureMatcher` plus optional Materials Project structure lookup | crystallographic reports and aliases |
-| MLIP disagreement | separate MatterSim and CHGNet outputs with unit normalization | applicability limits and possible disagreement causes |
-| relaxation validation | separate MatterSim and CHGNet `/v1/relax` results and strict geometry gates | phase transformations, instability, pressure/temperature, and phonon context |
-| DFT handoff | portable periodic DFT input contract; no calculation claim | reference phases, magnetism, functional/U, pseudopotential, convergence, and phonon review |
+| Stage ID | Numerical or structural authority | RAG/MCP role | Dedicated MCP tool variable |
+|---|---|---|---|
+| `generation_prior` | MatterGen-supported conditions only | reported phases, failed synthesis, and bounded condition priors | `MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR` |
+| `identity_novelty` | pymatgen `StructureMatcher` plus optional Materials Project structure lookup | crystallographic reports and aliases | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` |
+| `mlip_disagreement` | separate MatterSim and CHGNet outputs with unit normalization | applicability limits and possible disagreement causes | `MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT` |
+| `relaxation_validation` | separate MatterSim and CHGNet `/v1/relax` results and strict geometry gates | phase transformations, instability, pressure/temperature, and phonon context | `MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION` |
+| `dft_handoff` | selected periodic DFT backend; a prepared input package is not an executed calculation | reference phases, magnetism, functional/U, pseudopotential, convergence, and phonon review | `MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF` |
 
-Crossref, arXiv, and OpenAlex are bounded scholarly metadata sources. One optional MCP Streamable HTTP tool may be added only through the configured `MATERIAL_RAG_MCP_URL` and `MATERIAL_RAG_MCP_TOOL`; a prompt or model output cannot select an endpoint. Missing providers, missing credentials, empty retrieval, or errors are recorded as `partial`, `skipped`, or `unknown`. They never become a candidate property score.
+Crossref, arXiv, and OpenAlex are bounded scholarly metadata sources. Optional MCP Streamable HTTP tools may be selected only from the stage variables above, with `MATERIAL_RAG_MCP_TOOL` as the administrator-configured generic fallback. The client verifies the selected tool through bounded `tools/list`, checks its input/output contract, and rejects unstructured evidence. A prompt or model output cannot select an endpoint or tool. Missing providers, missing credentials, empty retrieval, schema mismatch, or errors are recorded as `partial`, `skipped`, or `unknown`; they never become a candidate property score or a validator pass.
+
+Each route persists a typed evidence handoff naming its consumer, payload schema, and still-required runtime validator. Only a source-grounded `generation_prior` handoff may guide a Fusion decision; identity, MLIP, relaxation, and DFT handoffs cannot steer generation. The evidence router never marks its listed validators as executed.
 
 The notebook form exposes the non-secret RAG/MCP settings. OpenAlex requires its free API key when that source is used; pressing Enter skips OpenAlex while the other sources continue. OpenAlex, optional RAG-model, and optional MCP credentials appear as hidden `getpass` prompts in the Setup cell and are scanned out of the archive. Leave the paired RAG or MCP endpoint fields blank to skip that integration.
 
@@ -193,13 +195,20 @@ Run one stage route directly from code or automation with a strict request JSON:
 export VALIDATION_EVIDENCE_ENABLED=1
 export VALIDATION_EVIDENCE_MAX_RESULTS=8
 export LITERATURE_CONTACT_EMAIL="researcher@example.org"
+export MATERIAL_RAG_MCP_URL="https://YOUR-MCP-SERVER/mcp"
+export MATERIAL_RAG_MCP_TOOL="search_material_evidence" # optional generic fallback
+export MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR="search_generation_prior"
+export MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY="search_crystal_identity"
+export MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT="search_mlip_limits"
+export MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION="search_relaxation_instability"
+export MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF="search_periodic_dft_methods"
 discovery-os validation-evidence \
   --request validation-stage.json \
   --goal goal.json \
   --artifacts runs/material-run-001
 ~~~
 
-See [Stage-specific validation evidence](docs/STAGE_VALIDATION_EVIDENCE.md) for request examples, environment variables, route semantics, and artifact layout.
+See [Stage-specific validation evidence](docs/STAGE_VALIDATION_EVIDENCE.md) for request examples, typed handoffs, environment variables, route semantics, and artifact layout. Codex contributors can invoke the repository-local [`$material-candidate-validation`](.codex/skills/material-candidate-validation/SKILL.md) skill to apply the same five-stage authority and MCP boundaries while changing or auditing the project. The skill is procedural guidance, not a runtime validator or MCP server.
 
 ## Genomic candidate evaluation with AlphaGenome
 
@@ -278,6 +287,7 @@ The repository excludes local environments, caches, run artifacts, logs, credent
 - Literature RAG workflow: docs/LITERATURE_RAG.md
 - MCP evidence source for RAG: docs/MCP_RAG.md
 - Stage-specific validation evidence: docs/STAGE_VALIDATION_EVIDENCE.md
+- Codex material validation skill: .codex/skills/material-candidate-validation/SKILL.md
 - Genomic AlphaGenome evaluation branch: docs/GENOMIC_ALPHAGENOME.md
 
 Material Candidate Explorer is an exploration and orchestration system. Scientific validity still comes from independent, domain-appropriate computation and experiment.

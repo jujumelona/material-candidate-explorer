@@ -1,0 +1,4 @@
+interface:
+  display_name: "Material Candidate Validation"
+  short_description: "Route evidence through material validation"
+  default_prompt: "Use $material-candidate-validation to validate material candidates with stage-specific RAG, configured MCP evidence, and authoritative scientific validators."

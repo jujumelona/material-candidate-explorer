@@ -90,12 +90,43 @@ def test_t4_notebook_runs_all_stage_specific_evidence_routes() -> None:
         "RAG_MODEL_NAME",
         "MATERIAL_RAG_MCP_URL",
         "MATERIAL_RAG_MCP_TOOL",
+        "MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR",
+        "MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY",
+        "MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT",
+        "MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION",
+        "MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF",
         "getpass.getpass",
         '"--decision-context"',
         '"property_score_created"',
         '"configured-tool-only"',
+        '"administrator-configured-allowlist-only"',
+        '"unknown_is_pass": False',
+        '"operator-procedure-not-scientific-validator"',
+        'PROJECT_SKILL_ID = "material-candidate-validation"',
+        "report.handoff",
+        "report.mcp_contract_status",
+        "checkpoint-receipt.json",
         "EXPECTED_EVIDENCE_STAGES",
     ):
         assert boundary in source
-    assert source.count("stage_evidence_router.run(") == 5
+    # The notebook owns one audited wrapper around the reusable router. Five
+    # checkpoints call it; prompts or model output never bypass the wrapper.
+    assert source.count("stage_evidence_router.run(") == 1
+    assert source.count("run_stage_evidence_checkpoint(") == 6
     assert "stage-validation-evidence-index.json" in source
+
+    assert source.index("generation_evidence_run = run_stage_evidence_checkpoint(") < source.index(
+        '"fusion-iterate"'
+    )
+    assert source.index("identity_novelty_assessments = StagedNoveltyAssessor(") < source.index(
+        "identity_evidence_run = run_stage_evidence_checkpoint("
+    )
+    assert source.index("disagreement_risk_counts =") < source.index(
+        "mlip_evidence_run = run_stage_evidence_checkpoint("
+    )
+    assert source.index("RELAXATION_CHECKPOINT_PATH.write_text(") < source.index(
+        "relaxation_evidence_run = run_stage_evidence_checkpoint("
+    )
+    assert source.index("dft_report = PortablePeriodicDFTInputBackend().prepare_inputs(") < source.index(
+        "dft_evidence_run = run_stage_evidence_checkpoint("
+    )

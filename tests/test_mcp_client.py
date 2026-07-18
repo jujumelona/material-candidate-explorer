@@ -36,6 +36,30 @@ class Response:
         pass
 
 
+def _tool_descriptor(name="search_materials"):
+    return {
+        "name": name,
+        "description": "Return source-grounded material evidence records.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer"},
+                "from_date": {"type": ["string", "null"]},
+                "to_date": {"type": ["string", "null"]},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {"records": {"type": "array"}},
+            "required": ["records"],
+            "additionalProperties": False,
+        },
+    }
+
+
 class Session:
     def __init__(self):
         self.headers = {}
@@ -61,6 +85,13 @@ class Session:
                 {
                     "jsonrpc": "2.0",
                     "id": 2,
+                    "result": {"tools": [_tool_descriptor()]},
+                }
+            ),
+            Response(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
                     "result": {
                         "structuredContent": {
                             "records": [
@@ -90,9 +121,10 @@ def test_streamable_http_mcp_initializes_and_calls_configured_tool():
     client = StreamableHttpMcpClient("https://mcp.example/evidence", session=session)
     result = client.call_tool("search_materials", {"query": "Li O"})
     assert result["records"][0]["source_id"] == "doc-1"
-    assert session.calls[2][1]["headers"]["Mcp-Session-Id"] == "session-1"
-    assert session.calls[2][1]["json"]["params"]["name"] == "search_materials"
-    assert session.calls[2][1]["allow_redirects"] is False
+    assert session.calls[2][1]["json"]["method"] == "tools/list"
+    assert session.calls[3][1]["headers"]["Mcp-Session-Id"] == "session-1"
+    assert session.calls[3][1]["json"]["params"]["name"] == "search_materials"
+    assert session.calls[3][1]["allow_redirects"] is False
 
 
 def test_stateless_mcp_server_is_initialized_only_once():
@@ -102,7 +134,7 @@ def test_stateless_mcp_server_is_initialized_only_once():
         Response(
             {
                 "jsonrpc": "2.0",
-                "id": 3,
+                "id": 4,
                 "result": {"structuredContent": {"records": []}, "content": []},
             }
         )
@@ -114,6 +146,7 @@ def test_stateless_mcp_server_is_initialized_only_once():
     assert methods == [
         "initialize",
         "notifications/initialized",
+        "tools/list",
         "tools/call",
         "tools/call",
     ]
@@ -124,11 +157,12 @@ def test_expired_session_is_reinitialized_once_without_the_old_session_header():
     session.responses = [
         session.responses[0],
         session.responses[1],
+        session.responses[2],
         Response(status=404),
         Response(
             {
                 "jsonrpc": "2.0",
-                "id": 3,
+                "id": 4,
                 "result": {
                     "protocolVersion": "2025-11-25",
                     "capabilities": {"tools": {}},
@@ -141,15 +175,22 @@ def test_expired_session_is_reinitialized_once_without_the_old_session_header():
         Response(
             {
                 "jsonrpc": "2.0",
-                "id": 4,
+                "id": 5,
+                "result": {"tools": [_tool_descriptor()]},
+            }
+        ),
+        Response(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
                 "result": {"structuredContent": {"records": []}, "content": []},
             }
         ),
     ]
     client = StreamableHttpMcpClient("https://mcp.example/evidence", session=session)
-    assert client.call_tool("search_materials", {}) == {"records": []}
-    assert "Mcp-Session-Id" not in session.calls[3][1]["headers"]
-    assert session.calls[5][1]["headers"]["Mcp-Session-Id"] == "session-2"
+    assert client.call_tool("search_materials", {"query": "Li O"}) == {"records": []}
+    assert "Mcp-Session-Id" not in session.calls[4][1]["headers"]
+    assert session.calls[7][1]["headers"]["Mcp-Session-Id"] == "session-2"
 
 
 def test_mcp_redirect_is_refused_without_following_it():
@@ -181,6 +222,38 @@ def test_mcp_tool_name_rejects_unbounded_or_special_character_names():
     client = StreamableHttpMcpClient("https://mcp.example/evidence", session=Session())
     with pytest.raises(ValueError):
         client.call_tool("search/materials", {})
+
+
+def test_mcp_rejects_unadvertised_tool_and_schema_mismatch_before_call():
+    session = Session()
+    client = StreamableHttpMcpClient("https://mcp.example/evidence", session=session)
+    with pytest.raises(McpClientError, match="not advertised"):
+        client.call_tool("other_material_tool", {"query": "Li O"})
+    assert [item[1]["json"]["method"] for item in session.calls] == [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+    ]
+
+    session = Session()
+    client = StreamableHttpMcpClient("https://mcp.example/evidence", session=session)
+    with pytest.raises(McpClientError, match="missing required field"):
+        client.call_tool("search_materials", {})
+
+
+def test_mcp_contract_requires_adapter_fields_and_records_collection():
+    session = Session()
+    client = StreamableHttpMcpClient("https://mcp.example/evidence", session=session)
+    contract = client.require_tool_contract(
+        "search_materials",
+        accepted_arguments=("query", "max_results", "from_date", "to_date"),
+        result_collection="records",
+    )
+    assert contract == {
+        "tool_name": "search_materials",
+        "input_contract": "schema-validated",
+        "output_contract": "schema-and-runtime-validated",
+    }
 
 
 def test_mcp_literature_records_are_strict_and_source_grounded():

@@ -19,14 +19,19 @@ from discovery_os.literature_rag import (
     SourceRetrievalStatus,
     SourceRunStatus,
 )
+from discovery_os.mcp_client import McpClientError
 from discovery_os.validation_evidence import (
+    McpContractVerificationStatus,
+    ValidationHandoffKind,
     ValidationEvidenceRequest,
     ValidationEvidenceRouter,
     ValidationEvidenceStage,
     ValidationEvidenceStatus,
     build_validation_evidence_prompt,
+    build_validation_evidence_router_from_environment,
     fusion_decision_context_from_stage_evidence,
     fusion_decision_contexts_from_stage_evidence,
+    validation_evidence_route,
 )
 
 
@@ -105,12 +110,26 @@ class _Pipeline:
         self.error = error
         self.bundle = bundle or _bundle()
         self.calls: list[dict] = []
+        self.retriever = _Retriever()
 
     def run(self, prompt: str, **kwargs):
         self.calls.append({"prompt": prompt, **kwargs})
         if self.error is not None:
             raise self.error
         return self.bundle
+
+
+class _ContractClient:
+    def require_tool_contract(self, name, *, accepted_arguments, result_collection):
+        assert name == "search_materials"
+        assert accepted_arguments == ("query", "max_results", "from_date", "to_date")
+        assert result_collection == "records"
+        return {"tool_name": name}
+
+
+class _Retriever:
+    mcp_client = _ContractClient()
+    mcp_tool = "search_materials"
 
 
 def test_generation_stage_routes_official_sources_and_binds_fusion_context(tmp_path) -> None:
@@ -125,6 +144,15 @@ def test_generation_stage_routes_official_sources_and_binds_fusion_context(tmp_p
     run = router.run(request)
 
     assert run.report.status == ValidationEvidenceStatus.COMPLETED
+    assert run.report.mcp_contract_status == McpContractVerificationStatus.VERIFIED
+    assert run.report.mcp_tool_name == "search_materials"
+    assert run.report.handoff.kind == ValidationHandoffKind.GENERATION_CONSTRAINT_CONTEXT
+    assert run.report.handoff.evidence_available is True
+    assert run.report.handoff.can_steer_generation is True
+    assert run.report.handoff.evidence_claim_ids == ["CLAIM-li-o"]
+    assert run.report.handoff.evidence_branch_ids == ["EBRANCH-li-o"]
+    assert run.report.handoff.validator_execution_state == "not_executed"
+    assert run.report.handoff.unknown_not_pass is True
     assert run.report.property_score_created is False
     assert run.report.bundle_relative_path is not None
     assert (tmp_path / run.report.bundle_relative_path).is_file()
@@ -164,6 +192,10 @@ def test_stage_retrieval_failure_remains_unknown(tmp_path) -> None:
     assert run.report.record_count == 0
     assert run.report.reason == "stage_evidence_retrieval_failed:RuntimeError"
     assert run.report.property_score_created is False
+    assert run.report.handoff.evidence_available is False
+    assert run.report.handoff.can_steer_generation is False
+    assert run.report.handoff.unknown_not_pass is True
+    assert run.report.handoff.validator_execution_state == "not_executed"
 
 
 def test_stage_prompt_is_bounded_and_observations_reject_secrets() -> None:
@@ -245,3 +277,151 @@ def test_profile_context_allocation_shares_one_evidence_policy(tmp_path) -> None
         "EBRANCH-li-o",
         "EBRANCH-li-o-space-group",
     ]
+
+
+def test_all_stage_routes_are_closed_typed_and_fail_closed() -> None:
+    expected = {
+        ValidationEvidenceStage.GENERATION_PRIOR: (
+            ValidationHandoffKind.GENERATION_CONSTRAINT_CONTEXT,
+            "FusionDecisionContext",
+            True,
+        ),
+        ValidationEvidenceStage.IDENTITY_NOVELTY: (
+            ValidationHandoffKind.IDENTITY_NOVELTY_CONTEXT,
+            "ScientificNoveltyAssessment",
+            False,
+        ),
+        ValidationEvidenceStage.MLIP_DISAGREEMENT: (
+            ValidationHandoffKind.MLIP_DISAGREEMENT_CONTEXT,
+            "ModelDisagreement",
+            False,
+        ),
+        ValidationEvidenceStage.RELAXATION_VALIDATION: (
+            ValidationHandoffKind.RELAXATION_GATE_CONTEXT,
+            "PeriodicRelaxationPayload",
+            False,
+        ),
+        ValidationEvidenceStage.DFT_HANDOFF: (
+            ValidationHandoffKind.DFT_PREPARATION_CONTEXT,
+            "DFTInputHandoffReport",
+            False,
+        ),
+    }
+    expected_sources = {
+        ValidationEvidenceStage.GENERATION_PRIOR: [
+            LiteratureSource.CROSSREF,
+            LiteratureSource.ARXIV,
+            LiteratureSource.OPENALEX,
+            LiteratureSource.MCP,
+        ],
+        ValidationEvidenceStage.IDENTITY_NOVELTY: [
+            LiteratureSource.CROSSREF,
+            LiteratureSource.ARXIV,
+            LiteratureSource.OPENALEX,
+            LiteratureSource.MCP,
+        ],
+        ValidationEvidenceStage.MLIP_DISAGREEMENT: [
+            LiteratureSource.CROSSREF,
+            LiteratureSource.ARXIV,
+            LiteratureSource.MCP,
+        ],
+        ValidationEvidenceStage.RELAXATION_VALIDATION: [
+            LiteratureSource.CROSSREF,
+            LiteratureSource.ARXIV,
+            LiteratureSource.MCP,
+        ],
+        ValidationEvidenceStage.DFT_HANDOFF: [
+            LiteratureSource.CROSSREF,
+            LiteratureSource.ARXIV,
+            LiteratureSource.MCP,
+        ],
+    }
+    for stage, (kind, payload_schema, can_steer) in expected.items():
+        route = validation_evidence_route(stage)
+        assert route.stage == stage
+        assert route.literature_sources == expected_sources[stage]
+        assert route.official_validators == [
+            item.authority_id for item in route.validator_authorities
+        ]
+        assert all(
+            item.availability
+            in {"implemented", "sidecar_required", "credential_required", "external_required"}
+            for item in route.validator_authorities
+        )
+        assert all(item.failure_policy == "unknown-not-pass" for item in route.validator_authorities)
+        assert route.failure_policy.record_absence == "not-proof-of-novelty-or-validity"
+        assert route.mcp_contract.tool_environment_variable == (
+            f"MATERIAL_RAG_MCP_TOOL_{stage.value.upper()}"
+        )
+        assert route.mcp_contract.selection_policy == "administrator-configured-allowlist-only"
+        assert route.mcp_contract.required_record_fields == ["source_id", "title"]
+        assert route.handoff_contract.kind == kind
+        assert route.handoff_contract.payload_schema == payload_schema
+        assert route.handoff_contract.can_steer_generation is can_steer
+        assert route.handoff_contract.evidence_can_replace_validator is False
+
+
+def test_non_allowlisted_bundle_source_fails_closed(tmp_path) -> None:
+    bundle = _bundle()
+    bad_query = bundle.search_plan.queries[0].model_copy(
+        update={"source": LiteratureSource.PUBMED}
+    )
+    bad_plan = bundle.search_plan.model_copy(update={"queries": [bad_query]})
+    bundle = bundle.model_copy(update={"search_plan": bad_plan})
+
+    run = ValidationEvidenceRouter(
+        _Pipeline(bundle=bundle), artifact_root=tmp_path
+    ).run(
+        ValidationEvidenceRequest(
+            stage=ValidationEvidenceStage.MLIP_DISAGREEMENT,
+            chemical_system="Li-O",
+        )
+    )
+
+    assert run.report.status == ValidationEvidenceStatus.UNKNOWN
+    assert run.report.reason == (
+        "stage_route_contract_violation:search_plan_used_nonselected_source"
+    )
+    assert run.bundle is None
+    assert run.report.handoff.evidence_available is False
+
+
+def test_failed_mcp_tool_contract_omits_mcp_and_keeps_other_sources_partial(tmp_path) -> None:
+    class BadClient:
+        def require_tool_contract(self, *args, **kwargs):
+            raise McpClientError("schema mismatch")
+
+    pipeline = _Pipeline()
+    pipeline.retriever.mcp_client = BadClient()
+    run = ValidationEvidenceRouter(pipeline, artifact_root=tmp_path).run(
+        ValidationEvidenceRequest(
+            stage=ValidationEvidenceStage.GENERATION_PRIOR,
+            chemical_system="Li-O",
+        )
+    )
+
+    assert LiteratureSource.MCP not in pipeline.calls[0]["sources"]
+    assert run.report.status == ValidationEvidenceStatus.PARTIAL
+    assert run.report.mcp_contract_status == McpContractVerificationStatus.FAILED
+    assert run.report.mcp_tool_name is None
+    assert run.report.handoff.evidence_available is True
+    assert any("tool contract failed" in item for item in run.report.warnings)
+
+
+def test_stage_specific_mcp_tool_environment_builds_isolated_pipeline(tmp_path) -> None:
+    router = build_validation_evidence_router_from_environment(
+        artifact_root=tmp_path,
+        environ={
+            "VALIDATION_EVIDENCE_ENABLED": "1",
+            "MATERIAL_RAG_MCP_URL": "https://mcp.example/evidence",
+            "MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT": "search_mlip_limits",
+        },
+    )
+
+    mlip_pipeline = router.pipelines_by_stage[ValidationEvidenceStage.MLIP_DISAGREEMENT]
+    assert mlip_pipeline is not None
+    assert mlip_pipeline.retriever.mcp_tool == "search_mlip_limits"
+    identity_pipeline = router.pipelines_by_stage[ValidationEvidenceStage.IDENTITY_NOVELTY]
+    assert identity_pipeline is not None
+    assert identity_pipeline.retriever.mcp_client is None
+    assert identity_pipeline.retriever.mcp_tool is None

@@ -68,8 +68,13 @@ from .novelty import ScientificNoveltyAssessment
 from .profiles import VALIDATION_PROFILES
 from .relaxation import PeriodicRelaxationPayload, PeriodicRelaxationRequest
 from .validation_evidence import (
+    McpEvidenceContract,
+    ValidationEvidenceHandoff,
     ValidationEvidenceReport,
     ValidationEvidenceRequest,
+    ValidationEvidenceRoute,
+    ValidationHandoffContract,
+    ValidatorAuthority,
     build_validation_evidence_router_from_environment,
 )
 from .runtime import ToolRuntime
@@ -121,6 +126,11 @@ SCHEMA_TYPES = {
         ValidationPlan,
         ValidationEvidenceReport,
         ValidationEvidenceRequest,
+        ValidationEvidenceHandoff,
+        ValidationEvidenceRoute,
+        ValidationHandoffContract,
+        ValidatorAuthority,
+        McpEvidenceContract,
         WorkspaceComparisonReport,
         WorkspaceEntityInput,
         WorkspacePairedRunReport,
