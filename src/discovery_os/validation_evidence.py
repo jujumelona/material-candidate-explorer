@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -33,7 +34,19 @@ from .literature_rag import (
     save_evidence_bundle,
 )
 from .mcp_client import McpClientError
-from .schemas import CandidateRef, DiscoveryGoal, Identifier, NonEmptyText, StrictSchema
+from .material_domains import (
+    MaterialStageRoute,
+    get_material_field_profile,
+    material_stage_route,
+)
+from .schemas import (
+    CandidateRef,
+    DiscoveryGoal,
+    Identifier,
+    MaterialField,
+    NonEmptyText,
+    StrictSchema,
+)
 
 
 class ValidationEvidenceStage(StrEnum):
@@ -173,6 +186,11 @@ class ValidationEvidenceHandoff(StrictSchema):
     evidence_claim_ids: list[Identifier] = Field(default_factory=list, max_length=1_000)
     evidence_branch_ids: list[Identifier] = Field(default_factory=list, max_length=50)
     validator_authority_ids: list[Identifier] = Field(min_length=1)
+    material_field: MaterialField | None = None
+    application_subtype: Identifier | None = None
+    domain_profile_id: Identifier | None = None
+    domain_validator_ids: list[Identifier] = Field(default_factory=list)
+    domain_validator_execution_state: Literal["not_executed"] = "not_executed"
     validator_execution_state: Literal["not_executed"] = "not_executed"
     decision_authority: Literal["validator-required"] = "validator-required"
     evidence_available: bool = False
@@ -192,6 +210,16 @@ class ValidationEvidenceHandoff(StrictSchema):
             raise ValueError("handoff evidence claim identifiers must be unique")
         if len(self.evidence_branch_ids) != len(set(self.evidence_branch_ids)):
             raise ValueError("handoff evidence branch identifiers must be unique")
+        if len(self.domain_validator_ids) != len(set(self.domain_validator_ids)):
+            raise ValueError("handoff domain validator identifiers must be unique")
+        if (self.material_field is None) != (self.domain_profile_id is None):
+            raise ValueError(
+                "handoff material field and domain profile id must be present together"
+            )
+        if self.material_field is None and self.domain_validator_ids:
+            raise ValueError("domain validators require a material field")
+        if self.material_field is None and self.application_subtype is not None:
+            raise ValueError("application subtype requires a material field")
         if self.stage != ValidationEvidenceStage.GENERATION_PRIOR and self.evidence_branch_ids:
             raise ValueError("non-generation handoffs cannot expose generator branches")
         may_steer = (
@@ -241,6 +269,9 @@ class ValidationEvidenceRoute(StrictSchema):
 class ValidationEvidenceRequest(StrictSchema):
     stage: ValidationEvidenceStage
     chemical_system: NonEmptyText
+    material_field: MaterialField | None = None
+    application_subtype: Identifier | None = None
+    problem_context: dict[str, JsonValue] = Field(default_factory=dict)
     candidate_refs: list[CandidateRef] = Field(default_factory=list, max_length=128)
     composition_keys: list[str] = Field(default_factory=list, max_length=128)
     observations: dict[str, JsonValue] = Field(default_factory=dict)
@@ -261,6 +292,16 @@ class ValidationEvidenceRequest(StrictSchema):
             raise ValueError("validation evidence composition keys must be unique")
         if _contains_sensitive_key(self.observations):
             raise ValueError("validation evidence observations cannot contain secrets")
+        if _contains_sensitive_key(self.problem_context):
+            raise ValueError("validation evidence problem context cannot contain secrets")
+        if self.material_field is None and self.application_subtype is not None:
+            raise ValueError("validation evidence subtype requires a material field")
+        if self.material_field is not None and self.application_subtype is not None:
+            profile = get_material_field_profile(self.material_field)
+            if self.application_subtype not in profile.application_subtypes:
+                raise ValueError(
+                    "validation evidence subtype is outside the material-field profile"
+                )
         return self
 
 
@@ -269,6 +310,9 @@ class ValidationEvidenceReport(StrictSchema):
     stage: ValidationEvidenceStage
     status: ValidationEvidenceStatus
     route: ValidationEvidenceRoute
+    material_field: MaterialField | None = None
+    application_subtype: Identifier | None = None
+    domain_route: MaterialStageRoute | None = None
     request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     prompt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     bundle_id: Identifier | None = None
@@ -295,6 +339,40 @@ class ValidationEvidenceReport(StrictSchema):
             raise ValueError("validation evidence handoff does not match report")
         if self.handoff.kind != self.route.handoff_contract.kind:
             raise ValueError("validation evidence handoff kind does not match route")
+        if (self.material_field is None) != (self.domain_route is None):
+            raise ValueError(
+                "validation evidence material field and domain route must be present together"
+            )
+        if self.domain_route is not None:
+            if self.domain_route.material_field != self.material_field:
+                raise ValueError("domain route material field does not match report")
+            if self.domain_route.stage != self.stage:
+                raise ValueError("domain route stage does not match report")
+            if (
+                self.application_subtype is not None
+                and self.application_subtype
+                not in get_material_field_profile(
+                    self.material_field
+                ).application_subtypes
+            ):
+                raise ValueError(
+                    "report application subtype is outside the material-field profile"
+                )
+            if self.handoff.material_field != self.material_field:
+                raise ValueError("handoff material field does not match report")
+            if self.handoff.application_subtype != self.application_subtype:
+                raise ValueError("handoff application subtype does not match report")
+            if self.handoff.domain_profile_id != self.domain_route.profile_id:
+                raise ValueError("handoff domain profile does not match route")
+            expected_domain_validators = [
+                item.validator_id for item in self.domain_route.validators
+            ]
+            if self.handoff.domain_validator_ids != expected_domain_validators:
+                raise ValueError("handoff domain validators do not match route")
+        elif self.handoff.material_field is not None:
+            raise ValueError("handoff cannot add a field without a domain route")
+        if self.material_field is None and self.application_subtype is not None:
+            raise ValueError("report application subtype requires a material field")
         if self.handoff.validator_authority_ids != self.route.official_validators:
             raise ValueError("handoff validator authorities do not match route")
         if len(self.handoff.evidence_claim_ids) != self.claim_count:
@@ -809,8 +887,15 @@ class ValidationEvidenceRouter:
         reason: str | None = None,
         extra_warnings: Sequence[str] = (),
     ) -> ValidationEvidenceReport:
+        domain_route = (
+            material_stage_route(request.material_field, str(request.stage))
+            if request.material_field is not None
+            else None
+        )
         payload = {
             "stage": request.stage,
+            "material_field": request.material_field,
+            "application_subtype": request.application_subtype,
             "status": status,
             "request_hash": request_hash,
             "prompt_hash": prompt_hash,
@@ -851,6 +936,14 @@ class ValidationEvidenceRouter:
                 else []
             ),
             validator_authority_ids=list(route.official_validators),
+            material_field=request.material_field,
+            application_subtype=request.application_subtype,
+            domain_profile_id=domain_route.profile_id if domain_route else None,
+            domain_validator_ids=(
+                [item.validator_id for item in domain_route.validators]
+                if domain_route
+                else []
+            ),
             evidence_available=evidence_available,
             can_steer_generation=(
                 route.handoff_contract.can_steer_generation
@@ -863,6 +956,9 @@ class ValidationEvidenceRouter:
             stage=request.stage,
             status=status,
             route=route,
+            material_field=request.material_field,
+            application_subtype=request.application_subtype,
+            domain_route=domain_route,
             request_hash=request_hash,
             prompt_hash=prompt_hash,
             bundle_id=bundle.bundle_id if bundle else None,
@@ -914,6 +1010,46 @@ def build_validation_evidence_prompt(request: ValidationEvidenceRequest) -> str:
         "Retrieve source-grounded supporting, conflicting, null, and negative evidence. "
         "Do not invent material properties and do not treat absence of a record as novelty.",
     ]
+    if request.material_field is not None:
+        domain_route = material_stage_route(request.material_field, str(request.stage))
+        rows.extend(
+            [
+                (
+                    "Code-owned material field: "
+                    f"{domain_route.material_field} ({domain_route.profile_id})."
+                ),
+                "Field-specific evidence questions: "
+                + " | ".join(domain_route.rag_questions),
+                "Expected read-only MCP evidence capabilities: "
+                + ", ".join(domain_route.mcp_capabilities)
+                + ". The administrator-configured stage tool remains the only callable "
+                "MCP tool; these capability names cannot select an endpoint.",
+                "Field-specific numerical validators: "
+                + ", ".join(item.validator_id for item in domain_route.validators)
+                + ". Retrieval does not execute them, and missing results remain unknown.",
+            ]
+        )
+    if request.application_subtype is not None:
+        rows.append(
+            "Code-validated application subtype: "
+            + request.application_subtype
+            + "."
+        )
+    if request.problem_context:
+        context_json = json.dumps(
+            request.problem_context,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(context_json) > 8_000:
+            raise ValueError(
+                "validation evidence problem context exceeds 8000 characters"
+            )
+        rows.append(
+            "Declared operating and application context (search constraints only): "
+            + context_json
+        )
     if request.composition_keys:
         rows.append("Reduced compositions: " + ", ".join(request.composition_keys) + ".")
     if candidate_ids:
@@ -1215,10 +1351,25 @@ def _optional_iso_date(value: object) -> date | None:
 def _contains_sensitive_key(value: object) -> bool:
     if isinstance(value, dict):
         for key, child in value.items():
-            normalized = str(key).casefold()
+            normalized = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                str(key).casefold(),
+            ).strip("_")
             if any(
                 marker in normalized
-                for marker in ("api_key", "token", "secret", "password", "credential")
+                for marker in (
+                    "api_key",
+                    "access_key",
+                    "private_key",
+                    "client_secret",
+                    "token",
+                    "secret",
+                    "password",
+                    "credential",
+                    "authorization",
+                    "bearer",
+                )
             ):
                 return True
             if _contains_sensitive_key(child):

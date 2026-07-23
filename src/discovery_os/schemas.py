@@ -50,6 +50,28 @@ class DiscoveryDomain(StrEnum):
     GENERAL_MATERIALS = "general_materials"
 
 
+class MaterialField(StrEnum):
+    """Typed crystalline-material workflow selected before evidence retrieval.
+
+    ``DiscoveryDomain`` remains the broad goal/validation-profile taxonomy.
+    This finer-grained field controls which material-specific calculations,
+    databases, evidence questions, and experimental handoffs are required.
+    """
+
+    GENERAL_INORGANIC = "general_inorganic"
+    BATTERY_ELECTRODE = "battery_electrode"
+    SOLID_ELECTROLYTE = "solid_electrolyte"
+    SUPERCONDUCTOR = "superconductor"
+    HETEROGENEOUS_CATALYST = "heterogeneous_catalyst"
+    SEMICONDUCTOR = "semiconductor"
+    PHOTOVOLTAIC_ABSORBER = "photovoltaic_absorber"
+    THERMOELECTRIC = "thermoelectric"
+    MAGNETIC_MATERIAL = "magnetic_material"
+    FERROELECTRIC_PIEZOELECTRIC = "ferroelectric_piezoelectric"
+    STRUCTURAL_ALLOY = "structural_alloy"
+    POROUS_FRAMEWORK = "porous_framework"
+
+
 class CandidateType(StrEnum):
     SMALL_MOLECULE = "small_molecule"
     BIOLOGIC = "biologic"
@@ -1055,6 +1077,7 @@ __all__ = [
     "HypothesisUpdate",
     "ApplicabilityAssessment",
     "MethodClass",
+    "MaterialField",
     "ObjectiveDirection",
     "ParameterDescriptor",
     "ParameterType",

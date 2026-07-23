@@ -63,6 +63,23 @@ from .literature_rag import (
     load_evidence_bundle,
     save_evidence_bundle,
 )
+from .material_domains import (
+    MATERIAL_FIELD_PROFILES,
+    DomainValidatorSpec,
+    MaterialFieldModelDecision,
+    MaterialFieldModelRun,
+    MaterialDomainPlan,
+    MaterialFieldProfile,
+    MaterialFieldResolution,
+    MaterialFieldResultAssessment,
+    MaterialPropertyDecision,
+    MaterialPropertyObservation,
+    MaterialPropertyRequirement,
+    MaterialStageRoute,
+    build_main_model_material_field_classifier_from_environment,
+    build_material_domain_plan,
+    get_material_field_profile,
+)
 from .mock_model import MockDiscoveryModel
 from .dft_handoff import DFTInputHandoffReport, DFTInputManifest
 from .novelty import ScientificNoveltyAssessment
@@ -132,6 +149,17 @@ SCHEMA_TYPES = {
         ValidationHandoffContract,
         ValidatorAuthority,
         McpEvidenceContract,
+        DomainValidatorSpec,
+        MaterialFieldModelDecision,
+        MaterialFieldModelRun,
+        MaterialDomainPlan,
+        MaterialFieldProfile,
+        MaterialFieldResolution,
+        MaterialFieldResultAssessment,
+        MaterialPropertyRequirement,
+        MaterialPropertyDecision,
+        MaterialPropertyObservation,
+        MaterialStageRoute,
         WorkspaceComparisonReport,
         WorkspaceEntityInput,
         WorkspacePairedRunReport,
@@ -209,6 +237,73 @@ def _profiles(_args: argparse.Namespace) -> int:
             }
         )
     print(json.dumps(rows, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _material_fields(args: argparse.Namespace) -> int:
+    if args.field:
+        print(get_material_field_profile(args.field).model_dump_json(indent=2))
+        return 0
+    rows = [
+        {
+            "material_field": str(field),
+            "profile_id": profile.profile_id,
+            "name": profile.name,
+            "discovery_domain": profile.discovery_domain,
+            "candidate_types": profile.candidate_types,
+            "required_problem_context": profile.required_problem_context,
+            "required_properties": [
+                {
+                    "property_name": item.property_name,
+                    "unit": item.unit,
+                    "missing_result_policy": item.missing_result_policy,
+                }
+                for item in profile.properties
+                if item.required_for_field_claim
+            ],
+            "field_claim_boundary": profile.field_claim_boundary,
+        }
+        for field, profile in sorted(
+            MATERIAL_FIELD_PROFILES.items(), key=lambda item: str(item[0])
+        )
+    ]
+    print(json.dumps(rows, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _material_route(args: argparse.Namespace) -> int:
+    try:
+        context = json.loads(args.context_json) if args.context_json else {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit("--context-json must contain valid JSON") from exc
+    if not isinstance(context, dict):
+        raise SystemExit("--context-json must decode to a JSON object")
+    model_run = None
+    requested_auto = str(args.field).strip().casefold() in {"", "auto", "자동"}
+    if args.use_main_model and requested_auto:
+        if not args.prompt.strip():
+            raise SystemExit("--use-main-model requires a non-empty --prompt")
+        classifier = build_main_model_material_field_classifier_from_environment(
+            required=True
+        )
+        assert classifier is not None
+        model_run = classifier.classify(
+            args.prompt,
+            chemical_system=args.chemical_system,
+            problem_context=context,
+        )
+    plan = build_material_domain_plan(
+        args.field,
+        prompt=args.prompt,
+        chemical_system=args.chemical_system,
+        problem_context=context,
+        model_run=model_run,
+    )
+    if args.fail_on_ambiguous and plan.resolution.requires_operator_choice:
+        raise SystemExit(
+            "AUTO material-field routing is ambiguous; pass an explicit --field"
+        )
+    print(plan.model_dump_json(indent=2))
     return 0
 
 
@@ -577,6 +672,48 @@ def make_parser() -> argparse.ArgumentParser:
 
     profiles = subparsers.add_parser("profiles", help="list code-owned validation gates")
     profiles.set_defaults(handler=_profiles)
+
+    material_fields = subparsers.add_parser(
+        "material-fields",
+        help=(
+            "list field-specific material properties, units, validators, and "
+            "claim boundaries"
+        ),
+    )
+    material_fields.add_argument(
+        "--field",
+        choices=[str(item) for item in MATERIAL_FIELD_PROFILES],
+    )
+    material_fields.set_defaults(handler=_material_fields)
+
+    material_route = subparsers.add_parser(
+        "material-route",
+        help=(
+            "resolve a material field with code-owned rules and optional main-model "
+            "reconciliation, then print its five-stage RAG/MCP/validator plan"
+        ),
+    )
+    material_route.add_argument("--field", default="AUTO")
+    material_route.add_argument("--prompt", default="")
+    material_route.add_argument("--chemical-system")
+    material_route.add_argument(
+        "--context-json",
+        help="JSON object with temperature, pressure, application conditions, and other context",
+    )
+    material_route.add_argument(
+        "--use-main-model",
+        action="store_true",
+        help=(
+            "classify with MATERIAL_FIELD_MODEL_* (or RAG_MODEL_*) and reconcile "
+            "the structured result with deterministic routing"
+        ),
+    )
+    material_route.add_argument(
+        "--fail-on-ambiguous",
+        action="store_true",
+        help="stop instead of falling back to general screening when AUTO ties",
+    )
+    material_route.set_defaults(handler=_material_route)
 
     schema = subparsers.add_parser("schema", help="print a model-connection JSON Schema")
     schema.add_argument("name")

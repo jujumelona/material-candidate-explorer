@@ -69,6 +69,82 @@ The scientific choices and claim boundaries are mapped to primary sources in [Re
 
 `MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb` is the recommended material-candidate workflow. It runs a budgeted, multi-round `fusion-search`: the MatterGen sidecar performs raw-geometry, tolerance-aware within-call and search-session duplicate rejection before MatterSim and CHGNet evaluation; evaluated candidates are then inserted into persistent evidence and branch pools and used to schedule the next round. The coordinator's attested-hash check is a defensive post-evaluation fallback, not a replacement for `StructureMatcher`. Global generator-call and generated-candidate limits cover every round, branch, frontier, and control variant. A MAXIMUM run does not fabricate candidates or silently accept a shortfall: rejection, sidecar failure, deduplication, or frontier exhaustion is preserved in the funnel and the notebook fails closed if it cannot establish the requested 8-32 crystallographically unique candidates. It then runs explicit MLIP relaxations, composition-scoped Pareto ranking with crowding, staged structural novelty checks, and research-only DFT input preparation for the top 1-5 candidates.
 
+### Field-aware T4 routing
+
+Set `MATERIAL_FIELD` in the notebook Setup cell to `AUTO` or to one explicit
+profile ID. An explicit profile always wins. For `AUTO`,
+`MAIN_AI_FIELD_ROUTING` controls the optional main-AI classifier:
+
+- `AUTO` (default) uses the classifier when a model endpoint is configured and
+  otherwise uses deterministic code-owned matching.
+- `REQUIRED` refuses to generate candidates unless the classifier is configured
+  and returns a usable, reconciled decision.
+- `OFF` never calls the classifier and uses deterministic matching only.
+
+The classifier returns a typed primary field, up to four genuinely secondary
+fields, one code-allowed application subtype, confidence, literal evidence
+spans from the supplied prompt, chemical system, or problem context, and an
+optional clarification question. At least one span must identify the
+application in the prompt or problem context; a composition alone is
+insufficient. The runtime verifies every span before reconciling the
+proposal with the deterministic scorer. Agreement is recorded as
+`auto-consensus`. A verified decision can resolve a deterministic no-match or
+tie, but model clarification, confidence below 0.70, or disagreement between
+the two routes becomes `auto-model-conflict`, falls back to general screening,
+and requires an operator choice. The model never chooses an API, MCP endpoint
+or tool, calculation engine, or scientific pass/fail result. The model's
+confidence is an uncalibrated routing signal, not scientific uncertainty or a
+material-property probability.
+
+The 12 profiles are `general_inorganic`, `battery_electrode`, `solid_electrolyte`, `superconductor`, `heterogeneous_catalyst`, `semiconductor`, `photovoltaic_absorber`, `thermoelectric`, `magnetic_material`, `ferroelectric_piezoelectric`, `structural_alloy`, and `porous_framework`. Each profile fixes its required problem context, property names and units, preferred calculations, experimental confirmation, RAG questions, MCP capabilities, and fail-closed claim boundary.
+
+Inspect or resolve the same profiles without opening the notebook:
+
+~~~bash
+# List all 12 profiles and their required field properties
+discovery-os material-fields
+
+# Inspect one explicit profile
+discovery-os material-fields --field solid_electrolyte
+
+# Preview AUTO routing from a prompt; stop if two fields tie
+discovery-os material-route \
+  --field AUTO \
+  --prompt "Find a stable lithium solid electrolyte with high ionic conductivity" \
+  --fail-on-ambiguous
+
+# Optionally classify with the main reasoning endpoint and reconcile both routes
+export MATERIAL_FIELD_MODEL_API_URL="https://YOUR-OPENAI-COMPATIBLE-ENDPOINT/v1"
+export MATERIAL_FIELD_MODEL_NAME="YOUR-MODEL"
+export MATERIAL_FIELD_MODEL_API_KEY="" # optional when the endpoint needs no key
+discovery-os material-route \
+  --field AUTO \
+  --prompt "Find a stable lithium solid electrolyte with high ionic conductivity" \
+  --chemical-system "Li-P-S" \
+  --context-json '{"mobile_ion":"Li","temperature":300}' \
+  --use-main-model \
+  --fail-on-ambiguous
+
+# Force an explicit, reproducible field route
+discovery-os material-route \
+  --field heterogeneous_catalyst \
+  --prompt "Screen CO2 reduction catalyst surfaces"
+~~~
+
+The dedicated URL and model name are one atomic pair. If either
+`MATERIAL_FIELD_MODEL_API_URL` or `MATERIAL_FIELD_MODEL_NAME` is supplied,
+both are required and the classifier uses only the dedicated key and timeout.
+When the pair is entirely absent, the complete `RAG_MODEL_*` configuration is
+reused instead; individual dedicated and RAG fields are never cross-paired.
+`--use-main-model` requires one complete pair. Without that flag, the CLI uses
+deterministic routing. The notebook applies the stricter
+`MAIN_AI_FIELD_ROUTING` policy above.
+
+The selected profile specializes all five evidence boundaries: `generation_prior`, `identity_novelty`, `mlip_disagreement`, `relaxation_validation`, and `dft_handoff`. Every stage request carries the code-validated application subtype and declared operating context, so retrieval is conditioned on the actual task instead of only a broad field label. RAG and the administrator-configured MCP tool remain read-only evidence context at every boundary; only source-closed generation-prior evidence may steer generation. Generic MatterGen + MatterSim + CHGNet output is candidate triage, not proof of battery, superconducting, catalytic, electronic, thermal, magnetic, mechanical, or adsorption performance. A field property remains `unknown`, never passing or zero, until the profile's named numerical or experimental validator actually runs and its provenance is preserved.
+Field-specific computational ranking additionally requires one complete target-condition set; results from different operating conditions are incomparable and are never averaged.
+
+See [Domain-specific material workflows](docs/DOMAIN_MATERIAL_WORKFLOWS.md) for the property/validator matrix, stage-specific retrieval questions, MCP capability contracts, and scientific claim boundaries.
+
 ~~~text
 bounded multi-round MatterGen search -> pre-expert strict duplicate rejection
 -> scaled-prototype relation retained separately
@@ -91,6 +167,14 @@ At five intermediate boundaries the notebook also runs source-grounded validatio
 Crossref, arXiv, and OpenAlex are bounded scholarly metadata sources. Optional MCP Streamable HTTP tools may be selected only from the stage variables above, with `MATERIAL_RAG_MCP_TOOL` as the administrator-configured generic fallback. The client verifies the selected tool through bounded `tools/list`, checks its input/output contract, and rejects unstructured evidence. A prompt or model output cannot select an endpoint or tool. Missing providers, missing credentials, empty retrieval, schema mismatch, or errors are recorded as `partial`, `skipped`, or `unknown`; they never become a candidate property score or a validator pass.
 
 RAG and MCP have distinct jobs here. RAG retrieves and closes scholarly evidence into citable records. The optional MCP route is only a configured structured evidence-provider interface; it is not permission to execute a model, database write, relaxation, or DFT job. Runtime sidecars, the strict structure matcher, external structure clients, and an explicitly configured periodic DFT backend remain the action validators.
+
+This repository ships the MCP client and capability contract, not official
+MCP servers from Materials Project, OPTIMADE, COD, OpenKIM, NOMAD, AiiDA, OCP,
+or the other upstream projects named by the capability labels. Configure a
+read-only server or adapter that you administer and whose `tools/list` schema
+matches the contract, or leave MCP unset. A capability ID such as
+`materials-project-structure-search` is a required evidence function, not a
+claim that the upstream project publishes a same-named MCP tool.
 
 Each route persists a typed evidence handoff naming its consumer, payload schema, and still-required runtime validator. Only a source-grounded `generation_prior` handoff may guide a Fusion decision; identity, MLIP, relaxation, and DFT handoffs cannot steer generation. The evidence router never marks its listed validators as executed.
 

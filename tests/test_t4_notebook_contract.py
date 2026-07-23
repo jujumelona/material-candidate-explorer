@@ -260,6 +260,71 @@ def test_t4_notebook_runs_all_stage_specific_evidence_routes() -> None:
     )
 
 
+def test_t4_notebook_routes_one_audited_material_field_fail_closed() -> None:
+    notebook = _load_notebook()
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+
+    assert 'MATERIAL_FIELD = "AUTO"' in source
+    assert 'MAIN_AI_FIELD_ROUTING = "AUTO"' in source
+    for field in (
+        "general_inorganic",
+        "battery_electrode",
+        "solid_electrolyte",
+        "superconductor",
+        "heterogeneous_catalyst",
+        "semiconductor",
+        "photovoltaic_absorber",
+        "thermoelectric",
+        "magnetic_material",
+        "ferroelectric_piezoelectric",
+        "structural_alloy",
+        "porous_framework",
+    ):
+        assert field in source
+    for contract in (
+        "build_material_domain_plan(",
+        "build_main_model_material_field_classifier_from_environment(",
+        'MAIN_AI_FIELD_ROUTING == "REQUIRED"',
+        'MATERIAL_FIELD_MODEL_API_URL = ""',
+        'MATERIAL_FIELD_MODEL_NAME = ""',
+        "MATERIAL_PROBLEM_CONTEXT_JSON",
+        "main_field_classifier.classify(",
+        "chemical_system=chemical_system",
+        "problem_context=material_problem_context",
+        "model_run=main_model_run",
+        "domain_plan.main_model_run.model_dump",
+        "domain_plan.main_model_run.endpoint_or_tool_selection_performed",
+        "domain_plan.resolution.requires_operator_choice",
+        "domain_plan.missing_required_context",
+        "if not domain_plan.field_route_ready",
+        "selected_validation_profile = get_validation_profile(",
+        "domain=domain_plan.profile.discovery_domain",
+        "validation_profile_id=selected_validation_profile.profile_id",
+        'candidate_types=[CandidateType.CRYSTAL]',
+        "MATERIAL_DOMAIN_PLAN_PATH",
+        '"material-domain-plan.json"',
+        "MATERIAL_DOMAIN_FINAL_AUDIT_PATH",
+        '"material-domain-final-audit.json"',
+        "domain_plan.unexecuted_required_properties",
+        '"field_specific_property_calculation_executed": False',
+        "GENERIC_T4_FIELD_PROPERTY_BOUNDARY",
+    ):
+        assert contract in source
+    assert source.count(
+        "material_field=domain_plan.profile.material_field"
+    ) == 5
+    assert source.count(
+        "application_subtype=domain_plan.resolution.application_subtype"
+    ) == 5
+    assert source.count("problem_context=material_problem_context") >= 7
+    assert source.index(
+        "main_field_classifier.classify("
+    ) < source.index("draft_parent = Candidate(")
+    assert source.index(
+        "domain_plan = build_material_domain_plan("
+    ) < source.index("draft_parent = Candidate(")
+
+
 def test_t4_notebook_uses_one_global_adaptive_fusion_search() -> None:
     notebook = _load_notebook()
     source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
