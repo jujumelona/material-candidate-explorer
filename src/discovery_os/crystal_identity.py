@@ -14,11 +14,22 @@ import importlib
 import json
 import math
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 
 _FINGERPRINT_SCHEMA = "crystal-structure-fingerprint-v1"
+_IDENTITY_FINGERPRINT_SCHEMA = "crystal-raw-identity-fingerprint-v2"
+CRYSTAL_IDENTITY_CANONICALIZATION = "source-niggli-no-symmetry-v2"
+
+_STRICT_MATCH_LATTICE_TOLERANCE = 0.02
+_STRICT_MATCH_SITE_TOLERANCE = 0.05
+_STRICT_MATCH_ANGLE_TOLERANCE = 1.0
+_STRICT_MATCH_MAX_RELATIVE_VOLUME_DIFFERENCE = 0.03
+_SCALED_MATCH_LATTICE_TOLERANCE = 0.2
+_SCALED_MATCH_SITE_TOLERANCE = 0.3
+_SCALED_MATCH_ANGLE_TOLERANCE = 5.0
 
 
 class CrystalIdentityError(ValueError):
@@ -31,6 +42,64 @@ class PymatgenRequiredError(CrystalIdentityError):
 
 class InvalidCrystalGeometryError(CrystalIdentityError):
     """A parsed crystal fails a hard geometry-safety constraint."""
+
+
+class CrystalMatchRelation(str, Enum):
+    """Scientific relation between two species-preserving periodic structures.
+
+    Only ``STRICT_MATERIAL_DUPLICATE`` is eligible for hard deduplication.
+    ``SCALED_SAME_PROTOTYPE`` deliberately preserves both candidates because
+    matching required normalization to an equivalent volume.  ``AMBIGUOUS`` is
+    fail-closed: a comparison problem or direction-dependent result must never
+    silently remove a candidate.
+    """
+
+    STRICT_MATERIAL_DUPLICATE = "strict_material_duplicate"
+    SCALED_SAME_PROTOTYPE = "scaled_same_prototype"
+    AMBIGUOUS = "ambiguous"
+    DISTINCT = "distinct"
+
+
+@dataclass(frozen=True, slots=True)
+class CrystalMatcherSettings:
+    """Complete, reviewable ``StructureMatcher`` settings for one comparison."""
+
+    ltol: float
+    stol: float
+    angle_tol: float
+    primitive_cell: bool
+    scale: bool
+    attempt_supercell: bool
+    allow_subset: bool
+    max_relative_volume_difference: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CrystalMatchAssessment:
+    """Typed result separating hard identity from scaled prototype similarity."""
+
+    relation: CrystalMatchRelation
+    strict_match: bool | None
+    scaled_match: bool | None
+    relative_volume_difference: float
+    strict_settings: CrystalMatcherSettings
+    scaled_settings: CrystalMatcherSettings
+    reason: str | None = None
+
+    @property
+    def hard_deduplication_allowed(self) -> bool:
+        """Whether one of the two candidate records may be removed scientifically."""
+
+        return self.relation == CrystalMatchRelation.STRICT_MATERIAL_DUPLICATE
+
+
+@dataclass(frozen=True, slots=True)
+class CrystalAmbiguousComparison:
+    """A fail-closed pair that could not be assigned a strict identity result."""
+
+    left_index: int
+    right_index: int
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,14 +118,23 @@ class CrystalGeometryReport:
 
 @dataclass(frozen=True, slots=True)
 class CanonicalCrystalStructure:
-    """A deterministic primitive representation plus preserved standard-cell data."""
+    """Separate symmetry-standardized context from deletion-safe identity.
+
+    ``canonical_structure`` and ``structure_hash`` preserve the historical
+    primitive standardized scientific/prototype fingerprint.  Hard deletion
+    uses only ``identity_structure`` and ``identity_structure_hash``, which are
+    Niggli-reduced directly from the parsed source without symmetry refinement.
+    """
 
     canonical_structure: Any
+    identity_structure: Any
     primitive_structure: Any
     conventional_structure: Any
     canonical_cif: str
     fingerprint: dict[str, Any]
     structure_hash: str
+    identity_fingerprint: dict[str, Any]
+    identity_structure_hash: str
     geometry: CrystalGeometryReport
     source_atom_count: int
     primitive_atom_count: int
@@ -80,6 +158,8 @@ class CrystalGroupingResult:
 
     canonical_structures: tuple[CanonicalCrystalStructure, ...]
     groups: tuple[CrystalStructureGroup, ...]
+    matcher_settings: CrystalMatcherSettings
+    ambiguous_comparisons: tuple[CrystalAmbiguousComparison, ...] = ()
 
     @property
     def unique_indices(self) -> tuple[int, ...]:
@@ -261,7 +341,7 @@ def canonicalize_crystal_structure(
     coordinate_decimals: int = 10,
     max_cif_bytes: int = 4 * 1024 * 1024,
 ) -> CanonicalCrystalStructure:
-    """Return a deterministic Niggli-reduced primitive cell and standard-cell context."""
+    """Return separate prototype context and non-symmetrized hard identity."""
 
     if not math.isfinite(symprec) or symprec <= 0:
         raise ValueError("symprec must be finite and positive")
@@ -308,11 +388,19 @@ def canonicalize_crystal_structure(
         raise CrystalIdentityError("primitive-cell standardization produced an invalid atom count")
     try:
         reduced = primitive.get_reduced_structure(reduction_algo="niggli")
+        # Hard identity must retain the generated geometry. Applying
+        # SpacegroupAnalyzer's symprec before this step could idealize a
+        # genuine symmetry-breaking displacement and create a false duplicate.
+        identity_reduced = source.get_reduced_structure(reduction_algo="niggli")
     except Exception as exc:
         raise CrystalIdentityError(
             f"pymatgen Niggli reduction failed: {type(exc).__name__}: {exc}"
         ) from exc
     canonical = _canonical_site_order(reduced, decimals=coordinate_decimals)
+    identity = _canonical_site_order(
+        identity_reduced,
+        decimals=coordinate_decimals,
+    )
     fingerprint = _fingerprint_payload(
         canonical,
         symprec=symprec,
@@ -320,6 +408,11 @@ def canonicalize_crystal_structure(
         coordinate_decimals=coordinate_decimals,
     )
     structure_hash = _payload_hash(fingerprint)
+    identity_fingerprint = _identity_fingerprint_payload(
+        identity,
+        coordinate_decimals=coordinate_decimals,
+    )
+    identity_structure_hash = _payload_hash(identity_fingerprint)
     try:
         writer = modules["cif"].CifWriter(
             canonical,
@@ -335,11 +428,14 @@ def canonicalize_crystal_structure(
         raise CrystalIdentityError("canonical CIF is empty or exceeds the representation limit")
     return CanonicalCrystalStructure(
         canonical_structure=canonical,
+        identity_structure=identity,
         primitive_structure=primitive,
         conventional_structure=conventional,
         canonical_cif=canonical_cif,
         fingerprint=fingerprint,
         structure_hash=structure_hash,
+        identity_fingerprint=identity_fingerprint,
+        identity_structure_hash=identity_structure_hash,
         geometry=geometry,
         source_atom_count=len(source),
         primitive_atom_count=len(primitive),
@@ -361,63 +457,196 @@ def canonical_structure_hash(value: Any, **kwargs: Any) -> str:
     return canonicalize_crystal_structure(value, **kwargs).structure_hash
 
 
+def classify_crystal_structure_relation(
+    first: Any,
+    second: Any,
+    *,
+    strict_ltol: float = _STRICT_MATCH_LATTICE_TOLERANCE,
+    strict_stol: float = _STRICT_MATCH_SITE_TOLERANCE,
+    strict_angle_tol: float = _STRICT_MATCH_ANGLE_TOLERANCE,
+    strict_max_relative_volume_difference: float = (
+        _STRICT_MATCH_MAX_RELATIVE_VOLUME_DIFFERENCE
+    ),
+    scaled_ltol: float = _SCALED_MATCH_LATTICE_TOLERANCE,
+    scaled_stol: float = _SCALED_MATCH_SITE_TOLERANCE,
+    scaled_angle_tol: float = _SCALED_MATCH_ANGLE_TOLERANCE,
+    canonicalization_kwargs: dict[str, Any] | None = None,
+) -> CrystalMatchAssessment:
+    """Classify a pair without confusing scaled similarity with a duplicate.
+
+    Both matchers preserve species identity, reduce primitive cells, and permit
+    equivalent supercell descriptions.  The strict pass does *not* normalize
+    volumes and also applies a symmetric relative-volume guard.  Only when that
+    pass fails is the scale-normalized matcher used to identify a related
+    prototype.  Matcher failures and direction-dependent legacy results are
+    returned as ``AMBIGUOUS`` so callers preserve both candidates.
+    """
+
+    strict_settings = _matcher_settings(
+        ltol=strict_ltol,
+        stol=strict_stol,
+        angle_tol=strict_angle_tol,
+        scale=False,
+        max_relative_volume_difference=strict_max_relative_volume_difference,
+    )
+    scaled_settings = _matcher_settings(
+        ltol=scaled_ltol,
+        stol=scaled_stol,
+        angle_tol=scaled_angle_tol,
+        scale=True,
+        max_relative_volume_difference=None,
+    )
+    kwargs = dict(canonicalization_kwargs or {})
+    canonical = tuple(
+        item
+        if isinstance(item, CanonicalCrystalStructure)
+        else canonicalize_crystal_structure(item, **kwargs)
+        for item in (first, second)
+    )
+    relative_volume_difference = _relative_volume_difference(
+        canonical[0].identity_structure,
+        canonical[1].identity_structure,
+    )
+    strict_match, strict_reason = _fit_with_settings(
+        canonical[0].identity_structure,
+        canonical[1].identity_structure,
+        strict_settings,
+    )
+    if strict_match is None:
+        return CrystalMatchAssessment(
+            relation=CrystalMatchRelation.AMBIGUOUS,
+            strict_match=None,
+            scaled_match=None,
+            relative_volume_difference=relative_volume_difference,
+            strict_settings=strict_settings,
+            scaled_settings=scaled_settings,
+            reason=strict_reason,
+        )
+    volume_within_strict_limit = (
+        relative_volume_difference
+        <= strict_max_relative_volume_difference
+    )
+    if strict_match and volume_within_strict_limit:
+        return CrystalMatchAssessment(
+            relation=CrystalMatchRelation.STRICT_MATERIAL_DUPLICATE,
+            strict_match=True,
+            scaled_match=True,
+            relative_volume_difference=relative_volume_difference,
+            strict_settings=strict_settings,
+            scaled_settings=scaled_settings,
+        )
+
+    scaled_match, scaled_reason = _fit_with_settings(
+        canonical[0].identity_structure,
+        canonical[1].identity_structure,
+        scaled_settings,
+    )
+    if scaled_match is None:
+        return CrystalMatchAssessment(
+            relation=CrystalMatchRelation.AMBIGUOUS,
+            strict_match=strict_match,
+            scaled_match=None,
+            relative_volume_difference=relative_volume_difference,
+            strict_settings=strict_settings,
+            scaled_settings=scaled_settings,
+            reason=scaled_reason,
+        )
+    if strict_match and not volume_within_strict_limit and not scaled_match:
+        return CrystalMatchAssessment(
+            relation=CrystalMatchRelation.AMBIGUOUS,
+            strict_match=True,
+            scaled_match=False,
+            relative_volume_difference=relative_volume_difference,
+            strict_settings=strict_settings,
+            scaled_settings=scaled_settings,
+            reason="strict_match_exceeded_volume_guard_but_scaled_match_failed",
+        )
+    return CrystalMatchAssessment(
+        relation=(
+            CrystalMatchRelation.SCALED_SAME_PROTOTYPE
+            if scaled_match
+            else CrystalMatchRelation.DISTINCT
+        ),
+        strict_match=(strict_match and volume_within_strict_limit),
+        scaled_match=scaled_match,
+        relative_volume_difference=relative_volume_difference,
+        strict_settings=strict_settings,
+        scaled_settings=scaled_settings,
+        reason=(
+            "strict_match_exceeded_relative_volume_guard"
+            if strict_match and not volume_within_strict_limit
+            else None
+        ),
+    )
+
+
 def group_crystal_structures(
     structures: list[Any] | tuple[Any, ...],
     *,
-    ltol: float = 0.2,
-    stol: float = 0.3,
-    angle_tol: float = 5.0,
+    ltol: float = _STRICT_MATCH_LATTICE_TOLERANCE,
+    stol: float = _STRICT_MATCH_SITE_TOLERANCE,
+    angle_tol: float = _STRICT_MATCH_ANGLE_TOLERANCE,
+    max_relative_volume_difference: float = (
+        _STRICT_MATCH_MAX_RELATIVE_VOLUME_DIFFERENCE
+    ),
     canonicalization_kwargs: dict[str, Any] | None = None,
 ) -> CrystalGroupingResult:
-    """Group equivalent structures with ``StructureMatcher`` in stable input order.
+    """Hard-group strict material duplicates in stable input order.
 
     Canonical hashes are useful cache keys, but grouping intentionally does not
     rely on hash equality: ``StructureMatcher`` is the final scientific duplicate
-    decision and accepts primitive/supercell-equivalent representations.
+    decision and accepts primitive/supercell-equivalent representations.  Hard
+    grouping always uses ``scale=False`` and a relative-volume guard.  Use
+    :func:`classify_crystal_structure_relation` to detect scale-normalized
+    same-prototype candidates without deleting them.
     """
 
+    settings = _matcher_settings(
+        ltol=ltol,
+        stol=stol,
+        angle_tol=angle_tol,
+        scale=False,
+        max_relative_volume_difference=max_relative_volume_difference,
+    )
     if not structures:
-        return CrystalGroupingResult(canonical_structures=(), groups=())
+        return CrystalGroupingResult(
+            canonical_structures=(),
+            groups=(),
+            matcher_settings=settings,
+        )
     kwargs = dict(canonicalization_kwargs or {})
     canonical = tuple(
         item if isinstance(item, CanonicalCrystalStructure) else canonicalize_crystal_structure(item, **kwargs)
         for item in structures
     )
-    matcher_type = _pymatgen_modules()["matcher"].StructureMatcher
-    matcher = matcher_type(
-        ltol=ltol,
-        stol=stol,
-        angle_tol=angle_tol,
-        primitive_cell=True,
-        scale=True,
-        attempt_supercell=True,
-        allow_subset=False,
-    )
     members: list[list[int]] = []
+    ambiguous: list[CrystalAmbiguousComparison] = []
     for index, current in enumerate(canonical):
         matched = False
         for group in members:
             representative = canonical[group[0]]
-            try:
-                equivalent = bool(
-                    matcher.fit(
-                        representative.canonical_structure,
-                        current.canonical_structure,
-                        symmetric=True,
+            volume_difference = _relative_volume_difference(
+                representative.identity_structure,
+                current.identity_structure,
+            )
+            equivalent, reason = _fit_with_settings(
+                representative.identity_structure,
+                current.identity_structure,
+                settings,
+            )
+            if equivalent is None:
+                ambiguous.append(
+                    CrystalAmbiguousComparison(
+                        left_index=group[0],
+                        right_index=index,
+                        reason=reason or "strict_structure_match_ambiguous",
                     )
                 )
-            except TypeError:
-                # Compatibility with older pymatgen releases lacking ``symmetric``.
-                equivalent = bool(
-                    matcher.fit(
-                        representative.canonical_structure,
-                        current.canonical_structure,
-                    )
-                )
-            except Exception as exc:
-                raise CrystalIdentityError(
-                    f"StructureMatcher comparison failed: {type(exc).__name__}: {exc}"
-                ) from exc
+                continue
+            equivalent = bool(
+                equivalent
+                and volume_difference <= max_relative_volume_difference
+            )
             if equivalent:
                 group.append(index)
                 matched = True
@@ -428,11 +657,16 @@ def group_crystal_structures(
         CrystalStructureGroup(
             representative_index=group[0],
             member_indices=tuple(group),
-            representative_hash=canonical[group[0]].structure_hash,
+            representative_hash=canonical[group[0]].identity_structure_hash,
         )
         for group in members
     )
-    return CrystalGroupingResult(canonical_structures=canonical, groups=groups)
+    return CrystalGroupingResult(
+        canonical_structures=canonical,
+        groups=groups,
+        matcher_settings=settings,
+        ambiguous_comparisons=tuple(ambiguous),
+    )
 
 
 def deduplicate_crystal_structures(
@@ -443,6 +677,100 @@ def deduplicate_crystal_structures(
 
     result = group_crystal_structures(structures, **kwargs)
     return tuple(result.canonical_structures[index] for index in result.unique_indices)
+
+
+def _matcher_settings(
+    *,
+    ltol: float,
+    stol: float,
+    angle_tol: float,
+    scale: bool,
+    max_relative_volume_difference: float | None,
+) -> CrystalMatcherSettings:
+    values = (ltol, stol, angle_tol)
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("StructureMatcher tolerances must be finite and positive")
+    if (
+        max_relative_volume_difference is not None
+        and (
+            not math.isfinite(max_relative_volume_difference)
+            or max_relative_volume_difference < 0
+        )
+    ):
+        raise ValueError(
+            "max_relative_volume_difference must be finite and non-negative"
+        )
+    return CrystalMatcherSettings(
+        ltol=float(ltol),
+        stol=float(stol),
+        angle_tol=float(angle_tol),
+        primitive_cell=True,
+        scale=scale,
+        attempt_supercell=True,
+        allow_subset=False,
+        max_relative_volume_difference=(
+            float(max_relative_volume_difference)
+            if max_relative_volume_difference is not None
+            else None
+        ),
+    )
+
+
+def _fit_with_settings(
+    first: Any,
+    second: Any,
+    settings: CrystalMatcherSettings,
+) -> tuple[bool | None, str | None]:
+    matcher_type = _pymatgen_modules()["matcher"].StructureMatcher
+    matcher = matcher_type(
+        ltol=settings.ltol,
+        stol=settings.stol,
+        angle_tol=settings.angle_tol,
+        primitive_cell=settings.primitive_cell,
+        scale=settings.scale,
+        attempt_supercell=settings.attempt_supercell,
+        allow_subset=settings.allow_subset,
+    )
+    try:
+        return bool(matcher.fit(first, second, symmetric=True)), None
+    except TypeError:
+        # Older pymatgen releases do not expose the symmetric keyword.  Requiring
+        # both directions prevents ordering-dependent deletion in those versions.
+        try:
+            forward = bool(matcher.fit(first, second))
+            reverse = bool(matcher.fit(second, first))
+        except Exception as exc:
+            return None, f"structure_match_failed:{type(exc).__name__}"
+        if forward != reverse:
+            return None, "structure_match_direction_dependent"
+        return forward, None
+    except Exception as exc:
+        return None, f"structure_match_failed:{type(exc).__name__}"
+
+
+def _relative_volume_difference(first: Any, second: Any) -> float:
+    """Return symmetric per-atom volume difference.
+
+    A total-cell comparison would incorrectly reject an otherwise equivalent
+    primitive/supercell pair before ``StructureMatcher`` can establish the
+    mapping.
+    """
+
+    if len(first) < 1 or len(second) < 1:
+        raise CrystalIdentityError("volume comparison requires non-empty structures")
+    first_volume = float(first.volume) / len(first)
+    second_volume = float(second.volume) / len(second)
+    if (
+        not math.isfinite(first_volume)
+        or not math.isfinite(second_volume)
+        or first_volume <= 0
+        or second_volume <= 0
+    ):
+        raise CrystalIdentityError(
+            "relative-volume comparison requires finite positive cell volumes"
+        )
+    mean_volume = (first_volume + second_volume) / 2.0
+    return abs(first_volume - second_volume) / mean_volume
 
 
 def _pymatgen_modules() -> dict[str, Any]:
@@ -597,7 +925,10 @@ def _fingerprint_payload(
     angle_tolerance: float,
     coordinate_decimals: int,
 ) -> dict[str, Any]:
-    lattice = structure.lattice
+    payload = _structure_fingerprint_fields(
+        structure,
+        coordinate_decimals=coordinate_decimals,
+    )
     return {
         "schema": _FINGERPRINT_SCHEMA,
         "standardization": {
@@ -606,6 +937,37 @@ def _fingerprint_payload(
             "angle_tolerance_degrees": angle_tolerance,
             "coordinate_decimals": coordinate_decimals,
         },
+        **payload,
+    }
+
+
+def _identity_fingerprint_payload(
+    structure: Any,
+    *,
+    coordinate_decimals: int,
+) -> dict[str, Any]:
+    payload = _structure_fingerprint_fields(
+        structure,
+        coordinate_decimals=coordinate_decimals,
+    )
+    return {
+        "schema": _IDENTITY_FINGERPRINT_SCHEMA,
+        "standardization": {
+            "cell": "source_niggli",
+            "symmetry_refinement_used_for_identity": False,
+            "coordinate_decimals": coordinate_decimals,
+        },
+        **payload,
+    }
+
+
+def _structure_fingerprint_fields(
+    structure: Any,
+    *,
+    coordinate_decimals: int,
+) -> dict[str, Any]:
+    lattice = structure.lattice
+    return {
         "composition": {
             str(key): round(float(value), 12)
             for key, value in sorted(structure.composition.as_dict().items())
@@ -642,15 +1004,21 @@ def _payload_hash(payload: dict[str, Any]) -> str:
 
 
 __all__ = [
+    "CRYSTAL_IDENTITY_CANONICALIZATION",
+    "CrystalAmbiguousComparison",
     "CanonicalCrystalStructure",
     "CrystalGeometryReport",
     "CrystalGroupingResult",
     "CrystalIdentityError",
+    "CrystalMatchAssessment",
+    "CrystalMatcherSettings",
+    "CrystalMatchRelation",
     "CrystalStructureGroup",
     "InvalidCrystalGeometryError",
     "PymatgenRequiredError",
     "canonical_structure_hash",
     "canonicalize_crystal_structure",
+    "classify_crystal_structure_relation",
     "crystal_structure_fingerprint",
     "deduplicate_crystal_structures",
     "exact_file_hash",

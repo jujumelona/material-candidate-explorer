@@ -577,6 +577,15 @@ class DesiredChange(StrictSchema):
     direction: Literal["increase", "decrease", "target", "preserve", "explore"]
     property_name: str | None = Field(default=None, max_length=256)
     target_value: JsonValue = None
+    unit: str | None = Field(default=None, max_length=128)
+    source: Literal[
+        "controller_rule",
+        "declared_search_prior",
+        "explicit_goal",
+        "expert_evidence",
+        "literature_generator_hint",
+        "parent_candidate",
+    ] = "controller_rule"
     rationale: NonEmptyText
 
     @model_validator(mode="after")
@@ -714,6 +723,9 @@ class GenerationControls(StrictSchema):
 class WorkspaceRunConfig(StrictSchema):
     workspace_mode: WorkspaceMode
     seed: int = Field(ge=0)
+    # Set by FusionSearchRunner so a stateful generator sidecar can reject and
+    # replace duplicates across calls before expensive expert evaluation.
+    search_session_id: Identifier | None = None
     generator_seed: int | None = Field(default=None, ge=0)
     goal_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     parent_candidate_ref: CandidateRef

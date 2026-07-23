@@ -209,6 +209,83 @@ for component_id in selected:
             weight_revision = revision
             runtime_environment["SIDECAR_WEIGHT_SNAPSHOT_PATH"] = str(snapshot)
             runtime_environment["SIDECAR_WEIGHT_ATTESTATION"] = f"huggingface:{repository}@{revision}"
+        elif kind == "https":
+            revision = weight.get("revision")
+            expected_digest = weight.get("sha256")
+            expected_size = weight.get("expected_size_bytes")
+            download_url = weight.get("download_url")
+            filename = pathlib.PurePosixPath(
+                str(download_url).split("?", 1)[0]
+            ).name
+            if (
+                not isinstance(revision, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", revision)
+                or not isinstance(expected_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+                or not isinstance(expected_size, int)
+                or isinstance(expected_size, bool)
+                or expected_size <= 0
+                or not re.fullmatch(
+                    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,254}[A-Za-z0-9])?",
+                    filename,
+                )
+            ):
+                fail(f"HTTPS weight metadata is invalid for {component_id!r}")
+            artifact_root = (
+                install_root / "models" / component_id / weight["weight_id"] / revision
+            ).resolve()
+            artifact = (artifact_root / filename).resolve()
+            try:
+                artifact.relative_to(artifact_root)
+                artifact_root.relative_to(install_root)
+            except ValueError:
+                fail(f"HTTPS weight artifact for {component_id!r} escapes InstallRoot")
+            marker_path = artifact_root / ".artifact.json"
+            try:
+                marker = json.loads(
+                    marker_path.read_text(encoding="utf-8"),
+                    object_pairs_hook=unique_object,
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                fail(
+                    f"verified artifact marker is missing or unreadable for "
+                    f"{component_id!r}: {exc}"
+                )
+            expected_marker = {
+                "schema_version": "1.0",
+                "download_url": download_url,
+                "revision": revision,
+                "filename": filename,
+                "sha256": expected_digest,
+                "size_bytes": expected_size,
+            }
+            if marker != expected_marker:
+                fail(
+                    f"artifact marker does not match the integration manifest for "
+                    f"{component_id!r}"
+                )
+            if not artifact.is_file() or artifact.is_symlink():
+                fail(f"verified HTTPS weight is missing for {component_id!r}")
+            digest = hashlib.sha256()
+            with artifact.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            if (
+                artifact.stat().st_size != expected_size
+                or digest.hexdigest() != expected_digest
+            ):
+                fail(f"verified HTTPS weight bytes changed for {component_id!r}")
+            weight_revision = f"sha256:{expected_digest}"
+            if declared_revision and declared_revision.lower() != weight_revision:
+                fail(f"{weight_env} conflicts with the manifest-pinned HTTPS weight")
+            checkpoint_name = {
+                "mattersim": "MATTERSIM_CHECKPOINT_PATH",
+                "chgnet": "CHGNET_CHECKPOINT_PATH",
+            }.get(component_id)
+            if checkpoint_name is None:
+                fail(f"HTTPS weight binding is not implemented for {component_id!r}")
+            runtime_environment[checkpoint_name] = str(artifact)
+            runtime_environment["SIDECAR_WEIGHT_ATTESTATION"] = weight_revision
         elif kind == "manual":
             if component_id == "scgpt":
                 raw_path = os.environ.get("SCGPT_CHECKPOINT_DIR", "").strip()
@@ -335,22 +412,30 @@ for component_id in selected:
                 runtime_environment[path_name] = str(local_path)
                 runtime_environment["SIDECAR_WEIGHT_ATTESTATION"] = weight_revision
         elif kind == "managed":
-            local_raw = os.environ.get("MATTERSIM_CHECKPOINT_PATH", "").strip() if component_id == "mattersim" else ""
+            managed_path_name = {
+                "mattersim": "MATTERSIM_CHECKPOINT_PATH",
+                "chgnet": "CHGNET_CHECKPOINT_PATH",
+            }.get(component_id)
+            local_raw = (
+                os.environ.get(managed_path_name, "").strip()
+                if managed_path_name is not None
+                else ""
+            )
             if local_raw:
                 selected_path = pathlib.Path(local_raw).expanduser()
                 if selected_path.is_symlink():
-                    fail("MATTERSIM_CHECKPOINT_PATH must be a regular non-symlink file")
+                    fail(f"{managed_path_name} must be a regular non-symlink file")
                 local_path = selected_path.resolve()
                 if not local_path.is_file():
-                    fail("MATTERSIM_CHECKPOINT_PATH must be a regular non-symlink file")
+                    fail(f"{managed_path_name} must be a regular non-symlink file")
                 digest = hashlib.sha256()
                 with local_path.open("rb") as handle:
                     for block in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(block)
                 weight_revision = f"sha256:{digest.hexdigest()}"
                 if declared_revision.lower().startswith("sha256:") and declared_revision.lower() != weight_revision:
-                    fail(f"{weight_env} conflicts with MATTERSIM_CHECKPOINT_PATH")
-                runtime_environment["MATTERSIM_CHECKPOINT_PATH"] = str(local_path)
+                    fail(f"{weight_env} conflicts with {managed_path_name}")
+                runtime_environment[managed_path_name] = str(local_path)
                 runtime_environment["SIDECAR_WEIGHT_ATTESTATION"] = weight_revision
             else:
                 if not declared_revision:

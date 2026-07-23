@@ -318,20 +318,41 @@ class CHGNetExpert(LazyModelAdapter[Any]):
         self,
         *,
         model_name: str = "0.3.0",
+        checkpoint_path: str | None = None,
         weight_attestation: str | None = None,
         device: str = "auto",
     ) -> None:
         super().__init__(device=device)
         self.model_name = model_name
+        self.checkpoint_path = checkpoint_path
+        self.checkpoint_sha256 = (
+            sha256_file(checkpoint_path) if checkpoint_path else None
+        )
         self.weight_attestation = weight_attestation
 
     def _load_model(self, device: str) -> Any:
+        if self.checkpoint_path is not None and (
+            self.checkpoint_sha256 is None
+            or sha256_file(self.checkpoint_path) != self.checkpoint_sha256
+        ):
+            raise ModelExecutionError(
+                "CHGNet checkpoint bytes changed after runtime attestation"
+            )
         module = require_module(
             "chgnet.model.model",
             install_hint="install chgnet and pymatgen in this isolated sidecar environment",
         )
         try:
-            model = module.CHGNet.load(model_name=self.model_name)
+            if self.checkpoint_path is None:
+                model = module.CHGNet.load(model_name=self.model_name)
+            else:
+                path = Path(self.checkpoint_path).expanduser().resolve(strict=True)
+                if not path.is_file():
+                    raise ModelExecutionError("CHGNet checkpoint path is not a file")
+                model = module.CHGNet.from_file(
+                    str(path),
+                    version=self.model_name,
+                )
             move = getattr(model, "to", None)
             if callable(move):
                 model = move(device)
@@ -422,6 +443,7 @@ class CHGNetExpert(LazyModelAdapter[Any]):
         return {
             "runtime_class": type(self).__name__,
             "model_name": self.model_name,
+            "checkpoint_sha256": self.checkpoint_sha256,
             "weight_attestation": self.weight_attestation,
             "requested_device": self._requested_device,
         }

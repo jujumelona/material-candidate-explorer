@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "manifest_revision": "31d60868f07110d2303651376b4129921a3043c30ba8da82b170f61a9333a607",
+  "manifest_revision": "f1964864652b1020b4905a0787961dda240a6890105e47865e70f6a6799d6141",
   "generated_at": "2026-07-15T00:00:00+09:00",
   "resolution_cutoff": "2026-07-14T15:00:00Z",
   "uv_version": "0.11.28",
@@ -268,9 +268,13 @@
         {
           "schema_version": "1.0",
           "weight_id": "chgnet-0p3p0-default",
-          "kind": "managed",
+          "kind": "https",
+          "revision": "8d04abc467630b30cd8349c2fe12eeab10f62171",
+          "download_url": "https://raw.githubusercontent.com/CederGroupHub/chgnet/8d04abc467630b30cd8349c2fe12eeab10f62171/chgnet/pretrained/0.3.0/chgnet_0.3.0_e29f68s314m37.pth.tar",
+          "sha256": "d14ab7c0f093efe64b60a7bcd540bca10e74fb7f46c86108a079af60524659d1",
+          "expected_size_bytes": 4863221,
           "gated": false,
-          "notes": ["CHGNet.load() selects the packaged/upstream-managed 0.3.0 checkpoint; record the runtime model name and file hash."]
+          "notes": ["Project-pinned SHA-256 measured from the official immutable v0.4.2 source revision; the sidecar loads this exact CHGNet 0.3.0 file with CHGNet.from_file()."]
         }
       ],
       "api": {
@@ -713,9 +717,13 @@
         {
           "schema_version": "1.0",
           "weight_id": "mattersim-default",
-          "kind": "managed",
+          "kind": "https",
+          "revision": "40a1eb8f1189a53af310957b4f2c5dfbfe68d647",
+          "download_url": "https://raw.githubusercontent.com/microsoft/mattersim/40a1eb8f1189a53af310957b4f2c5dfbfe68d647/pretrained_models/mattersim-v1.0.0-5M.pth",
+          "sha256": "e3df9fa708725e3d453140646c7d1838324b347a3d1214cf1440522146f872b5",
+          "expected_size_bytes": 91176875,
           "gated": false,
-          "notes": ["The upstream package downloads 1M/5M checkpoints on first use."]
+          "notes": ["Project-pinned SHA-256 measured from the official immutable v1.2.5 source revision; MAXIMUM material screening selects the more accurate public 5M checkpoint."]
         }
       ],
       "api": {

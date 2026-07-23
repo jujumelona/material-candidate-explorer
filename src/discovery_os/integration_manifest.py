@@ -144,10 +144,11 @@ class LicenseSpec(StrictSchema):
 
 class WeightSpec(StrictSchema):
     weight_id: Identifier
-    kind: Literal["huggingface", "managed", "manual"]
+    kind: Literal["huggingface", "https", "managed", "manual"]
     repository: str | None = Field(default=None, max_length=512)
     revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     download_url: str | None = Field(default=None, max_length=2_048)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     expected_size_bytes: int | None = Field(default=None, ge=0)
     gated: bool = False
     token_env: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]+$")
@@ -162,6 +163,17 @@ class WeightSpec(StrictSchema):
                 raise ValueError("Hugging Face weights require repository and revision")
             if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository):
                 raise ValueError("Hugging Face repository must use owner/name")
+        elif self.kind == "https":
+            if (
+                self.revision is None
+                or self.download_url is None
+                or self.sha256 is None
+                or self.expected_size_bytes is None
+                or self.expected_size_bytes <= 0
+            ):
+                raise ValueError(
+                    "HTTPS weights require an immutable revision, URL, SHA-256, and positive size"
+                )
         elif self.kind == "manual" and self.download_url is None:
             raise ValueError("manual weights require download_url")
         if self.download_url is not None:

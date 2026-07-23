@@ -32,7 +32,7 @@ DEFAULT_MANIFEST = WORKSPACE / "integrations" / "manifest.v1.json"
 DEFAULT_ROOT = WORKSPACE / ".discovery"
 TRUTHY = {"1", "true", "yes", "accept", "accepted"}
 TRUSTED_DEFAULT_MANIFEST_REVISION = (
-    "31d60868f07110d2303651376b4129921a3043c30ba8da82b170f61a9333a607"
+    "f1964864652b1020b4905a0787961dda240a6890105e47865e70f6a6799d6141"
 )
 SAFE_SLUG = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
 PACKAGE_PIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*==[^\s=<>!~]+$")
@@ -427,15 +427,19 @@ class Installer:
                     if weight_row["action"] != "download":
                         continue
                     weight = weight_specs[weight_row["weight_id"]]
-                    snapshot_marker = (
+                    completion_marker = (
                         self.root
                         / "models"
                         / component_id
                         / weight_row["weight_id"]
                         / weight["revision"]
-                        / ".snapshot.json"
+                        / (
+                            ".artifact.json"
+                            if weight["kind"] == "https"
+                            else ".snapshot.json"
+                        )
                     ).resolve()
-                    if not snapshot_marker.is_file():
+                    if not completion_marker.is_file():
                         already_present = False
                         break
             if not already_present:
@@ -720,6 +724,87 @@ class Installer:
         results: dict[str, Any] = {}
         for weight in component["weights"]:
             weight_id = weight["weight_id"]
+            if weight["kind"] == "https":
+                parsed = urlsplit(weight["download_url"])
+                filename = PurePosixPath(parsed.path).name
+                if re.fullmatch(
+                    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,254}[A-Za-z0-9])?",
+                    filename,
+                ) is None:
+                    raise BootstrapError(
+                        f"HTTPS weight {component['component_id']}/{weight_id} "
+                        "has an unsafe artifact filename"
+                    )
+                models_root = (self.root / "models").resolve()
+                _assert_below(models_root, self.root)
+                destination_root = (
+                    models_root
+                    / component["component_id"]
+                    / weight_id
+                    / weight["revision"]
+                ).resolve()
+                _assert_below(destination_root, models_root)
+                destination = (destination_root / filename).resolve()
+                _assert_below(destination, destination_root)
+                marker = destination_root / ".artifact.json"
+                if destination.is_symlink() or marker.is_symlink():
+                    raise BootstrapError(
+                        f"HTTPS weight path contains a symlink for "
+                        f"{component['component_id']}/{weight_id}"
+                    )
+                if marker.is_file():
+                    try:
+                        existing = json.loads(
+                            marker.read_text(encoding="utf-8"),
+                            object_pairs_hook=_reject_duplicate_json_keys,
+                        )
+                    except (
+                        OSError,
+                        UnicodeError,
+                        json.JSONDecodeError,
+                        BootstrapError,
+                    ) as exc:
+                        raise BootstrapError(
+                            f"existing artifact marker is unreadable for "
+                            f"{component['component_id']}/{weight_id}"
+                        ) from exc
+                    expected_marker = {
+                        "schema_version": "1.0",
+                        "download_url": weight["download_url"],
+                        "revision": weight["revision"],
+                        "filename": filename,
+                        "sha256": weight["sha256"],
+                        "size_bytes": weight["expected_size_bytes"],
+                    }
+                    if existing != expected_marker:
+                        raise BootstrapError(
+                            f"existing artifact marker does not match the trusted "
+                            f"manifest for {component['component_id']}/{weight_id}"
+                        )
+                _download_verified(
+                    weight["download_url"],
+                    destination,
+                    expected_sha256=weight["sha256"],
+                    expected_size=weight["expected_size_bytes"],
+                )
+                _atomic_json(
+                    marker,
+                    {
+                        "schema_version": "1.0",
+                        "download_url": weight["download_url"],
+                        "revision": weight["revision"],
+                        "filename": filename,
+                        "sha256": weight["sha256"],
+                        "size_bytes": weight["expected_size_bytes"],
+                    },
+                )
+                results[weight_id] = {
+                    "status": "downloaded",
+                    "path": str(destination),
+                    "revision": weight["revision"],
+                    "sha256": weight["sha256"],
+                }
+                continue
             if weight["kind"] == "managed":
                 results[weight_id] = {
                     "status": "managed_by_upstream",
@@ -1119,6 +1204,7 @@ def _validate_manifest_shape(payload: dict[str, Any]) -> None:
         "repository",
         "revision",
         "download_url",
+        "sha256",
         "expected_size_bytes",
         "gated",
         "token_env",
@@ -1378,7 +1464,7 @@ def _validate_weight_spec(component_id: str, weight: dict[str, Any]) -> None:
         raise BootstrapError(f"weight {component_id!r} has an unsupported schema_version")
     _validate_safe_slug(weight.get("weight_id"), f"weight {component_id} id")
     kind = weight.get("kind")
-    if kind not in {"huggingface", "managed", "manual"}:
+    if kind not in {"huggingface", "https", "managed", "manual"}:
         raise BootstrapError(f"weight {component_id!r} has an unsupported kind")
     if kind == "huggingface":
         repository = weight.get("repository")
@@ -1392,6 +1478,27 @@ def _validate_weight_spec(component_id: str, weight: dict[str, Any]) -> None:
             raise BootstrapError(f"Hugging Face weight {component_id!r} is not commit-pinned")
     if kind == "manual":
         _validate_https_url(weight.get("download_url"), f"manual weight {component_id}")
+    if kind == "https":
+        _validate_https_url(weight.get("download_url"), f"HTTPS weight {component_id}")
+        revision = weight.get("revision")
+        digest = weight.get("sha256")
+        size = weight.get("expected_size_bytes")
+        if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            raise BootstrapError(
+                f"HTTPS weight {component_id!r} must bind an immutable 40-character revision"
+            )
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise BootstrapError(
+                f"HTTPS weight {component_id!r} must publish an exact SHA-256"
+            )
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or not 0 < size <= MAX_ARCHIVE_COMPRESSED_BYTES
+        ):
+            raise BootstrapError(
+                f"HTTPS weight {component_id!r} must publish a bounded positive size"
+            )
     expected_size = weight.get("expected_size_bytes")
     if expected_size is not None and (
         not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size < 0
@@ -1656,6 +1763,8 @@ def _download_verified(
         raise BootstrapError(f"existing download failed checksum validation: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_suffix(destination.suffix + ".part")
+    if partial.is_symlink() or (partial.exists() and not partial.is_file()):
+        raise BootstrapError(f"unsafe partial download path: {partial}")
     request = urllib.request.Request(url, headers={"User-Agent": "discovery-os-bootstrap/1.0"})
     try:
         with urllib.request.urlopen(request, timeout=300) as response, partial.open("wb") as handle:

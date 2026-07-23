@@ -449,6 +449,71 @@ def test_selector_builds_deterministic_pareto_novelty_and_disagreement_branches(
     assert first.scientific_claim == "diagnostic_only"
 
 
+def test_selector_never_uses_raw_energy_to_dominate_another_composition(
+    tmp_path: Path,
+) -> None:
+    artifacts = ArtifactStore(tmp_path)
+    evidence = ExpertEvidenceStore(artifacts)
+    goal = DiscoveryGoal(
+        goal_id="composition-scoped-energy",
+        domain=DiscoveryDomain.GENERAL_MATERIALS,
+        title="Do not compare raw energy gauges across compositions",
+        scientific_question="Which candidates are non-dominated within composition?",
+        objectives=[
+            PropertyObjective(
+                property_name="energy_per_atom",
+                direction=ObjectiveDirection.MINIMIZE,
+                unit="arb",
+                required=True,
+            )
+        ],
+        validation_profile_id="raw-energy-scope-v1",
+        candidate_types=[CandidateType.COMPOSITION],
+    )
+
+    def entry(candidate_id: str, formula: str, energy: float) -> CandidatePoolEntry:
+        return _store_candidate_panel(
+            evidence,
+            artifacts,
+            _candidate(candidate_id, formula),
+            {
+                "expert-a": {"energy_per_atom": energy},
+                "expert-b": {"energy_per_atom": energy + 0.01},
+            },
+        )
+
+    pool = CandidatePool(
+        pool_id="composition-scoped-pool",
+        entries=[
+            entry("different-low", "Li", -100.0),
+            entry("different-high", "LiO", -1.0),
+            entry("same-better", "SiC", -2.0),
+            entry("same-worse", "SiC", -1.0),
+        ],
+    )
+
+    selection = DeterministicExplorationSelector(evidence).select(
+        pool,
+        goal,
+        limit_per_branch=10,
+    )
+    pareto = next(
+        item for item in selection.branches if item.branch == ExplorationBranch.PARETO
+    )
+
+    assert {item.candidate_ref.candidate_id for item in pareto.candidates} == {
+        "different-low",
+        "different-high",
+        "same-better",
+    }
+    assert "same-worse" not in {
+        item.candidate_ref.candidate_id for item in pareto.candidates
+    }
+    assert "raw energies are compared only within one reduced composition" in (
+        pareto.candidates[0].rationale
+    )
+
+
 def test_selector_excludes_ood_and_failed_candidates_without_imputation(
     tmp_path: Path,
 ) -> None:
@@ -763,3 +828,29 @@ def test_adaptive_scheduler_tracks_reasons_and_keeps_controls_bounded() -> None:
     assert 0.0 <= controls.mutation_strength <= 1.0
     assert 0.0 <= controls.diversity_strength <= 1.0
     assert controls.schedule_step == 100
+
+
+def test_classifier_free_guidance_scheduler_uses_correct_explore_exploit_direction() -> None:
+    scheduler = AdaptiveGenerationScheduler(
+        GenerationControls(
+            alpha=0.5,
+            temperature=1.0,
+            mutation_strength=0.2,
+            diversity_strength=0.3,
+        ),
+        alpha_semantics="classifier_free_guidance",
+    )
+
+    scheduler.update(improvement=0.1, structural_collapse_rate=0.1)
+    exploit = scheduler.update(improvement=0.2, structural_collapse_rate=0.1)
+    assert exploit.alpha == pytest.approx(0.6)
+    assert "condition-focused exploitation" in exploit.decision_reason
+
+    scheduler.update(improvement=0.0, structural_collapse_rate=0.1)
+    explore = scheduler.update(improvement=0.0, structural_collapse_rate=0.1)
+    assert explore.alpha == pytest.approx(0.5)
+    assert "broaden sampling" in explore.decision_reason
+
+    collapse = scheduler.update(improvement=0.0, structural_collapse_rate=0.5)
+    assert collapse.alpha == pytest.approx(0.4)
+    assert "classifier-free guidance" in collapse.decision_reason

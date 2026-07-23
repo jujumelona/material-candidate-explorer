@@ -43,6 +43,7 @@ from discovery_os.schemas import (
     CandidateType,
     DiscoveryDomain,
     DiscoveryGoal,
+    GoalConstraint,
     ObjectiveDirection,
     PropertyObjective,
     RepresentationKind,
@@ -402,6 +403,90 @@ def test_revision_uses_branch_specific_hull_and_preserves_explicit_targets(
     if branch == "expert_disagreement":
         assert proposal.confidence <= 0.2
         assert any("additional expert" in note for note in proposal.safety_notes)
+
+
+@pytest.mark.parametrize(
+    ("branch", "expected_hull"),
+    [
+        ("stability", 0.0),
+        ("target_property", 0.03),
+        ("novelty", 0.08),
+        ("expert_disagreement", 0.03),
+        ("pareto", 0.05),
+    ],
+)
+def test_branch_hull_priors_exist_before_any_hull_measurement(
+    branch: str,
+    expected_hull: float,
+) -> None:
+    candidate = _candidate()
+    goal = _goal(
+        PropertyObjective(
+            property_name="energy_above_hull",
+            direction=ObjectiveDirection.MINIMIZE,
+            unit="eV/atom",
+        )
+    )
+    request = _request(
+        candidate=candidate,
+        goal=goal,
+        features=[
+            _feature(
+                candidate,
+                feature_id="force-only",
+                expert_id="mattersim",
+                value=0.05,
+                unit="eV/angstrom",
+                property_name="max_force",
+            )
+        ],
+        decision_context=FusionDecisionContext(exploration_branch=branch),
+    )
+    backend = EvidenceDrivenFusionBackend()
+    output = backend.fuse(request)
+    proposal = backend.propose_revision(_revision_request(request, output))
+
+    assert {
+        change.property_name: change.target_value
+        for change in proposal.desired_changes
+    }["energy_above_hull"] == expected_hull
+
+
+def test_raw_cross_mlip_energy_offsets_do_not_drive_fusion_state() -> None:
+    candidate = _candidate()
+    goal = _goal(
+        PropertyObjective(
+            property_name="energy_per_atom",
+            direction=ObjectiveDirection.MINIMIZE,
+            unit="eV/atom",
+        )
+    )
+    request = _request(
+        candidate=candidate,
+        goal=goal,
+        features=[
+            _feature(
+                candidate,
+                feature_id="matter-energy",
+                expert_id="mattersim",
+                value=-8.0,
+                property_name="energy_per_atom",
+            ),
+            _feature(
+                candidate,
+                feature_id="chg-energy",
+                expert_id="chgnet",
+                value=-3.0,
+                property_name="energy_per_atom",
+            ),
+        ],
+    )
+
+    output = EvidenceDrivenFusionBackend().fuse(request)
+
+    assert output.latent.values[3] == 0.0
+    assert output.latent.values[4] == 0.0
+    assert any("neutral 0.0 sentinel" in warning for warning in output.warnings)
 
 
 def test_unstable_hull_focuses_zero_and_mev_evidence_is_converted() -> None:
@@ -1093,3 +1178,56 @@ def test_live_literature_branch_becomes_molecule_generation_prior_not_score() ->
     assert any(change.property_name == "scaffold_smiles" for change in proposal.desired_changes)
     assert "search branch" in " ".join(proposal.safety_notes)
     assert proposal.confidence <= 0.95
+
+
+def test_literature_hint_cannot_expand_hard_chemical_system_scope() -> None:
+    candidate = _candidate()
+    goal = _goal(
+        PropertyObjective(
+            property_name="energy_above_hull",
+            direction=ObjectiveDirection.MINIMIZE,
+            unit="eV/atom",
+        )
+    ).model_copy(
+        update={
+            "constraints": [
+                GoalConstraint(
+                    constraint_id="immutable-li-o",
+                    description="Keep the baseline Li-O element set",
+                    property_name="chemical_system",
+                    operator="eq",
+                    value="Li-O",
+                    hard=True,
+                )
+            ]
+        }
+    )
+    context = FusionDecisionContext(
+        evidence_branch_id="materials-literature",
+        evidence_branch_kind="reported_phase",
+        evidence_claim_ids=["claim-fe-dopant"],
+        evidence_generator_hints={
+            "chemical_system": "Li-Fe-O",
+            "energy_above_hull": 0.03,
+        },
+        exploration_branch="pareto",
+    )
+    request = _request(
+        candidate=candidate,
+        goal=goal,
+        features=[
+            _feature(candidate, feature_id="m", expert_id="mattersim", value=0.02)
+        ],
+        decision_context=context,
+    )
+    backend = EvidenceDrivenFusionBackend()
+    output = backend.fuse(request)
+    proposal = backend.propose_revision(_revision_request(request, output))
+
+    targets = {
+        change.property_name: change.target_value
+        for change in proposal.desired_changes
+    }
+    assert targets.get("chemical_system") in {None, "Li-O"}
+    assert targets.get("chemical_system") != "Fe-Li-O"
+    assert any("expanded-system" in note for note in proposal.safety_notes)

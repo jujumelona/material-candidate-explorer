@@ -52,25 +52,153 @@ def test_t4_notebook_preserves_the_material_screening_contract() -> None:
     for required in (
         "TOTAL_CANDIDATES = 16",
         "if not 8 <= TOTAL_CANDIDATES <= 32",
-        '"tight"',
-        '"balanced"',
-        '"broad"',
-        '"explore"',
+        "SEARCH_ROUNDS = 8",
+        "MAX_GENERATION_CALLS = 32",
+        "FRONTIER_WIDTH = 1",
+        "BASE_GUIDANCE_ALPHA = 0.5",
+        "BASE_CFG_GAMMA = 2.0",
+        "GoalConstraint",
+        'constraint_id="immutable-chemical-system"',
+        'property_name="chemical_system"',
+        'operator="eq"',
+        "value=chemical_system",
+        "hard=True",
+        "target_energy_above_hull_eV_atom=None",
+        '"fusion-search"',
+        "PersistedFusionSearchReport",
+        "ExpertEvidenceStore",
+        "search_report.rounds_completed < 3",
         "generation_funnel_hashes",
         "group_crystal_structures",
+        "crystal_matcher_settings = asdict(grouping.matcher_settings)",
+        "grouping.ambiguous_comparisons",
+        '"matcher_settings": asdict(relaxed_grouping.matcher_settings)',
+        "relaxed_grouping.ambiguous_comparisons",
+        '"deduplicated": False',
         '"mattersim"',
         '"chgnet"',
         '"/v1/relax"',
         "require_stress_comparison=True",
         "require_relaxed_structure_comparison=True",
         "rank_composition_scoped_pareto",
+        "CompositionEnergyPair",
+        "composition_relative_energy_disagreement",
+        "COMPOSITION_ENERGY_ALIGNMENT_PATH",
+        '"raw_cross_model_energy_offsets_used_for_risk": False',
+        "payload.final_energy_eV / relaxed_atom_count",
+        "max_force_eV_A=payload.final_max_force_eV_A",
+        'relative_energy=relative_energy',
+        'row["predictions"]["mattersim"]',
+        'row["predictions"]["chgnet"]',
+        'force_rmse_eV_A=row["force_rmse_eV_A"]',
+        '"initial_common_geometry_force_rmse_eV_A"',
+        '"initial_common_geometry_stress_diff_GPa"',
+        '"energy_risk": "composition_relative_independently_relaxed_geometries"',
+        '"relaxed_force_cross_model_comparison_performed": False',
+        '"relaxed_stress_cross_model_comparison_performed": False',
+        'common_geometry_mattersim=row["predictions"]["mattersim"]',
+        'common_geometry_chgnet=row["predictions"]["chgnet"]',
+        'common_geometry_alignment_id=row["initial_common_geometry_alignment_id"]',
+        '"schema": "common-geometry-mlip-alignment-v1"',
+        '"initial_common_geometry_alignment_id"',
+        "singleton_composition_fraction",
+        "SINGLETON_COMPOSITION_FRACTION_THRESHOLD = 0.5",
+        '"insufficient_within_composition_replication"',
+        '"triage_by_force_diversity_uncertainty_not_cross_formula_stability_ranking"',
+        '"rag_numeric_stability_substitution_performed": False',
+        '"initial_feature_predictions"',
+        '"relaxed_ranking_predictions"',
+        '"unranked_failed_relaxation_requires_operator_review"',
         "MaterialsProjectStructureLookup",
         "PortablePeriodicDFTInputBackend",
+        "reserve_external_no_match_portfolio_slot",
+        "novelty-dft-portfolio-receipt.json",
+        '"unknown_external_novelty_receives_credit": False',
+        "generation-profile-matrix.json",
+        "applied_generation_profiles",
+        "applied_target_profiles",
+        "len(applied_alphas) < 2",
+        "len(applied_gammas) < 2",
+        "len(applied_target_profiles) < 3",
+        'funnel["crystallographically_unique"] != TOTAL_CANDIDATES',
+        '"mattersim": "sha256:e3df9fa708725e3d453140646c7d1838324b347a3d1214cf1440522146f872b5"',
+        '"chgnet": "sha256:d14ab7c0f093efe64b60a7bcd540bca10e74fb7f46c86108a079af60524659d1"',
         '"cross_stoichiometry_energy_comparison_performed": False',
         '"dft_executed": False',
         '"zip_or_extxyz_merge_performed": False',
     ):
         assert required in source
+    assert "ltol=0.2" not in source
+    assert "stol=0.3" not in source
+    assert "angle_tol=5.0" not in source
+    assert 'property_name="energy_above_hull"' not in source
+    assert "maximum_energy_abs_difference_eV_atom" not in source
+    assert "predictions_for_disagreement" not in source
+    assert "ranking_vector_disagreement" not in source
+    assert "managed-unattested" not in source
+
+
+def test_complete_common_geometry_disagreement_can_stay_low() -> None:
+    from discovery_os.materials_screening import (
+        MLIPScreeningPrediction,
+        classify_model_disagreement,
+    )
+    from discovery_os.mlip_reliability import (
+        CompositionEnergyPair,
+        composition_relative_energy_disagreement,
+    )
+
+    relative_energy = composition_relative_energy_disagreement(
+        [
+            CompositionEnergyPair(
+                candidate_id="candidate-a",
+                reduced_composition="Li2O",
+                first_model_id="mattersim",
+                second_model_id="chgnet",
+                first_energy_per_atom_eV=-2.0,
+                second_energy_per_atom_eV=-20.0,
+                alignment_artifact_id="aligned-low-panel",
+            ),
+            CompositionEnergyPair(
+                candidate_id="candidate-b",
+                reduced_composition="Li2O",
+                first_model_id="mattersim",
+                second_model_id="chgnet",
+                first_energy_per_atom_eV=-1.0,
+                second_energy_per_atom_eV=-19.0,
+                alignment_artifact_id="aligned-low-panel",
+            ),
+        ]
+    )[0]
+    disagreement = classify_model_disagreement(
+        MLIPScreeningPrediction(
+            expert_id="mattersim",
+            energy_per_atom_eV=-5.0,
+            max_force_eV_A=0.03,
+            stress_norm=1.0,
+            stress_unit="GPa",
+        ),
+        MLIPScreeningPrediction(
+            expert_id="chgnet",
+            energy_per_atom_eV=7.0,
+            max_force_eV_A=0.04,
+            stress_norm=1.01,
+            stress_unit="GPa",
+        ),
+        force_rmse_eV_A=0.01,
+        relative_energy=relative_energy,
+        relaxed_structure_match=True,
+        require_stress_comparison=True,
+        require_relaxed_structure_comparison=True,
+    )
+
+    assert disagreement.raw_energy_per_atom_abs_diff_eV == 12.0
+    assert disagreement.energy_comparison_basis == "composition_relative_aligned"
+    assert disagreement.composition_relative_energy_abs_diff_eV_atom == 0.0
+    assert disagreement.stress_norm_abs_diff_GPa is not None
+    assert abs(disagreement.stress_norm_abs_diff_GPa - 0.01) < 1e-12
+    assert disagreement.risk == "low"
+    assert disagreement.dft_escalation is False
 
 
 def test_t4_notebook_runs_all_stage_specific_evidence_routes() -> None:
@@ -96,7 +224,7 @@ def test_t4_notebook_runs_all_stage_specific_evidence_routes() -> None:
         "MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION",
         "MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF",
         "getpass.getpass",
-        '"--decision-context"',
+        '"--rag-bundle"',
         '"property_score_created"',
         '"configured-tool-only"',
         '"administrator-configured-allowlist-only"',
@@ -116,7 +244,7 @@ def test_t4_notebook_runs_all_stage_specific_evidence_routes() -> None:
     assert "stage-validation-evidence-index.json" in source
 
     assert source.index("generation_evidence_run = run_stage_evidence_checkpoint(") < source.index(
-        '"fusion-iterate"'
+        '"fusion-search"'
     )
     assert source.index("identity_novelty_assessments = StagedNoveltyAssessor(") < source.index(
         "identity_evidence_run = run_stage_evidence_checkpoint("
@@ -130,3 +258,69 @@ def test_t4_notebook_runs_all_stage_specific_evidence_routes() -> None:
     assert source.index("dft_report = PortablePeriodicDFTInputBackend().prepare_inputs(") < source.index(
         "dft_evidence_run = run_stage_evidence_checkpoint("
     )
+
+
+def test_t4_notebook_uses_one_global_adaptive_fusion_search() -> None:
+    notebook = _load_notebook()
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+
+    assert source.count('"fusion-search"') == 1
+    assert "fusion-iterate" not in source
+    for contract in (
+        "GENERATION_BATCH_SIZE = 1",
+        "minimum_rounds_for_budget = 1 + (TOTAL_CANDIDATES - 1 + 4) // 5",
+        '"--rounds", str(SEARCH_ROUNDS)',
+        '"--frontier-width", str(FRONTIER_WIDTH)',
+        '"--max-generation-calls", str(MAX_GENERATION_CALLS)',
+        '"--max-generated-candidates", str(TOTAL_CANDIDATES)',
+        '"--no-control-sweep"',
+        '"--required-evaluator", "mattersim"',
+        '"--required-evaluator", "chgnet"',
+        '"pareto", "stability", "target_property", "novelty", "expert_disagreement"',
+        "search_report.budget_usage.generated_candidates",
+        "search_report.rounds_completed < 3",
+        "record.generation_provenance is not None",
+        "evidence_store.load(evidence_id)",
+        '"feature_refs": feature_refs',
+        'applied.get("diffusion_guidance_factor") != BASE_CFG_GAMMA',
+        "GENERATION_PROFILE_MATRIX_PATH",
+        "expected_gamma = round(requested_alpha * float(alpha_to_gamma_scale), 8)",
+        "unique_target_energy_above_hull_eV_atom",
+        'CREDENTIAL_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")',
+        "if name not in credential_env_values",
+        "for secret_name, secret in credential_env_values.items()",
+    ):
+        assert contract in source
+
+    # A stage bundle is passed only after the typed generation handoff permits
+    # steering; absent or failed evidence leaves the search on validator-only control.
+    assert source.index("if generation_evidence_run.report.handoff.can_steer_generation:") < source.index(
+        'command.extend(["--rag-bundle", str(generation_rag_bundle_path)])'
+    )
+
+
+def test_t4_notebook_uses_a_bounded_external_novelty_dft_portfolio() -> None:
+    notebook = _load_notebook()
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+
+    assert source.index("base_dft_refs = select_dft_handoff_refs(") < source.index(
+        "novelty_portfolio = reserve_external_no_match_portfolio_slot("
+    )
+    assert source.index(
+        "novelty_portfolio = reserve_external_no_match_portfolio_slot("
+    ) < source.index(
+        "dft_report = PortablePeriodicDFTInputBackend().prepare_inputs("
+    )
+    for contract in (
+        "base_candidate_refs=base_dft_refs",
+        "eligible_candidate_refs=eligible_dft_refs",
+        "assessments=novelty_assessments",
+        "max_novelty_slots=1",
+        "selected_dft_refs = novelty_portfolio.selected_candidate_refs",
+        "NOVELTY_PORTFOLIO_PATH",
+        'external_database.status) != "no_match"',
+    ):
+        assert contract in source
+
+    assert "property-space-diversity (the internal branch identifier is `novelty`)" in source
+    assert "External database novelty is assessed later" in source

@@ -14,7 +14,7 @@ POST /v1/generate   # generator-v1 모델
 
 | 모델 | 포트 | 현재 sidecar가 실제 호출하는 경로 | 중요한 경계 |
 |---|---:|---|---|
-| MatterGen | 8101 | MatterGen `CrystalGenerator` | 명시적 목표/수정 target을 condition으로 변환. raw latent, 부모 구조 mutation, temperature·mutation·diversity는 upstream 입력이 아니므로 경고 |
+| MatterGen | 8101 | MatterGen `CrystalGenerator` | exact checkpoint allowlist에 있는 condition만 변환하고 `gamma=alpha*guidance_max`를 기록. primitive 20-atom/element envelope와 strict unscaled duplicate gate를 적용. raw latent, 부모 구조 mutation, temperature·mutation·diversity는 upstream 입력이 아니므로 requested-but-ignored 경고 |
 | REINVENT4 | 8112 | 고정 argv의 공식 CLI sampling | temperature·randomized SMILES·uniqueness와 선택적 Mol2Mol 부모 seed만 반영. raw latent/물성 수정은 소비하지 않음 |
 | Uni-Mol | 8102 | `unimol_tools.UniMolRepr` | SMILES 또는 SDF/XYZ 원자·좌표를 공식 conformer dict로 변환 |
 | UMA | 8109 | `fairchem.core.FAIRChemCalculator` | `UMA_TASK_NAME=omat`은 주기 CIF/POSCAR, `omol`은 비주기 XYZ/EXTXYZ/SDF만 허용. 안정된 hidden API가 없어 energy/force/stress observable을 반환 |
@@ -47,7 +47,7 @@ Windows PowerShell에서 Linux 전용 모델이 포함된 프로필은 `-Backend
   -AcceptLicense esm
 
 .\start-sidecars.ps1 `
-  -Component mattergen,unimol,boltz,esm,rnafm,pyscf `
+  -Component mattergen,mattersim,chgnet,unimol,boltz,esm,rnafm,pyscf `
   -Backend auto `
   -InstallRoot "I:\DiscoveryOS\scientific-envs" `
   -AllowExternalRoot
@@ -59,18 +59,26 @@ Linux에서는 다음과 같습니다.
 
 ```bash
 ./bootstrap.sh --profile all-open --accelerator cuda --include-weights --accept-license esm
-./start-sidecars.sh --component mattergen --component unimol --component boltz --component esm \
+./start-sidecars.sh --component mattergen --component mattersim --component chgnet \
+  --component unimol --component boltz --component esm \
   --component rnafm --component pyscf
 . ./.discovery/sidecars.env.sh
 ```
 
-위 시작 예시는 자동/고정 weight로 동작하는 구현부터 선택합니다. MatterSim·CHGNet·Chemprop·REINVENT·scGPT·QHNet을 함께 시작하려면 아래 수동/관리 checkpoint 변수를 먼저 채운 뒤 `--component`/`-Component`에 추가하십시오. 필수 bundle이나 검증된 bootstrap source가 빠진 선택은 preflight에서 즉시 거부되며 어떤 프로세스도 부분 기동하지 않습니다.
+위 시작 예시는 자동/고정 weight로 동작하는 구현부터 선택합니다. Chemprop·REINVENT·scGPT·QHNet을 함께 시작하려면 아래 수동 checkpoint 변수를 먼저 채운 뒤 `--component`/`-Component`에 추가하십시오. 필수 bundle이나 검증된 bootstrap source가 빠진 선택은 preflight에서 즉시 거부되며 어떤 프로세스도 부분 기동하지 않습니다.
 
 기동기는 loopback 포트 충돌과 기존 live PID state를 거부하고, stdout/stderr log와 PID/provenance state를 `InstallRoot` 아래에 기록합니다. Windows 프로세스는 숨김 창으로 실행됩니다. readiness가 실패하면 프로세스를 몰래 종료하지 않고 state와 log 경로를 남깁니다.
 
-## 수동 또는 관리 checkpoint
+## Exact 자동 artifact와 수동 checkpoint
 
-manifest의 `manual`/`managed` weight는 임의 파일을 자동 선택하지 않습니다. 시작 전에 최소한 다음처럼 실제 파일과 immutable revision을 명시합니다.
+기본 MatterSim 5M과 CHGNet 0.3.0은 더 이상 upstream-managed weight가 아닙니다. bootstrap이 immutable official source revision에서 exact HTTPS file을 받아 size와 SHA-256을 검사하고 `.artifact.json`을 기록합니다. launcher는 marker를 대조하고 파일을 다시 hash한 뒤 checkpoint path와 `sha256:<digest>` revision을 자동 바인딩합니다.
+
+| 모델 | upstream revision | size | SHA-256 |
+|---|---|---:|---|
+| MatterSim 5M | `40a1eb8f1189a53af310957b4f2c5dfbfe68d647` | `91,176,875` | `e3df9fa708725e3d453140646c7d1838324b347a3d1214cf1440522146f872b5` |
+| CHGNet 0.3.0 | `8d04abc467630b30cd8349c2fe12eeab10f62171` | `4,863,221` | `d14ab7c0f093efe64b60a7bcd540bca10e74fb7f46c86108a079af60524659d1` |
+
+따라서 이 두 기본 모델에 `managed-unattested:*`를 설정하지 않습니다. marker나 file byte가 바뀌면 launcher는 기동을 거부합니다. manifest의 `manual` weight만 시작 전에 다음처럼 실제 파일과 immutable revision을 명시합니다.
 
 Windows용 전체 입력 틀은 [`integrations/manual-checkpoints.env.example.ps1`](../integrations/manual-checkpoints.env.example.ps1)에 있습니다. 그대로 실행하지 말고 별도 운영 파일로 복사해 placeholder를 모두 교체하십시오. 자동 snapshot 모델의 내부 경로는 launcher가 검증된 `InstallRoot`에서 계산하므로 이 파일에서 임의로 덮어쓰지 않습니다.
 
@@ -82,9 +90,6 @@ $env:CHEMPROP_PROPERTY_UNITS = "mol/L,dimensionless"
 
 $env:REINVENT_MODEL_FILE = "D:\models\reinvent\prior.model"
 $env:REINVENT_WEIGHT_REVISION = "sha256:..."
-
-$env:MATTERSIM_WEIGHT_REVISION = "managed-unattested:upstream-release-and-cache-id"
-$env:CHGNET_WEIGHT_REVISION = "managed-unattested:chgnet-0.3.0-builtin"
 
 # Boltz는 bootstrap의 검증된 snapshot을 자동 바인딩한다. 아래는 운영 조정값이다.
 $env:BOLTZ_CACHE = "I:\DiscoveryOS\scientific-envs\cache\boltz-runtime"

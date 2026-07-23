@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from discovery_os.artifacts import ArtifactStore
 from discovery_os.cli import main
+from discovery_os.crystal_identity import CRYSTAL_IDENTITY_CANONICALIZATION
 from discovery_os.fusion_exploration import ExpertEvidenceStore, SchedulerObservation
 from discovery_os.fusion_loop import FusionLoopRunner
 from discovery_os.fusion_reference import MeanFusionBackend
@@ -32,9 +33,11 @@ from discovery_os.fusion_schemas import (
     WorkspaceRunConfig,
 )
 from discovery_os.fusion_search import (
+    FusionSearchReport,
     FusionSearchRunner,
     FusionSearchStatus,
     SearchBranchFailurePayload,
+    SearchBudget,
     SearchCandidateRecord,
     SearchControlPoint,
     SearchControlSweep,
@@ -354,6 +357,60 @@ class _DuplicateStructureGenerator:
         )
 
 
+def _with_strict_crystal_identity(candidate: Candidate, digest: str) -> Candidate:
+    representations = [
+        item.model_copy(
+            update={
+                "metadata": {
+                    **item.metadata,
+                    "identity_structure_sha256": digest,
+                    "identity_canonicalization": CRYSTAL_IDENTITY_CANONICALIZATION,
+                }
+            }
+        )
+        if item.kind == RepresentationKind.CIF
+        else item
+        for item in candidate.representations
+    ]
+    draft = candidate.model_copy(
+        update={
+            "candidate_ref": None,
+            "representations": representations,
+            "attributes": {
+                **candidate.attributes,
+                "crystal_identity": {
+                    "identity_structure_sha256": digest,
+                    "identity_canonicalization": CRYSTAL_IDENTITY_CANONICALIZATION,
+                },
+            },
+        }
+    )
+    return draft.model_copy(
+        update={
+            "candidate_ref": CandidateRef(
+                candidate_id=draft.candidate_id,
+                version=1,
+                content_hash=candidate_content_hash(draft),
+            )
+        }
+    )
+
+
+class _RepeatedStrictCrystalGenerator(_BatchGenerator):
+    """Repeat two strict identities under new lineage IDs on every call."""
+
+    def generate(self, request) -> FusionGenerationResponse:
+        response = super().generate(request)
+        candidates = [
+            _with_strict_crystal_identity(
+                candidate,
+                ("a" if index % 2 == 0 else "b") * 64,
+            )
+            for index, candidate in enumerate(response.candidates)
+        ]
+        return response.model_copy(update={"candidates": candidates})
+
+
 class _OneBranchFailingGenerator(_BatchGenerator):
     def generate(self, request) -> FusionGenerationResponse:
         if (
@@ -511,11 +568,20 @@ def test_search_runs_independent_branches_with_cache_lineage_and_raw_history(
         for item in report.cycle_records
     )
 
-    # Two positive observations reduce alpha independently in every branch;
-    # round 2 must receive those updated controls through cloned run configs.
+    # Every branch starts from a distinct bounded guidance profile. Two
+    # positive observations then move each profile independently; round 2 must
+    # receive those updated controls through cloned run configs.
     round_two = [item for item in report.cycle_records if item.round_index == 2]
     assert round_two
-    assert all(item.controls.alpha == 0.4 for item in round_two)
+    assert {
+        str(item.branch): item.controls.alpha for item in round_two
+    } == {
+        "pareto": 0.4,
+        "stability": 0.55,
+        "target_property": 0.5,
+        "novelty": 0.2,
+        "expert_disagreement": 0.3,
+    }
     assert all(item.controls.schedule_step == 2 for item in round_two)
     assert any(item.alpha == 0.4 for item in generator.controls)
 
@@ -604,6 +670,139 @@ def test_search_runs_independent_branches_with_cache_lineage_and_raw_history(
     assert len(report_bytes) == persisted.report_artifact.byte_size
     assert report_bytes
     assert report.scientific_claim == "diagnostic_only"
+
+
+def test_global_search_budget_caps_all_round_branch_and_variant_generation(
+    tmp_path: Path,
+) -> None:
+    runtime, _encoders = _runtime(tmp_path)
+    generator = _BatchGenerator()
+    root = _initial_candidate()
+    report = FusionSearchRunner(
+        FusionLoopRunner(runtime, generator),
+        ExpertEvidenceStore(runtime.artifact_store),
+    ).run(
+        search_id="budgeted-search",
+        goal=_goal(),
+        initial_candidate=root,
+        base_run_config=_config(root),
+        rounds=5,
+        frontier_width=1,
+        expert_ids=["expert-a", "expert-b"],
+        search_budget=SearchBudget(
+            max_generation_calls=3,
+            max_generated_candidates=5,
+        ),
+    ).report
+
+    assert report.status == FusionSearchStatus.EXHAUSTED
+    assert report.rounds_completed >= 2
+    assert report.budget_usage.generation_calls == 3
+    assert report.budget_usage.generated_candidates == 5
+    assert report.budget_usage.exhausted is True
+    assert generator.calls == 3
+    assert sum(
+        len(item.child_record_ids) for item in report.cycle_records
+    ) == 5
+    assert sorted(
+        len(item.child_record_ids) for item in report.cycle_records
+    ) == [1, 2, 2]
+
+    tampered = report.model_dump(mode="json")
+    tampered["budget_usage"]["generated_candidates"] = 4
+    with pytest.raises(ValidationError, match="generated-candidate usage"):
+        FusionSearchReport.model_validate(tampered)
+
+
+def test_budget_boundary_preserves_the_last_permitted_failed_attempt(
+    tmp_path: Path,
+) -> None:
+    runtime, _encoders = _runtime(tmp_path)
+    root = _initial_candidate()
+    report = FusionSearchRunner(
+        FusionLoopRunner(runtime, _AlwaysFailingGenerator()),
+        ExpertEvidenceStore(runtime.artifact_store),
+    ).run(
+        search_id="budgeted-failed-search",
+        goal=_goal(),
+        initial_candidate=root,
+        base_run_config=_config(root),
+        rounds=3,
+        frontier_width=1,
+        expert_ids=["expert-a", "expert-b"],
+        control_sweep=SearchControlSweep(
+            points=[
+                SearchControlPoint(alpha=0.25, temperature=1.4, label="retry"),
+            ],
+            include_adaptive_center=True,
+            max_variants_per_parent=2,
+        ),
+        search_budget=SearchBudget(
+            max_generation_calls=1,
+            max_generated_candidates=2,
+        ),
+    ).report
+
+    assert report.status == FusionSearchStatus.FAILED
+    assert report.budget_usage.generation_calls == 1
+    assert report.budget_usage.generated_candidates == 0
+    assert report.budget_usage.exhausted is True
+    assert len(report.control_attempts) == 1
+    assert report.control_attempts[0].success is False
+    assert len(report.failure_records) == 1
+    assert report.failure_records[0].cause == "generator sidecar unavailable"
+    assert report.round_history[0].failure_record_ids == [
+        report.failure_records[0].failure_id
+    ]
+
+
+def test_attested_crystal_hash_is_deduplicated_across_calls_and_branches(
+    tmp_path: Path,
+) -> None:
+    runtime, _encoders = _runtime(tmp_path)
+    root = _initial_candidate()
+    report = FusionSearchRunner(
+        FusionLoopRunner(runtime, _RepeatedStrictCrystalGenerator()),
+        ExpertEvidenceStore(runtime.artifact_store),
+    ).run(
+        search_id="strict-identity-search",
+        goal=_goal(),
+        initial_candidate=root,
+        base_run_config=_config(root),
+        rounds=3,
+        frontier_width=1,
+        expert_ids=["expert-a", "expert-b"],
+    ).report
+
+    generated = [
+        item for item in report.candidate_records if item.generation_provenance is not None
+    ]
+    duplicate_records = [
+        item
+        for item in generated
+        if any(
+            reason.startswith("attested_crystal_hash_duplicate:")
+            for reason in item.exclusion_reasons
+        )
+    ]
+    assert duplicate_records
+    assert all(not item.selection_eligible for item in duplicate_records)
+
+    eligible_candidate_ids = {
+        item.candidate.candidate_id
+        for item in generated
+        if item.selection_eligible
+        and item.candidate.candidate_id.startswith("generated-")
+    }
+    # Only the two first-call strict identities may advance even though later
+    # calls return new candidate IDs and lineage for the same crystals.
+    assert eligible_candidate_ids == {"generated-0-0", "generated-0-1"}
+    assert {
+        selected.candidate_ref.candidate_id
+        for branch in report.final_selection.branches
+        for selected in branch.candidates
+        if selected.candidate_ref.candidate_id.startswith("generated-")
+    }.issubset(eligible_candidate_ids)
 
 
 def test_validation_handoff_is_pareto_stability_only_and_exact_content_unique(
@@ -966,12 +1165,12 @@ def test_search_automatically_schedules_from_raw_cross_round_dominance(
         str(item.branch): item.controls for item in result.report.branches
     }
     assert final_controls["pareto"].alpha == 0.3
-    assert final_controls["expert_disagreement"].alpha == 0.5
-    assert all(
-        controls.alpha == 0.4
-        for name, controls in final_controls.items()
-        if name not in {"pareto", "expert_disagreement"}
-    )
+    assert final_controls["stability"].alpha == 0.55
+    assert final_controls["target_property"].alpha == 0.5
+    assert final_controls["novelty"].alpha == 0.2
+    # No disagreement frontier was eligible, so this branch retains its
+    # initial exploration-biased seed controls.
+    assert final_controls["expert_disagreement"].alpha == 0.4
     assert decision_contexts
     assert all(item is not None and item.exploration_branch for item in decision_contexts)
     assert decision_contexts[0].exploration_branch == "pareto"

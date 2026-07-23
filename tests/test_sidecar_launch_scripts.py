@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,100 @@ MANIFEST = ROOT / "integrations" / "manifest.v1.json"
 
 def _manifest() -> dict:
     return json.loads(MANIFEST.read_text(encoding="utf-8"))
+
+
+def _fixture_https_chgnet_manifest(
+    path: Path,
+    *,
+    artifact_bytes: bytes,
+) -> tuple[Path, dict]:
+    payload = _manifest()
+    component = next(
+        item for item in payload["components"] if item["component_id"] == "chgnet"
+    )
+    weight = component["weights"][0]
+    weight.update(
+        {
+            "kind": "https",
+            "download_url": "https://example.invalid/chgnet-fixture.pth.tar",
+            "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "expected_size_bytes": len(artifact_bytes),
+        }
+    )
+    material = dict(payload)
+    material.pop("manifest_revision", None)
+    payload["manifest_revision"] = hashlib.sha256(
+        json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path, weight
+
+
+def _install_fixture_https_artifact(
+    install_root: Path,
+    *,
+    weight: dict,
+    artifact_bytes: bytes,
+) -> Path:
+    artifact_root = (
+        install_root
+        / "models"
+        / "chgnet"
+        / weight["weight_id"]
+        / weight["revision"]
+    )
+    artifact_root.mkdir(parents=True)
+    artifact = artifact_root / "chgnet-fixture.pth.tar"
+    artifact.write_bytes(artifact_bytes)
+    (artifact_root / ".artifact.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "download_url": weight["download_url"],
+                "revision": weight["revision"],
+                "filename": artifact.name,
+                "sha256": weight["sha256"],
+                "size_bytes": weight["expected_size_bytes"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return artifact
+
+
+def _patch_fixture_chgnet_weight(
+    monkeypatch,
+    tmp_path: Path,
+) -> tuple[Path, str]:
+    checkpoint = tmp_path / "chgnet-fixture.pth.tar"
+    checkpoint.write_bytes(b"pinned-chgnet-fixture")
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    manifest = sidecar_cli.load_integration_manifest()
+    components = []
+    for component in manifest.components:
+        if component.component_id != "chgnet":
+            components.append(component)
+            continue
+        weight = component.weights[0].model_copy(
+            update={
+                "download_url": "https://example.invalid/chgnet-fixture.pth.tar",
+                "sha256": digest,
+                "expected_size_bytes": checkpoint.stat().st_size,
+            }
+        )
+        components.append(component.model_copy(update={"weights": [weight]}))
+    fixture_manifest = manifest.model_copy(update={"components": components})
+    monkeypatch.setattr(
+        sidecar_cli,
+        "load_integration_manifest",
+        lambda: fixture_manifest,
+    )
+    return checkpoint, f"sha256:{digest}"
 
 
 def _fake_component_python(install_root: Path, component_id: str, *, windows: bool) -> Path:
@@ -166,14 +261,21 @@ def test_configuration_preflight_rejects_missing_qhnet_bundle() -> None:
         )
 
 
-def test_configuration_preflight_is_static_and_keeps_checkpoint_lazy(monkeypatch) -> None:
+def test_configuration_preflight_is_static_and_keeps_checkpoint_lazy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint, revision = _patch_fixture_chgnet_weight(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "discovery_os.sidecars.cli._module_available",
         lambda _module_name: True,
     )
     report = preflight_configuration(
         "chgnet",
-        {"SIDECAR_WEIGHT_REVISION": "managed-unattested:chgnet-0.3.0-fixture"},
+        {
+            "CHGNET_CHECKPOINT_PATH": str(checkpoint),
+            "SIDECAR_WEIGHT_REVISION": revision,
+        },
         host="127.0.0.1",
         port=8113,
     )
@@ -181,10 +283,15 @@ def test_configuration_preflight_is_static_and_keeps_checkpoint_lazy(monkeypatch
     assert report["configuration_only"] is True
     assert report["checkpoint_loaded"] is False
     assert report["model_id"] == "chgnet"
+    assert report["weight_revision"] == revision
     assert report["port"] == 8113
 
 
-def test_configuration_preflight_rejects_missing_model_package(monkeypatch) -> None:
+def test_configuration_preflight_rejects_missing_model_package(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint, revision = _patch_fixture_chgnet_weight(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "discovery_os.sidecars.cli._module_available",
         lambda module_name: module_name != "chgnet",
@@ -192,16 +299,23 @@ def test_configuration_preflight_rejects_missing_model_package(monkeypatch) -> N
     with pytest.raises(ValueError, match="model dependency 'chgnet' is not installed"):
         preflight_configuration(
             "chgnet",
-            {"SIDECAR_WEIGHT_REVISION": "managed-unattested:chgnet-0.3.0-fixture"},
+            {
+                "CHGNET_CHECKPOINT_PATH": str(checkpoint),
+                "SIDECAR_WEIGHT_REVISION": revision,
+            },
             host="127.0.0.1",
             port=8113,
         )
 
 
-def test_cli_preflight_emits_machine_readable_success_without_loading(monkeypatch, capsys) -> None:
-    monkeypatch.setenv(
-        "SIDECAR_WEIGHT_REVISION", "managed-unattested:chgnet-0.3.0-fixture"
-    )
+def test_cli_preflight_emits_machine_readable_success_without_loading(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    checkpoint, revision = _patch_fixture_chgnet_weight(monkeypatch, tmp_path)
+    monkeypatch.setenv("CHGNET_CHECKPOINT_PATH", str(checkpoint))
+    monkeypatch.setenv("SIDECAR_WEIGHT_REVISION", revision)
     monkeypatch.setattr(
         "discovery_os.sidecars.cli._module_available",
         lambda _module_name: True,
@@ -216,6 +330,26 @@ def test_cli_preflight_emits_machine_readable_success_without_loading(monkeypatc
     assert payload["supported"] is True
     assert payload["configuration_only"] is True
     assert payload["checkpoint_loaded"] is False
+    assert payload["weight_revision"] == revision
+
+
+def test_configuration_preflight_rejects_tampered_https_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint, revision = _patch_fixture_chgnet_weight(monkeypatch, tmp_path)
+    checkpoint.write_bytes(b"tampered-chgnet-fixture")
+
+    with pytest.raises(ValueError, match="declared .* selected file"):
+        preflight_configuration(
+            "chgnet",
+            {
+                "CHGNET_CHECKPOINT_PATH": str(checkpoint),
+                "SIDECAR_WEIGHT_REVISION": revision,
+            },
+            host="127.0.0.1",
+            port=8113,
+        )
 
 
 def test_configuration_preflight_rejects_missing_required_model_config() -> None:
@@ -366,9 +500,14 @@ def test_powershell_dry_run_builds_a_pinned_command_and_secret_free_env(tmp_path
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell native layout is Windows-specific")
-def test_powershell_managed_weight_revision_is_fail_closed(tmp_path: Path) -> None:
+def test_powershell_https_weight_binding_is_exact_and_fail_closed(tmp_path: Path) -> None:
     install_root = tmp_path / "sidecars"
     _fake_component_python(install_root, "chgnet", windows=True)
+    artifact_bytes = b"exact-launcher-chgnet-fixture"
+    manifest, weight = _fixture_https_chgnet_manifest(
+        tmp_path / "manifest.json",
+        artifact_bytes=artifact_bytes,
+    )
     environ = dict(os.environ)
     environ.pop("CHGNET_WEIGHT_REVISION", None)
     blocked = _run_powershell(
@@ -376,6 +515,9 @@ def test_powershell_managed_weight_revision_is_fail_closed(tmp_path: Path) -> No
         "native",
         "-Component",
         "chgnet",
+        "-Manifest",
+        str(manifest),
+        "-AllowCustomManifest",
         "-InstallRoot",
         str(install_root),
         "-AllowExternalRoot",
@@ -383,14 +525,21 @@ def test_powershell_managed_weight_revision_is_fail_closed(tmp_path: Path) -> No
         environ=environ,
     )
     assert blocked.returncode != 0
-    assert "CHGNET_WEIGHT_REVISION is required" in (blocked.stdout + blocked.stderr)
+    assert "Verified artifact marker is missing" in (blocked.stdout + blocked.stderr)
 
-    environ["CHGNET_WEIGHT_REVISION"] = "managed-unattested:chgnet-0.3.0-fixture"
+    artifact = _install_fixture_https_artifact(
+        install_root,
+        weight=weight,
+        artifact_bytes=artifact_bytes,
+    )
     accepted = _run_powershell(
         "-Backend",
         "native",
         "-Component",
         "chgnet",
+        "-Manifest",
+        str(manifest),
+        "-AllowCustomManifest",
         "-InstallRoot",
         str(install_root),
         "-AllowExternalRoot",
@@ -400,7 +549,35 @@ def test_powershell_managed_weight_revision_is_fail_closed(tmp_path: Path) -> No
     assert accepted.returncode == 0, accepted.stderr
     sidecar = json.loads(accepted.stdout)["sidecars"][0]
     assert sidecar["port"] == 8113
-    assert sidecar["weight_revision"] == "managed-unattested:chgnet-0.3.0-fixture"
+    expected_revision = f"sha256:{hashlib.sha256(artifact_bytes).hexdigest()}"
+    assert sidecar["weight_revision"] == expected_revision
+    assert sidecar["runtime_environment"]["CHGNET_CHECKPOINT_PATH"] == str(
+        artifact.resolve()
+    )
+    assert (
+        sidecar["runtime_environment"]["SIDECAR_WEIGHT_ATTESTATION"]
+        == expected_revision
+    )
+
+    artifact.write_bytes(b"X" * len(artifact_bytes))
+    tampered = _run_powershell(
+        "-Backend",
+        "native",
+        "-Component",
+        "chgnet",
+        "-Manifest",
+        str(manifest),
+        "-AllowCustomManifest",
+        "-InstallRoot",
+        str(install_root),
+        "-AllowExternalRoot",
+        "-DryRun",
+        environ=environ,
+    )
+    assert tampered.returncode != 0
+    assert "Verified HTTPS weight bytes changed" in (
+        tampered.stdout + tampered.stderr
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell native layout is Windows-specific")

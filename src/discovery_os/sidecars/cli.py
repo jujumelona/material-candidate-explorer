@@ -44,7 +44,6 @@ from .weight_binding import (
     verify_huggingface_snapshot,
 )
 
-
 DEFAULT_PORTS = {
     "mattergen": 8101,
     "unimol": 8102,
@@ -88,7 +87,9 @@ _MODEL_MODULES = {
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run one isolated Discovery OS model sidecar")
+    parser = argparse.ArgumentParser(
+        description="Run one isolated Discovery OS model sidecar"
+    )
     parser.add_argument("--model", required=True, choices=sorted(DEFAULT_PORTS))
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
@@ -206,8 +207,14 @@ def _prepare_sidecar(
         if host_override is not None
         else effective_values.get("SIDECAR_HOST", "127.0.0.1")
     )
-    if not isinstance(host, str) or not host.strip() or any(char in host for char in "\r\n\t"):
-        raise ValueError("sidecar host must be a non-blank host without control characters")
+    if (
+        not isinstance(host, str)
+        or not host.strip()
+        or any(char in host for char in "\r\n\t")
+    ):
+        raise ValueError(
+            "sidecar host must be a non-blank host without control characters"
+        )
     host = host.strip()
     port = (
         port_override
@@ -280,7 +287,9 @@ def _bind_weight_configuration(
     declared = effective.get("SIDECAR_WEIGHT_REVISION")
     if weight.kind == "huggingface":
         if weight.repository is None or weight.revision is None:
-            raise WeightBindingError("fixed Hugging Face weight lacks repository/revision")
+            raise WeightBindingError(
+                "fixed Hugging Face weight lacks repository/revision"
+            )
         snapshot_raw = effective.get("SIDECAR_WEIGHT_SNAPSHOT_PATH", "").strip()
         if not snapshot_raw:
             raise WeightBindingError(
@@ -385,8 +394,10 @@ def _bind_weight_configuration(
                 require_snapshot_member(bundle, name, kind="file")
             digest = directory_inventory_sha256(bundle)
             attestation = f"sha256:{digest}"
-            if declared and declared.strip().lower().startswith("sha256:") and (
-                declared.strip().lower() != attestation
+            if (
+                declared
+                and declared.strip().lower().startswith("sha256:")
+                and (declared.strip().lower() != attestation)
             ):
                 raise WeightBindingError(
                     "scgpt declared weight revision conflicts with SCGPT_CHECKPOINT_DIR"
@@ -414,12 +425,46 @@ def _bind_weight_configuration(
         effective["SIDECAR_WEIGHT_ATTESTATION"] = attestation
         return effective
 
+    if weight.kind == "https":
+        path_name = {
+            "mattersim": "MATTERSIM_CHECKPOINT_PATH",
+            "chgnet": "CHGNET_CHECKPOINT_PATH",
+        }.get(model)
+        if path_name is None:
+            raise WeightBindingError(
+                f"{component_id} has an HTTPS weight but no reviewed checkpoint binding"
+            )
+        if weight.sha256 is None:
+            raise WeightBindingError(
+                f"{component_id} HTTPS weight has no manifest SHA-256"
+            )
+        attestation = attest_file_revision(
+            _required(effective, path_name),
+            declared_revision=declared,
+            label=component_id,
+        )
+        expected_attestation = f"sha256:{weight.sha256}"
+        if attestation != expected_attestation:
+            raise WeightBindingError(
+                f"{component_id} checkpoint does not match the manifest-pinned SHA-256"
+            )
+        effective["SIDECAR_WEIGHT_REVISION"] = expected_attestation
+        effective["SIDECAR_WEIGHT_ATTESTATION"] = expected_attestation
+        return effective
+
     if weight.kind == "managed":
-        if model == "mattersim" and effective.get("MATTERSIM_CHECKPOINT_PATH", "").strip():
+        managed_checkpoint_name = {
+            "mattersim": "MATTERSIM_CHECKPOINT_PATH",
+            "chgnet": "CHGNET_CHECKPOINT_PATH",
+        }.get(model)
+        if (
+            managed_checkpoint_name is not None
+            and effective.get(managed_checkpoint_name, "").strip()
+        ):
             attestation = attest_file_revision(
-                effective["MATTERSIM_CHECKPOINT_PATH"],
+                effective[managed_checkpoint_name],
                 declared_revision=declared,
-                label="mattersim",
+                label=model,
             )
             effective["SIDECAR_WEIGHT_REVISION"] = attestation
             effective["SIDECAR_WEIGHT_ATTESTATION"] = attestation
@@ -438,7 +483,9 @@ def _bind_weight_configuration(
         effective["SIDECAR_WEIGHT_REVISION"] = normalized
         effective["SIDECAR_WEIGHT_ATTESTATION"] = normalized
         return effective
-    raise WeightBindingError(f"unsupported weight kind for {component_id}: {weight.kind}")
+    raise WeightBindingError(
+        f"unsupported weight kind for {component_id}: {weight.kind}"
+    )
 
 
 def _validate_static_configuration(model: str, values: Mapping[str, str]) -> None:
@@ -480,6 +527,8 @@ def _validate_static_configuration(model: str, values: Mapping[str, str]) -> Non
         )
     elif model == "mattersim":
         path_rules = (("MATTERSIM_CHECKPOINT_PATH", "file"),)
+    elif model == "chgnet":
+        path_rules = (("CHGNET_CHECKPOINT_PATH", "file"),)
     elif model == "chemprop":
         path_rules = (("CHEMPROP_CHECKPOINT_PATH", "file"),)
     elif model == "reinvent4":
@@ -519,7 +568,9 @@ def _validate_static_configuration(model: str, values: Mapping[str, str]) -> Non
             raise ValueError("BOLTZ_CACHE must not be blank")
         cache = Path(cache_raw).expanduser().resolve()
         if cache.exists() and not cache.is_dir():
-            raise ValueError("BOLTZ_CACHE must point to a directory or a creatable path")
+            raise ValueError(
+                "BOLTZ_CACHE must point to a directory or a creatable path"
+            )
         process_timeout = _float(values, "BOLTZ_PROCESS_TIMEOUT_SECONDS", 840.0)
         request_timeout = _float(values, "SIDECAR_TIMEOUT_SECONDS", 900.0)
         if process_timeout <= 0 or process_timeout >= request_timeout:
@@ -539,7 +590,13 @@ def _validate_runtime_dependency(model: str) -> None:
         # _runtime already resolved and bound an exact executable path.
         return
     if model == "qhnet":
-        for module_name in ("torch", "torch_geometric", "torch_cluster", "torch_scatter", "e3nn"):
+        for module_name in (
+            "torch",
+            "torch_geometric",
+            "torch_cluster",
+            "torch_scatter",
+            "e3nn",
+        ):
             if not _module_available(module_name):
                 raise ValueError(
                     f"QHNet runtime dependency {module_name!r} is not installed in this sidecar environment"
@@ -578,7 +635,11 @@ def _required_reinvent_executable() -> str:
     # POSIX virtual environments commonly link bin/python to an interpreter
     # outside the environment, while their console scripts remain in bin/.
     environment_bin = Path(sys.executable).expanduser().absolute().parent
-    names = ("reinvent.exe", "reinvent") if os.name == "nt" else ("reinvent", "reinvent.exe")
+    names = (
+        ("reinvent.exe", "reinvent")
+        if os.name == "nt"
+        else ("reinvent", "reinvent.exe")
+    )
     for name in names:
         candidate = environment_bin / name
         if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
@@ -603,13 +664,19 @@ def _required_boltz_executable() -> str:
     discovered = shutil.which("boltz")
     if discovered is not None:
         return str(Path(discovered).resolve())
-    raise ValueError("Boltz executable was not found beside the active sidecar Python or on PATH")
+    raise ValueError(
+        "Boltz executable was not found beside the active sidecar Python or on PATH"
+    )
 
 
 def _identity(model: str, values: Mapping[str, str]) -> ModelIdentity:
     component_id = "qhnet-source" if model == "qhnet" else model
     component = next(
-        (item for item in load_integration_manifest().components if item.component_id == component_id),
+        (
+            item
+            for item in load_integration_manifest().components
+            if item.component_id == component_id
+        ),
         None,
     )
     manifest_version = None
@@ -619,16 +686,24 @@ def _identity(model: str, values: Mapping[str, str]) -> ModelIdentity:
         manifest_version = component.install.version or (
             component.source.release if component.source is not None else None
         )
-        manifest_code = component.source.revision if component.source is not None else None
-        exact = {item.revision for item in component.weights if item.revision is not None}
+        manifest_code = (
+            component.source.revision if component.source is not None else None
+        )
+        exact = {
+            item.revision for item in component.weights if item.revision is not None
+        }
         unresolved = [item for item in component.weights if item.revision is None]
         if len(exact) == 1 and not unresolved:
             manifest_weight = next(iter(exact))
         elif not component.weights:
             manifest_weight = "no-external-weight"
-    model_version = _required_or_default(values, "SIDECAR_MODEL_VERSION", manifest_version)
+    model_version = _required_or_default(
+        values, "SIDECAR_MODEL_VERSION", manifest_version
+    )
     code_revision = _required_or_default(values, "SIDECAR_CODE_REVISION", manifest_code)
-    weight_revision = _required_or_default(values, "SIDECAR_WEIGHT_REVISION", manifest_weight)
+    weight_revision = _required_or_default(
+        values, "SIDECAR_WEIGHT_REVISION", manifest_weight
+    )
     capability = "generate" if model in {"mattergen", "reinvent4"} else "features"
     return ModelIdentity(
         model_id=component_id,
@@ -654,10 +729,19 @@ def _runtime(model: str, values: Mapping[str, str]) -> Any:
             for key, value in objective_map.items()
         ):
             raise ValueError("MATTERGEN_OBJECTIVE_MAP must map strings to strings")
+        supported_raw = values.get("MATTERGEN_SUPPORTED_CONDITION_NAMES")
+        supported_condition_names = (
+            None
+            if supported_raw is None
+            else tuple(
+                name.strip() for name in supported_raw.split(",") if name.strip()
+            )
+        )
         return MatterGenGenerator(
             pretrained_name=values.get("MATTERGEN_PRETRAINED_NAME", "mattergen_base"),
             checkpoint_path=values.get("MATTERGEN_CHECKPOINT_PATH") or None,
             objective_map=objective_map,
+            supported_condition_names=supported_condition_names,
             device=device,
         )
     if model == "reinvent4":
@@ -690,6 +774,7 @@ def _runtime(model: str, values: Mapping[str, str]) -> Any:
     if model == "chgnet":
         return CHGNetExpert(
             model_name=values.get("CHGNET_MODEL_NAME", "0.3.0"),
+            checkpoint_path=values.get("CHGNET_CHECKPOINT_PATH") or None,
             weight_attestation=values.get("SIDECAR_WEIGHT_ATTESTATION") or None,
             device=device,
         )
@@ -721,9 +806,12 @@ def _runtime(model: str, values: Mapping[str, str]) -> Any:
             executable=_required_boltz_executable(),
             cache_path=values.get("BOLTZ_CACHE") or None,
             checkpoint_path=values.get("BOLTZ_CHECKPOINT_PATH") or None,
-            affinity_checkpoint_path=values.get("BOLTZ_AFFINITY_CHECKPOINT_PATH") or None,
+            affinity_checkpoint_path=values.get("BOLTZ_AFFINITY_CHECKPOINT_PATH")
+            or None,
             mols_tar_path=values.get("BOLTZ_MOLS_TAR_PATH") or None,
-            process_timeout_seconds=_float(values, "BOLTZ_PROCESS_TIMEOUT_SECONDS", 840.0),
+            process_timeout_seconds=_float(
+                values, "BOLTZ_PROCESS_TIMEOUT_SECONDS", 840.0
+            ),
             max_json_bytes=_integer(values, "BOLTZ_MAX_JSON_BYTES", 1024 * 1024),
             max_cif_bytes=_integer(values, "BOLTZ_MAX_CIF_BYTES", 8 * 1024 * 1024),
             max_sequence_length=_integer(values, "BOLTZ_MAX_SEQUENCE_LENGTH", 16_384),
@@ -759,7 +847,9 @@ def _runtime(model: str, values: Mapping[str, str]) -> Any:
 
 def _limits(values: Mapping[str, str]) -> SidecarLimits:
     return SidecarLimits(
-        max_request_bytes=_integer(values, "SIDECAR_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
+        max_request_bytes=_integer(
+            values, "SIDECAR_MAX_REQUEST_BYTES", 8 * 1024 * 1024
+        ),
         max_batch_size=_integer(values, "SIDECAR_MAX_BATCH_SIZE", 32),
         max_concurrency=_integer(values, "SIDECAR_MAX_CONCURRENCY", 1),
         max_queue_size=_integer(values, "SIDECAR_MAX_QUEUE_SIZE", 2),
@@ -781,7 +871,9 @@ def _required_csv(values: Mapping[str, str], name: str) -> tuple[str, ...]:
     return items
 
 
-def _required_or_default(values: Mapping[str, str], name: str, default: str | None) -> str:
+def _required_or_default(
+    values: Mapping[str, str], name: str, default: str | None
+) -> str:
     value = values.get(name)
     if value is not None and value.strip():
         return value.strip()

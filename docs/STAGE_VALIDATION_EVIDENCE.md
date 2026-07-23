@@ -4,15 +4,17 @@
 
 The evidence router supplements a validator; it never replaces one. Literature record counts, citation counts, model summaries, and MCP responses cannot become energies, forces, hull values, novelty booleans, relaxation convergence, Pareto utilities, or DFT results.
 
+RAG and MCP are separate boundaries. RAG retrieves scholarly metadata and closes claims to source records. The optional MCP route supplies more structured evidence records through an administrator-selected, schema-checked tool. It does not authorize an action or establish that a generator, expert, matcher, database client, relaxation, or DFT calculation ran. Those actions remain with the runtime authority named in the route.
+
 ## Routes
 
 | Stage value | Runtime authority | Scholarly sources | Stage MCP variable | Context retrieved |
 |---|---|---|---|---|
-| `generation_prior` | MatterGen-supported condition allowlist and deterministic Fusion controller | Crossref, arXiv, OpenAlex, optional MCP | `MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR` | phases, negative synthesis evidence, composition ranges, stability constraints |
-| `identity_novelty` | pymatgen `StructureMatcher` and optional Materials Project `find_structure` | Crossref, arXiv, OpenAlex, optional MCP | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` | reported phases, crystallographic aliases, scoped database context |
-| `mlip_disagreement` | separate MatterSim and CHGNet properties with explicit units | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT` | applicability limits, out-of-domain chemistry, magnetic and charge-state caveats |
+| `generation_prior` | fixed allowlist for a named official MatterGen checkpoint and deterministic Fusion controller; a custom allowlist is recorded as operator attestation, not automatically verified training metadata | Crossref, arXiv, OpenAlex, optional MCP | `MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR` | phases, negative synthesis evidence, composition ranges, stability constraints |
+| `identity_novelty` | source-Niggli non-symmetrized identity plus strict unscaled pymatgen `StructureMatcher`; optional Materials Project `find_structure` is a similarity prefilter followed by local strict recheck | Crossref, arXiv, OpenAlex, optional MCP | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` | reported phases, crystallographic aliases, scoped database context |
+| `mlip_disagreement` | separately executed MatterSim and CHGNet properties with explicit units and launcher-verified exact weight SHA-256 values; aligned same-composition relative energy for cross-model energy evidence | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT` | applicability limits, out-of-domain chemistry, magnetic and charge-state caveats |
 | `relaxation_validation` | separate `/v1/relax` payloads, optimizer convergence, and strict geometry gates | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION` | transformations, mechanical/dynamical instability, pressure/temperature, phonons |
-| `dft_handoff` | actual selected `PeriodicDFTBackend` execution; an input package alone is not a calculation | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF` | reference phases, magnetic order, functional/U, pseudopotential and convergence review |
+| `dft_handoff` | actual executing `PeriodicDFTBackend`; completed results require input-manifest, method-policy, immutable output/convergence evidence, and applicable reference-set or phonon provenance | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF` | reference phases, magnetic order, functional/U, pseudopotential and convergence review |
 
 The route stores its official-validator identifiers as provenance. Actual candidate values still come from the corresponding structure matcher, database lookup, expert sidecar, relaxation endpoint, or DFT backend.
 
@@ -48,6 +50,8 @@ export MATERIAL_RAG_MCP_TOKEN=""              # runtime secret when required
 The MCP endpoint and tool names are administrator configuration. They are not accepted from the discovery prompt, RAG-model output, stage observations, or an MCP response. Each route selects its dedicated tool first and `MATERIAL_RAG_MCP_TOOL` second. If any dedicated variable is set, the URL is required; a stage with neither a dedicated tool nor the fallback records MCP as unconfigured and continues its other sources. HTTPS is required outside an explicitly opted-in loopback development endpoint.
 
 Before retrieval, the MCP client performs bounded `tools/list` discovery and requires the selected tool to be advertised exactly once. Its object `inputSchema` must declare `query`, `max_results`, `from_date`, and `to_date`. A published `outputSchema` must declare a `records` array; output is still runtime-validated when that optional schema is absent. Contract failure omits MCP for that stage and never falls back to model memory. See [MCP evidence sources for material RAG](MCP_RAG.md).
+
+The evidence route accepts records only. A same-named MCP tool that claims to mutate candidates, run relaxation, submit DFT, write a database, or replace a validator is outside this contract and must not be invoked through this path.
 
 ## CLI
 
@@ -123,6 +127,8 @@ Non-generation evidence cannot steer a generator. The Evidence Fusion backend al
 - every requested source successful with records: `completed`
 - validator unavailable or failed: `unknown-not-pass`, regardless of retrieved literature
 - absence from literature or a structure database: not proof of novelty or validity
+- the selector branch ID `novelty`: property-space diversity only; external structural novelty requires the staged assessor and scoped provider provenance
+- strict external scoped no-match: eligible only for a bounded shortlist tie-break (at most one reserved DFT slot); `unknown` gets no credit and no-match is not a novelty proof
 
 Every report keeps source statuses and hashes, sets `scientific_role` to `search_and_validation_context_only`, and fixes `property_score_created` to `false`. Requests reject secret-like observation keys. The T4 notebook separately scans all hidden credentials against every exported artifact before creating the result archive.
 

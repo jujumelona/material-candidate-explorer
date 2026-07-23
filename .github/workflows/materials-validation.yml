@@ -1,0 +1,76 @@
+name: Materials validation
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: materials-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic-materials:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deterministic validation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,materials,sidecar]"
+
+      - name: Verify trusted integration manifest
+        run: python scripts/bootstrap.py verify-manifest
+
+      - name: Run materials, evidence, and notebook contract tests
+        run: |
+          python -m pytest -q \
+            tests/test_checkpoint_binding.py \
+            tests/test_integration_manifest_and_bootstrap.py \
+            tests/test_crystal_identity.py \
+            tests/test_crystal_identity_relations.py \
+            tests/test_materials_screening.py \
+            tests/test_mattergen_contract.py \
+            tests/test_evidence_fusion.py \
+            tests/test_fusion_exploration.py \
+            tests/test_fusion_metrics_regressions.py \
+            tests/test_fusion_search.py \
+            tests/test_mlip_reliability.py \
+            tests/test_novelty_and_dft_handoff.py \
+            tests/test_relaxation.py \
+            tests/test_scientific_route_correctness.py \
+            tests/test_sidecar_launch_scripts.py \
+            tests/test_generator_sidecar_contract.py \
+            tests/test_validation_evidence.py \
+            tests/test_mcp_client.py \
+            tests/test_t4_notebook_contract.py
+
+      - name: Confirm notebook is clean JSON with compilable code cells
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          path = Path("MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb")
+          notebook = json.loads(path.read_text(encoding="utf-8"))
+          for index, cell in enumerate(notebook.get("cells", [])):
+              if cell.get("cell_type") != "code":
+                  continue
+              if cell.get("execution_count") is not None or cell.get("outputs"):
+                  raise SystemExit(f"notebook code cell {index} contains saved runtime output")
+              source = "".join(cell.get("source", []))
+              compile(source, f"{path}:cell-{index}", "exec")

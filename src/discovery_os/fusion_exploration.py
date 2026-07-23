@@ -29,12 +29,14 @@ from .hashing import bytes_hash, candidate_content_hash, canonical_json, stable_
 from .schemas import (
     Candidate,
     CandidateRef,
+    CandidateType,
     DiscoveryGoal,
     GoalConstraint,
     Identifier,
     NonEmptyText,
     ObjectiveDirection,
     PropertyObjective,
+    RepresentationKind,
     StrictSchema,
 )
 
@@ -532,13 +534,27 @@ class CandidatePool(StrictSchema):
 
 class SelectedCandidate(StrictSchema):
     candidate_ref: CandidateRef
-    score: float
+    score: float | None
+    score_status: Literal["available", "unknown"] = "available"
+    evidence_reasons: list[NonEmptyText] = Field(default_factory=list)
     rationale: NonEmptyText
     expert_property_vectors: dict[str, list[DiagnosticProperty]]
+
+    @model_validator(mode="after")
+    def _score_availability_is_explicit(self) -> SelectedCandidate:
+        if self.score_status == "unknown":
+            if self.score is not None:
+                raise ValueError("unknown branch scores must remain null")
+            if not self.evidence_reasons:
+                raise ValueError("unknown branch scores require explicit evidence reasons")
+        elif self.score is None:
+            raise ValueError("available branch scores require a numeric value")
+        return self
 
 
 class ExplorationBranchResult(StrictSchema):
     branch: ExplorationBranch
+    rationale: NonEmptyText = "deterministic evidence-preserving branch ranking"
     candidates: list[SelectedCandidate] = Field(default_factory=list)
 
 
@@ -560,6 +576,14 @@ class _CandidateVector:
     entry: CandidatePoolEntry
     utilities: dict[tuple[str, str], float]
     original: dict[str, list[DiagnosticProperty]]
+    composition_scope: str | None
+
+
+@dataclass(frozen=True)
+class _DisagreementAssessment:
+    status: Literal["available", "unknown"]
+    score: float | None
+    reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -651,18 +675,38 @@ class DeterministicExplorationSelector:
                 excluded[stable_hash(ref)] = (ref, [unit_error])
             comparable = []
 
-        normalized = self._normalize(comparable, expected_dimensions)
+        composition_scoped_dimensions = {
+            dimension
+            for dimension in expected_dimensions
+            if _is_raw_energy_property(dimension[1])
+            and any(item.composition_scope is not None for item in comparable)
+        }
+        normalized = self._normalize(
+            comparable,
+            expected_dimensions,
+            composition_scoped_dimensions=composition_scoped_dimensions,
+        )
         pareto = [
             item
             for item in comparable
             if not any(
-                _dominates(other.utilities, item.utilities, expected_dimensions)
+                _dominates_candidate(
+                    other,
+                    item,
+                    expected_dimensions,
+                    composition_scoped_dimensions=composition_scoped_dimensions,
+                )
                 for other in comparable
                 if other is not item
             )
         ]
         novelty = self._novelty_scores(comparable, normalized, expected_dimensions)
-        disagreement = self._disagreement_scores(comparable)
+        disagreement = self._disagreement_scores(
+            comparable,
+            normalized,
+            expected_dimensions,
+            composition_scoped_dimensions=composition_scoped_dimensions,
+        )
         target = self._weighted_objective_scores(
             comparable,
             normalized,
@@ -680,60 +724,127 @@ class DeterministicExplorationSelector:
             expected_dimensions,
             stability_objectives,
         )
+        has_raw_energy_objective = any(
+            _is_raw_energy_property(name) for name in objective_by_name
+        )
+        stability_rationale = (
+            "thermodynamic-stability utility uses only explicit formation-energy, "
+            "energy-above-hull, or decomposition-energy evidence; raw total or "
+            "per-atom energy is excluded"
+            if stability_objectives
+            else (
+                "unpopulated because no formation-energy, energy-above-hull, or "
+                "decomposition-energy evidence is available; raw energy supports "
+                "only within-composition low-energy triage, not thermodynamic stability"
+            )
+        )
+        target_rationale = (
+            "goal-weighted utility using each objective's worst expert value"
+            + (
+                "; raw energy supports only within-composition low-energy triage, "
+                "not thermodynamic stability"
+                if has_raw_energy_objective
+                else ""
+            )
+        )
+        disagreement_rationale = (
+            "available cross-expert property spans are ranked independently; at most "
+            "one candidate with unknown disagreement evidence is retained as a null-score "
+            "fallback with explicit reasons"
+        )
+        disagreement_candidates = self._rank_disagreement(
+            comparable,
+            disagreement,
+            limit=limit_per_branch,
+            rationale=disagreement_rationale,
+        )
+        if stability_objectives:
+            stability_candidates = self._rank(
+                comparable,
+                stability,
+                limit=limit_per_branch,
+                rationale=stability_rationale,
+            )
+        else:
+            stability_seed_rows = self._rank(
+                pareto or comparable,
+                target,
+                limit=1,
+                rationale=stability_rationale,
+            )
+            stability_candidates = [
+                SelectedCandidate(
+                    candidate_ref=row.candidate_ref,
+                    score=None,
+                    score_status="unknown",
+                    evidence_reasons=[
+                        "generation_prior_only_no_stability_evidence"
+                    ],
+                    rationale=(
+                        stability_rationale
+                        + "; deterministic Pareto parent retained only to keep the "
+                        "stability generation prior reachable"
+                    ),
+                    expert_property_vectors=row.expert_property_vectors,
+                )
+                for row in stability_seed_rows
+            ]
 
         branch_rows = [
             ExplorationBranchResult(
                 branch=ExplorationBranch.STABILITY,
-                candidates=self._rank(
-                    comparable,
-                    stability,
-                    limit=limit_per_branch,
-                    rationale=(
-                        "goal-weighted stability utility using each objective's "
-                        "worst expert value"
-                    ),
-                ),
+                rationale=stability_rationale,
+                candidates=stability_candidates,
             ),
             ExplorationBranchResult(
                 branch=ExplorationBranch.TARGET_PROPERTY,
+                rationale=target_rationale,
                 candidates=self._rank(
                     comparable,
                     target,
                     limit=limit_per_branch,
-                    rationale=(
-                        "goal-weighted utility using each objective's worst expert value"
-                    ),
+                    rationale=target_rationale,
                 ),
             ),
             ExplorationBranchResult(
                 branch=ExplorationBranch.NOVELTY,
+                rationale=(
+                    "property-space diversity from nearest-neighbor Chebyshev distance; "
+                    "this is not structural or database novelty"
+                ),
                 candidates=self._rank(
                     comparable,
                     novelty,
                     limit=limit_per_branch,
-                    rationale="nearest-neighbor Chebyshev distance in expert property space",
+                    rationale=(
+                        "property-space diversity from nearest-neighbor Chebyshev distance; "
+                        "this is not structural or database novelty"
+                    ),
                 ),
             ),
             ExplorationBranchResult(
                 branch=ExplorationBranch.EXPERT_DISAGREEMENT,
-                candidates=self._rank(
-                    comparable,
-                    {
-                        key: value
-                        for key, value in disagreement.items()
-                        if value >= self.disagreement_threshold
-                    },
-                    limit=limit_per_branch,
-                    rationale="high cross-expert property span retained as an independent branch",
-                ),
+                rationale=disagreement_rationale,
+                candidates=disagreement_candidates,
             ),
             ExplorationBranchResult(
                 branch=ExplorationBranch.PARETO,
+                rationale=(
+                    "non-dominated original per-expert objective vector; raw energies "
+                    "are compared only within one reduced composition and support "
+                    "only within-composition low-energy triage, not "
+                    "thermodynamic stability"
+                ),
                 candidates=self._rank(
                     pareto,
                     {key: value for key, value in target.items()},
                     limit=limit_per_branch,
-                    rationale="non-dominated original per-expert objective vector",
+                    rationale=(
+                        "non-dominated original per-expert objective vector; raw energies "
+                        "are compared only within one reduced composition and support "
+                        "only within-composition low-energy triage, not "
+                        "thermodynamic stability"
+                    ),
                 ),
             ),
         ]
@@ -826,9 +937,21 @@ class DeterministicExplorationSelector:
         reasons.extend(
             _numeric_constraint_reasons(originals, numeric_constraints)
         )
+        composition_scope = _candidate_composition_scope(entry.candidate)
+        if any(_is_raw_energy_property(item[1]) for item in utilities) and (
+            _is_periodic_candidate(entry.candidate) and composition_scope is None
+        ):
+            reasons.append(
+                "raw material energy requires an explicit reduced-composition scope"
+            )
         if reasons:
             return None, reasons
-        return _CandidateVector(entry=entry, utilities=utilities, original=originals), []
+        return _CandidateVector(
+            entry=entry,
+            utilities=utilities,
+            original=originals,
+            composition_scope=composition_scope,
+        ), []
 
     @staticmethod
     def _weighted_objective_scores(
@@ -890,16 +1013,35 @@ class DeterministicExplorationSelector:
     def _normalize(
         vectors: list[_CandidateVector],
         dimensions: list[tuple[str, str]],
+        *,
+        composition_scoped_dimensions: set[tuple[str, str]] | None = None,
     ) -> dict[str, dict[tuple[str, str], float]]:
-        ranges: dict[tuple[str, str], tuple[float, float]] = {}
+        scoped = composition_scoped_dimensions or set()
+        ranges: dict[tuple[tuple[str, str], str | None], tuple[float, float]] = {}
         for dim in dimensions:
-            values = [item.utilities[dim] for item in vectors]
-            ranges[dim] = (min(values), max(values))
+            if dim in scoped:
+                composition_keys = sorted(
+                    {item.composition_scope for item in vectors},
+                    key=lambda item: "" if item is None else item,
+                )
+                for composition in composition_keys:
+                    values = [
+                        item.utilities[dim]
+                        for item in vectors
+                        if item.composition_scope == composition
+                    ]
+                    ranges[(dim, composition)] = (min(values), max(values))
+            else:
+                values = [item.utilities[dim] for item in vectors]
+                ranges[(dim, None)] = (min(values), max(values))
         result: dict[str, dict[tuple[str, str], float]] = {}
         for item in vectors:
             row: dict[tuple[str, str], float] = {}
             for dim in dimensions:
-                low, high = ranges[dim]
+                range_key = (
+                    (dim, item.composition_scope) if dim in scoped else (dim, None)
+                )
+                low, high = ranges[range_key]
                 row[dim] = 1.0 if high == low else (item.utilities[dim] - low) / (high - low)
             result[_candidate_key(item)] = row
         return result
@@ -930,28 +1072,164 @@ class DeterministicExplorationSelector:
         return result
 
     @staticmethod
-    def _disagreement_scores(vectors: list[_CandidateVector]) -> dict[str, float]:
+    def _disagreement_scores(
+        vectors: list[_CandidateVector],
+        normalized: dict[str, dict[tuple[str, str], float]],
+        dimensions: list[tuple[str, str]],
+        *,
+        composition_scoped_dimensions: set[tuple[str, str]],
+    ) -> dict[str, _DisagreementAssessment]:
+        """Return typed diagnostic spans, never a calibrated error bar.
+
+        Using the normalized panel avoids interpreting arbitrary absolute energy
+        gauges from two MLIPs as a quantitative uncertainty.  A separate
+        reliability calibration is still required before making an error-bound
+        claim.  Incomparable panels remain null/unknown; in particular, a raw
+        energy panel containing one candidate cannot manufacture numeric zero
+        disagreement because it has no within-composition ordering information.
+        """
+
         global_values: dict[str, list[float]] = {}
-        by_candidate: dict[str, dict[str, list[float]]] = {}
+        by_candidate: dict[str, dict[str, list[tuple[tuple[str, str], float]]]] = {}
+        composition_panel_sizes: dict[str, int] = {}
         for item in vectors:
             key = _candidate_key(item)
-            grouped: dict[str, list[float]] = {}
-            for (_expert, property_name), value in item.utilities.items():
-                grouped.setdefault(property_name, []).append(value)
-                global_values.setdefault(property_name, []).append(value)
+            if item.composition_scope is not None:
+                composition_panel_sizes[item.composition_scope] = (
+                    composition_panel_sizes.get(item.composition_scope, 0) + 1
+                )
+            grouped: dict[str, list[tuple[tuple[str, str], float]]] = {}
+            for dimension in dimensions:
+                property_name = dimension[1]
+                raw_value = item.utilities[dimension]
+                grouped.setdefault(property_name, []).append(
+                    (dimension, raw_value)
+                )
+                global_values.setdefault(property_name, []).append(raw_value)
             by_candidate[key] = grouped
 
-        output: dict[str, float] = {}
+        output: dict[str, _DisagreementAssessment] = {}
+        vectors_by_key = {_candidate_key(item): item for item in vectors}
         for key, groups in by_candidate.items():
-            spans = []
-            for name, values in groups.items():
-                if len(values) < 2:
+            item = vectors_by_key[key]
+            spans: list[float] = []
+            reasons: list[str] = []
+            for property_name, rows in groups.items():
+                if len(rows) < 2:
+                    reasons.append(
+                        f"property {property_name!r} disagreement is unknown: "
+                        "fewer than two successful expert values"
+                    )
                     continue
-                population = global_values[name]
+                if any(
+                    dimension in composition_scoped_dimensions
+                    for dimension, _value in rows
+                ):
+                    composition = item.composition_scope
+                    if composition is None:
+                        reasons.append(
+                            f"raw energy property {property_name!r} disagreement is "
+                            "unknown: reduced-composition scope is missing"
+                        )
+                        continue
+                    if composition_panel_sizes.get(composition, 0) < 2:
+                        reasons.append(
+                            f"raw energy property {property_name!r} disagreement is "
+                            f"unknown for reduced composition {composition!r}: singleton "
+                            "composition panel has no within-composition ordering"
+                        )
+                        continue
+                    values = [normalized[key][dimension] for dimension, _value in rows]
+                    spans.append(max(values) - min(values))
+                    continue
+                values = [value for _dimension, value in rows]
+                population = global_values[property_name]
                 scale = max(population) - min(population)
-                spans.append(0.0 if scale == 0.0 else (max(values) - min(values)) / scale)
-            output[key] = max(spans, default=0.0)
+                spans.append(
+                    0.0 if scale == 0.0 else (max(values) - min(values)) / scale
+                )
+            if spans:
+                output[key] = _DisagreementAssessment(
+                    status="available",
+                    score=max(spans),
+                    reasons=tuple(sorted(set(reasons))),
+                )
+            else:
+                output[key] = _DisagreementAssessment(
+                    status="unknown",
+                    score=None,
+                    reasons=tuple(
+                        sorted(
+                            set(reasons)
+                            or {
+                                "cross-expert disagreement is unknown: no property "
+                                "has two comparable expert values"
+                            }
+                        )
+                    ),
+                )
         return output
+
+    def _rank_disagreement(
+        self,
+        vectors: list[_CandidateVector],
+        assessments: dict[str, _DisagreementAssessment],
+        *,
+        limit: int,
+        rationale: str,
+    ) -> list[SelectedCandidate]:
+        """Rank available spans first and retain at most one unknown fallback."""
+
+        unknown = [
+            item
+            for item in vectors
+            if assessments[_candidate_key(item)].status == "unknown"
+        ]
+        unknown.sort(
+            key=lambda item: (
+                item.entry.candidate.candidate_id,
+                item.entry.candidate.candidate_ref.version,
+                item.entry.candidate.candidate_ref.content_hash,
+            )
+        )
+        reserve_unknown = bool(unknown) and limit > 1
+        available_limit = limit - 1 if reserve_unknown else limit
+        available_scores = {
+            key: assessment.score
+            for key, assessment in assessments.items()
+            if assessment.status == "available"
+            and assessment.score is not None
+            and assessment.score >= self.disagreement_threshold
+        }
+        available_reasons = {
+            key: assessment.reasons
+            for key, assessment in assessments.items()
+            if assessment.status == "available" and assessment.reasons
+        }
+        selected = self._rank(
+            vectors,
+            available_scores,
+            limit=available_limit,
+            rationale=rationale,
+            evidence_reasons=available_reasons,
+        )
+        if unknown and len(selected) < limit:
+            fallback = unknown[0]
+            assessment = assessments[_candidate_key(fallback)]
+            selected.append(
+                SelectedCandidate(
+                    candidate_ref=fallback.entry.candidate.candidate_ref,
+                    score=None,
+                    score_status="unknown",
+                    evidence_reasons=list(assessment.reasons),
+                    rationale=(
+                        "unknown cross-expert disagreement retained for follow-up; "
+                        "null is not numeric agreement"
+                    ),
+                    expert_property_vectors=fallback.original,
+                )
+            )
+        return selected
 
     @staticmethod
     def _rank(
@@ -960,6 +1238,7 @@ class DeterministicExplorationSelector:
         *,
         limit: int | None,
         rationale: str,
+        evidence_reasons: dict[str, tuple[str, ...]] | None = None,
     ) -> list[SelectedCandidate]:
         eligible = [item for item in vectors if _candidate_key(item) in scores]
         eligible.sort(
@@ -976,6 +1255,10 @@ class DeterministicExplorationSelector:
             SelectedCandidate(
                 candidate_ref=item.entry.candidate.candidate_ref,
                 score=scores[_candidate_key(item)],
+                score_status="available",
+                evidence_reasons=list(
+                    (evidence_reasons or {}).get(_candidate_key(item), ())
+                ),
                 rationale=rationale,
                 expert_property_vectors=item.original,
             )
@@ -1017,11 +1300,14 @@ class AdaptiveGenerationScheduler:
         mutation_step: float = 0.10,
         diversity_step: float = 0.05,
         max_history: int = 1_024,
+        alpha_semantics: Literal["generic", "classifier_free_guidance"] = "generic",
     ) -> None:
         if isinstance(trend_window, bool) or trend_window < 2:
             raise ValueError("trend_window must be at least two")
         if isinstance(max_history, bool) or max_history <= 0:
             raise ValueError("max_history must be positive")
+        if alpha_semantics not in {"generic", "classifier_free_guidance"}:
+            raise ValueError("alpha_semantics is not supported")
         for label, value in (
             ("improvement_epsilon", improvement_epsilon),
             ("collapse_epsilon", collapse_epsilon),
@@ -1043,6 +1329,7 @@ class AdaptiveGenerationScheduler:
         self.mutation_step = mutation_step
         self.diversity_step = diversity_step
         self.max_history = max_history
+        self.alpha_semantics = alpha_semantics
         self._history: list[SchedulerDecision] = []
 
     @property
@@ -1109,18 +1396,39 @@ class AdaptiveGenerationScheduler:
         if collapse_increased:
             temperature -= self.temperature_step
             mutation -= self.mutation_step
+            if self.alpha_semantics == "classifier_free_guidance":
+                alpha -= self.alpha_step
             reasons.append(
                 "structural collapse increased; reduced temperature and mutation strength"
+                + (
+                    " and classifier-free guidance"
+                    if self.alpha_semantics == "classifier_free_guidance"
+                    else ""
+                )
             )
         elif sustained_improvement:
-            alpha -= self.alpha_step
-            reasons.append("improvement persisted; reduced alpha for precision")
+            if self.alpha_semantics == "classifier_free_guidance":
+                alpha += self.alpha_step
+                reasons.append(
+                    "improvement persisted; increased classifier-free guidance for "
+                    "condition-focused exploitation"
+                )
+            else:
+                alpha -= self.alpha_step
+                reasons.append("improvement persisted; reduced alpha for precision")
         elif stagnated:
             temperature += self.temperature_step
             mutation += self.mutation_step
             diversity += self.diversity_step
+            if self.alpha_semantics == "classifier_free_guidance":
+                alpha -= self.alpha_step
             reasons.append(
                 "objective stagnated; increased temperature, mutation, and diversity"
+                + (
+                    " while reducing classifier-free guidance to broaden sampling"
+                    if self.alpha_semantics == "classifier_free_guidance"
+                    else ""
+                )
             )
         else:
             reasons.append("no sustained trend; retained the current exploration controls")
@@ -1161,6 +1469,59 @@ def _candidate_key(vector: _CandidateVector) -> str:
     return stable_hash(ref)
 
 
+_RAW_ENERGY_PROPERTIES = frozenset(
+    {
+        "energy",
+        "energy_per_atom",
+        "potential_energy",
+        "total_energy",
+    }
+)
+
+
+def _is_raw_energy_property(name: str) -> bool:
+    """Return whether a property has an arbitrary method/composition energy gauge."""
+
+    return name.strip().casefold().replace("-", "_") in _RAW_ENERGY_PROPERTIES
+
+
+def _is_periodic_candidate(candidate: Candidate) -> bool:
+    return candidate.candidate_type in {
+        CandidateType.CRYSTAL,
+        CandidateType.COMPOSITION,
+        CandidateType.ALLOY,
+        CandidateType.BATTERY_MATERIAL,
+        CandidateType.CATALYST,
+    }
+
+
+def _candidate_composition_scope(candidate: Candidate) -> str | None:
+    """Read an explicit reduced-composition key without inventing chemistry.
+
+    Generator adapters should persist ``composition_key`` after parsing their
+    authoritative structure.  A canonical chemical-formula representation is a
+    compatible fallback for externally supplied candidates.  CIF text is not
+    reparsed here because the model-neutral coordinator must remain usable
+    without a crystallography dependency.
+    """
+
+    for key in ("composition_key", "reduced_formula"):
+        value = candidate.attributes.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    formulas = [
+        item
+        for item in candidate.representations
+        if item.kind == RepresentationKind.CHEMICAL_FORMULA
+    ]
+    canonical = [item for item in formulas if item.canonical]
+    selected = canonical[0] if len(canonical) == 1 else formulas[0] if formulas else None
+    if selected is None:
+        return None
+    value = "".join(selected.value.split())
+    return value or None
+
+
 def _dimension_name(dimension: tuple[str, str]) -> str:
     return f"{dimension[0]}/{dimension[1]}"
 
@@ -1173,6 +1534,35 @@ def _dominates(
     return all(left[item] >= right[item] for item in dimensions) and any(
         left[item] > right[item] for item in dimensions
     )
+
+
+def _dominates_candidate(
+    left: _CandidateVector,
+    right: _CandidateVector,
+    dimensions: list[tuple[str, str]],
+    *,
+    composition_scoped_dimensions: set[tuple[str, str]],
+) -> bool:
+    """Compare only scientifically compatible objective axes.
+
+    Within one composition all axes are available.  Across compositions, raw
+    total/per-atom energies are omitted because their absolute gauges do not
+    define a thermodynamic ordering.  Reference-consistent formation energy or
+    energy-above-hull objectives are deliberately not in the raw-energy set.
+    """
+
+    comparable = (
+        dimensions
+        if left.composition_scope == right.composition_scope
+        else [
+            item
+            for item in dimensions
+            if item not in composition_scoped_dimensions
+        ]
+    )
+    if not comparable:
+        return False
+    return _dominates(left.utilities, right.utilities, comparable)
 
 
 def _numeric_constraints(

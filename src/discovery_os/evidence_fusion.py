@@ -55,6 +55,29 @@ _HULL_EXPLORATION_TARGET = 0.05
 _DISAGREEMENT_THRESHOLD = 0.25
 _HULL_UNIT = "eV/atom"
 _HULL_MILLI_UNIT = "meV/atom"
+_HULL_BRANCH_PRIORS = {
+    "stability": 0.0,
+    "expert_disagreement": _HULL_STABLE_THRESHOLD,
+    "novelty": 0.08,
+    "target_property": _HULL_STABLE_THRESHOLD,
+    "pareto": _HULL_EXPLORATION_TARGET,
+}
+_MATTERGEN_CONDITION_UNITS: dict[str, str | None] = {
+    "chemical_system": None,
+    "space_group": None,
+    "dft_mag_density": "µB/Å^3",
+    "dft_band_gap": "eV",
+    "ml_bulk_modulus": "GPa",
+    "hhi_score": None,
+    "energy_above_hull": _HULL_UNIT,
+}
+# Absolute energies produced by independently trained MLIPs generally have
+# model-specific gauges.  Their raw values may be retained by the evidence
+# store, but must never be interpreted here as calibrated expert
+# disagreement.  Composition-relative comparison lives in mlip_reliability.
+_RAW_ENERGY_PROPERTY_NAMES = frozenset(
+    {"energy", "energy_per_atom", "potential_energy", "total_energy"}
+)
 _PERIODIC_SYMBOLS = frozenset(
     """H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni
     Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe
@@ -216,6 +239,8 @@ class EvidenceDrivenFusionBackend:
                 else "Molecule hints are generator priors, not efficacy or safety scores."
             ),
         ]
+        if evidence_rationale:
+            safety_notes.append(evidence_rationale)
         if (
             disagreement >= _DISAGREEMENT_THRESHOLD
             or request.decision_context.exploration_branch == "expert_disagreement"
@@ -349,6 +374,8 @@ def _objective_utilities(
     values: list[float] = []
     rows = _unambiguous_success_properties(features)
     for property_name, objective in objective_by_name.items():
+        if property_name.strip().casefold() in _RAW_ENERGY_PROPERTY_NAMES:
+            continue
         scale = _objective_numeric_scale(property_name, objective)
         if scale is None:
             continue
@@ -415,6 +442,8 @@ def _expert_disagreement(
     grouped: dict[str, dict[str, float]] = {}
     rows = _unambiguous_success_properties(features)
     for name, objective in objective_by_name.items():
+        if name.strip().casefold() in _RAW_ENERGY_PROPERTY_NAMES:
+            continue
         scale = _objective_numeric_scale(name, objective)
         if scale is None:
             continue
@@ -544,6 +573,7 @@ def _evidence_guided_changes(
         f"Live evidence branch {context.evidence_branch_id} from claims {claim_note}: "
     )
     changes: list[DesiredChange] = []
+    rejected_chemical_scope_hint = False
 
     if request.goal.domain == DiscoveryDomain.MEDICINAL_CHEMISTRY or (
         request.candidate.candidate_type == CandidateType.SMALL_MOLECULE
@@ -569,6 +599,7 @@ def _evidence_guided_changes(
                     direction="explore",
                     property_name=key,
                     target_value=value,
+                    source="literature_generator_hint",
                     rationale=(
                         rationale_prefix
                         + f"use {key!r} only to define a molecule-generation branch."
@@ -600,24 +631,37 @@ def _evidence_guided_changes(
         value = _validated_condition_target(key, value)
         if value is None:
             continue
+        if key == "chemical_system":
+            allowed = _chemical_system(request)
+            if allowed is not None and value != allowed:
+                rejected_chemical_scope_hint = True
+                continue
         changes.append(
             DesiredChange(
                 axis=ChangeAxis.TARGET_PROPERTY,
                 direction="target",
                 property_name=key,
                 target_value=value,
+                unit=_MATTERGEN_CONDITION_UNITS[key],
+                source="literature_generator_hint",
                 rationale=(
                     rationale_prefix
                     + f"explore the evidence-linked MatterGen condition {key!r}."
                 ),
             )
         )
-    return changes, (
+    note = (
         "Live materials evidence supplied explicit supported generation conditions; "
         "it did not become a stability or property score."
         if changes
         else ""
     )
+    if rejected_chemical_scope_hint:
+        note += (
+            " A literature-derived chemical system outside the immutable parent/goal "
+            "scope was ignored; expanded-system branches require explicit user opt-in."
+        )
+    return changes, note.strip()
 
 def _select_supported_changes(
     request: FusionRevisionRequest,
@@ -632,7 +676,12 @@ def _select_supported_changes(
     hull_objective = objectives.get("energy_above_hull")
     hull_rows = properties.get("energy_above_hull", [])
     hull_values = _unit_compatible_hull_values(hull_rows, hull_objective)
-    if hull_objective is not None or hull_rows:
+    exploration_branch = request.decision_context.exploration_branch
+    if (
+        hull_objective is not None
+        or hull_rows
+        or exploration_branch in _HULL_BRANCH_PRIORS
+    ):
         target = _next_hull_target(
             hull_objective,
             hull_values,
@@ -640,7 +689,7 @@ def _select_supported_changes(
             previous_improvement=(
                 request.decision_context.previous_objective_improvement
             ),
-            exploration_branch=request.decision_context.exploration_branch,
+            exploration_branch=exploration_branch,
         )
         target = _validated_condition_target("energy_above_hull", target)
         if target is not None:
@@ -650,9 +699,22 @@ def _select_supported_changes(
                     direction="target",
                     property_name="energy_above_hull",
                     target_value=target,
+                    unit=_HULL_UNIT,
+                    source=(
+                        "explicit_goal"
+                        if hull_objective is not None
+                        and isinstance(hull_objective.target_value, (int, float))
+                        and not isinstance(hull_objective.target_value, bool)
+                        else "expert_evidence"
+                        if hull_values
+                        else "declared_search_prior"
+                        if exploration_branch in _HULL_BRANCH_PRIORS
+                        else "expert_evidence"
+                    ),
                     rationale=(
-                        "Adjust the stability condition from the current primary expert "
-                        "panel without interpreting embeddings."
+                        "Apply a bounded MatterGen search condition. Branch values are "
+                        "declared priors, not measured stability; expert values are used "
+                        "only when explicitly available and unit-compatible."
                     ),
                 )
             )
@@ -684,6 +746,8 @@ def _select_supported_changes(
                 direction="target",
                 property_name=objective.property_name,
                 target_value=target,
+                unit=objective.unit,
+                source="explicit_goal",
                 rationale="Use only an explicit goal value or a current expert result.",
             )
         )
@@ -702,6 +766,7 @@ def _select_supported_changes(
                     direction="target",
                     property_name="chemical_system",
                     target_value=chemical_system,
+                    source="parent_candidate",
                     rationale="Preserve the parent candidate's explicit chemical system.",
                 )
             ],
@@ -742,25 +807,19 @@ def _next_hull_target(
             if scale is None:
                 return None
             return round(float(explicit) * scale, 8)
+    # These are bounded, declared search priors for independent MatterGen
+    # branches.  They are not inferred stability measurements.  Explicit goal
+    # targets above always take precedence.
     if not values:
-        return None
+        return _HULL_BRANCH_PRIORS.get(exploration_branch)
 
     stable_fraction = sum(value <= _HULL_STABLE_THRESHOLD for value in values) / len(values)
     if stable_fraction < 0.5:
         return 0.0
-    if exploration_branch == "stability":
-        return 0.0
-    if (
-        exploration_branch == "expert_disagreement"
-        or disagreement >= _DISAGREEMENT_THRESHOLD
-    ):
+    if exploration_branch in _HULL_BRANCH_PRIORS:
+        return _HULL_BRANCH_PRIORS[exploration_branch]
+    if disagreement >= _DISAGREEMENT_THRESHOLD:
         return _HULL_STABLE_THRESHOLD
-    if exploration_branch == "novelty":
-        return 0.08
-    if exploration_branch == "target_property":
-        return _HULL_STABLE_THRESHOLD
-    if exploration_branch == "pareto":
-        return _HULL_EXPLORATION_TARGET
     if previous_improvement is not None and previous_improvement > 0.0:
         return 0.0
     return _HULL_EXPLORATION_TARGET
@@ -797,6 +856,19 @@ def _objective_condition_target(
 
 
 def _chemical_system(request: FusionRevisionRequest) -> str | None:
+    declared = {
+        canonical
+        for constraint in request.goal.constraints
+        if constraint.hard
+        and constraint.property_name in {"chemical_system", "allowed_chemical_system"}
+        and constraint.operator == "eq"
+        and isinstance(constraint.value, str)
+        and (canonical := _canonical_chemical_system(constraint.value)) is not None
+    }
+    if len(declared) > 1:
+        raise ValueError("goal contains conflicting hard chemical-system constraints")
+    if declared:
+        return next(iter(declared))
     attribute = request.candidate.attributes.get("chemical_system")
     if isinstance(attribute, str):
         canonical = _canonical_chemical_system(attribute)

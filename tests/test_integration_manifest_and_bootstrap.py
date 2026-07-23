@@ -70,6 +70,14 @@ def test_manifest_pins_incompatible_model_stacks_in_separate_environments() -> N
     assert "torch-geometric==2.5.3" in components["qhnet-source"].install.constraints
     assert components["qhnet-source"].status == "research"
     assert all(len(item.source.revision) == 40 for item in manifest.components if item.source)
+    assert components["mattersim"].weights[0].kind == "https"
+    assert components["mattersim"].weights[0].sha256 == (
+        "e3df9fa708725e3d453140646c7d1838324b347a3d1214cf1440522146f872b5"
+    )
+    assert components["chgnet"].weights[0].kind == "https"
+    assert components["chgnet"].weights[0].sha256 == (
+        "d14ab7c0f093efe64b60a7bcd540bca10e74fb7f46c86108a079af60524659d1"
+    )
 
 
 def test_manifest_revision_detects_tampering(tmp_path) -> None:
@@ -307,6 +315,55 @@ def test_disk_preflight_source_api_requires_source_and_environment(
     assert complete["required_gb"] == 0.0
 
 
+def test_disk_preflight_recognizes_completed_https_weight_artifact(tmp_path) -> None:
+    bootstrap = _bootstrap_module()
+    manifest = bootstrap.load_manifest(ROOT / "integrations" / "manifest.v1.json")
+    component = next(
+        item for item in manifest["components"] if item["component_id"] == "chgnet"
+    )
+    weight = component["weights"][0]
+    root = tmp_path / "external"
+    installer = bootstrap.Installer(
+        manifest,
+        root,
+        accelerator="cpu",
+        accepted_licenses=set(),
+        include_weights=True,
+        dry_run=True,
+        allow_external_root=True,
+    )
+    environment_python = bootstrap._environment_python(root / "envs" / "chgnet")
+    environment_python.parent.mkdir(parents=True)
+    environment_python.touch()
+    row = {
+        "component_id": "chgnet",
+        "action": "install",
+        "storage_gb": component["resources"]["storage_gb"],
+        "weight_actions": [
+            {
+                "weight_id": weight["weight_id"],
+                "action": "download",
+            }
+        ],
+    }
+
+    incomplete = installer._disk_preflight({"components": [row]})
+    assert incomplete["required_gb"] == component["resources"]["storage_gb"]
+
+    marker = (
+        root
+        / "models"
+        / "chgnet"
+        / weight["weight_id"]
+        / weight["revision"]
+        / ".artifact.json"
+    )
+    marker.parent.mkdir(parents=True)
+    marker.write_text("{}", encoding="utf-8")
+    complete = installer._disk_preflight({"components": [row]})
+    assert complete["required_gb"] == 0.0
+
+
 def test_license_acceptance_is_explicit(monkeypatch) -> None:
     bootstrap = _bootstrap_module()
     manifest = bootstrap.load_manifest(ROOT / "integrations" / "manifest.v1.json")
@@ -477,6 +534,80 @@ def test_download_stops_at_declared_size_and_removes_partial(tmp_path, monkeypat
 
     assert not destination.exists()
     assert not destination.with_suffix(".gz.part").exists()
+
+
+def test_https_weight_install_records_exact_bytes_and_rejects_tampering(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    bootstrap = _bootstrap_module()
+    artifact_bytes = b"immutable-reviewed-weight-fixture"
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+    component = {
+        "component_id": "chgnet",
+        "weights": [
+            {
+                "weight_id": "fixture-checkpoint",
+                "kind": "https",
+                "revision": "a" * 40,
+                "download_url": "https://example.invalid/checkpoint.pth.tar",
+                "sha256": artifact_sha256,
+                "expected_size_bytes": len(artifact_bytes),
+            }
+        ],
+    }
+
+    class Response(io.BytesIO):
+        def __init__(self, data: bytes) -> None:
+            super().__init__(data)
+            self.headers = {"Content-Length": str(len(data))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    requests: list[str] = []
+
+    def fake_urlopen(request, **_kwargs):
+        requests.append(request.full_url)
+        return Response(artifact_bytes)
+
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", fake_urlopen)
+    root = tmp_path / "install"
+    installer = bootstrap.Installer(
+        {"components": []},
+        root,
+        accelerator="cpu",
+        accepted_licenses=set(),
+        include_weights=True,
+        dry_run=False,
+        allow_external_root=True,
+    )
+
+    first = installer._install_weights(component)
+    artifact = Path(first["fixture-checkpoint"]["path"])
+    marker = json.loads((artifact.parent / ".artifact.json").read_text(encoding="utf-8"))
+
+    assert requests == ["https://example.invalid/checkpoint.pth.tar"]
+    assert artifact.read_bytes() == artifact_bytes
+    assert marker == {
+        "schema_version": "1.0",
+        "download_url": "https://example.invalid/checkpoint.pth.tar",
+        "revision": "a" * 40,
+        "filename": "checkpoint.pth.tar",
+        "sha256": artifact_sha256,
+        "size_bytes": len(artifact_bytes),
+    }
+
+    second = installer._install_weights(component)
+    assert second == first
+    assert requests == ["https://example.invalid/checkpoint.pth.tar"]
+
+    artifact.write_bytes(b"X" * len(artifact_bytes))
+    with pytest.raises(bootstrap.BootstrapError, match="checksum validation"):
+        installer._install_weights(component)
 
 
 def test_archive_member_and_expansion_limits_cleanup_temporary_directory(

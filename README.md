@@ -1,6 +1,6 @@
 # Material Candidate Explorer
 
-[![Run T4 Discovery in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb) [![View T4 Notebook](https://img.shields.io/badge/T4%20Discovery-GitHub-181717?logo=github)](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb)
+[![Run T4 Discovery in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb) [![View T4 Notebook](https://img.shields.io/badge/T4%20Discovery-GitHub-181717?logo=github)](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb) [![Materials validation](https://github.com/jujumelona/material-candidate-explorer/actions/workflows/materials-validation.yml/badge.svg)](https://github.com/jujumelona/material-candidate-explorer/actions/workflows/materials-validation.yml)
 
 Material Candidate Explorer is a model-agnostic orchestration engine for exploring and prioritizing material candidates across chemistry, crystal materials, superconductors, batteries, catalysts, polymers, and medicinal chemistry.
 
@@ -41,15 +41,21 @@ The local Fusion backend never averages expert tensors. Its fixed eight-value la
 
 Actual candidate selection is performed by the evidence store, deterministic exploration selector, adaptive scheduler, and Pareto branches.
 
+The scientific choices and claim boundaries are mapped to primary sources in [Research foundations](docs/RESEARCH_FOUNDATIONS.md). Model or benchmark publications justify a workflow choice; they do not validate a newly generated candidate.
+
 ## Implemented behavior
 
 - Candidate batches and paired OFF/ON runs support candidate_count from 1 to 1024.
-- Fusion search keeps stability, target-property, novelty, expert-disagreement, and Pareto branches.
+- Fusion search keeps stability, target-property, expert-disagreement, Pareto, and a legacy `novelty` branch whose implemented score is property-space diversity. That branch is not a structural or database novelty result.
 - Every generated candidate is evaluated again by the configured experts.
-- MatterGen output is canonicalized for identity and deduplicated with pymatgen `StructureMatcher`; the direct generated CIF serialization is retained as the candidate, and exact-file hashes remain separate from scientific structure identity.
+- MatterGen accepts only the fixed allowlist for a named official checkpoint. A custom checkpoint is unconditional unless an operator supplies an explicit condition allowlist; that declaration is recorded as operator attestation and is not automatic inspection or proof of how the custom weights were trained. The adapter records the actual classifier-free guidance factor, requested/applied/ignored controls, model-envelope rejections, checkpoint provenance, and generation funnel.
+- MatterGen retains the direct generated CIF as the candidate. Hard identity uses a source-derived Niggli representation without symmetry refinement; the symmetry-standardized structure is retained only as prototype context. Only a strict, unscaled crystallographic match is hard-deduplicated, so a volume-scaled same-prototype candidate is retained. The sidecar removes strict duplicates within a call and, when `search_session_id` is present, across calls before expert evaluation while requesting replacements. The coordinator keeps a post-evaluation exact attested-identity-hash fallback for adapters that emit the compatible raw-identity receipt but do not perform session-aware replacement. Exact-file hashes remain separate from both identity receipts.
 - MatterSim and CHGNet expose a separate `/v1/relax` operation, so model execution, optimizer convergence, and the strict geometry gate are recorded independently.
-- Staged novelty assessment distinguishes current-batch matches, project-history matches, external structure matches, and `unknown` external status.
-- The portable DFT handoff writes reviewable CIF/POSCAR/Quantum ESPRESSO input packages for a top-1-to-5 shortlist without bundling pseudopotentials or claiming a calculation ran.
+- The trusted manifest downloads the default MatterSim 5M and CHGNet 0.3.0 files from immutable upstream source revisions, checks their declared byte sizes and project-pinned SHA-256 digests, and writes an attestation marker. The launchers rehash the files before binding them; the defaults are no longer upstream-managed or `managed-unattested`.
+- Staged structural novelty assessment is separate from the property-diversity branch. It distinguishes current-batch matches, project-history matches, external strict structure matches, scoped no-match, and `unknown`. A Materials Project `find_structure` result is only a similarity prefilter until the returned structure passes the local strict unscaled matcher. With several configured providers, external `no_match` requires all of them to return scoped no-match; one unresolved provider keeps the aggregate `unknown`.
+- Composition-scoped Pareto fronts use NSGA-II crowding to preserve objective boundaries. The top-1-to-5 DFT portfolio covers distinct reduced compositions before filling remaining slots and may reserve at most one slot for an eligible strict external scoped-no-match candidate. `unknown` receives no such credit, and even scoped no-match is not proof of novelty.
+- Optional split-conformal reliability applies only to an exact model/DFT/chemistry calibration scope. Missing or out-of-domain calibration returns unknown, exposes no coverage claim, and escalates to DFT.
+- The portable DFT handoff writes reviewable CIF/POSCAR/Quantum ESPRESSO input packages with an auditable reciprocal-space starting grid and unresolved pseudopotential-specific cutoffs; it does not bundle pseudopotentials or claim a calculation ran. A separately executing backend can return `completed` only with the input-manifest hash, immutable output and convergence artifacts, a method-policy hash, and explicit convergence. Formation or hull values additionally require a reference-set hash, and phonon conclusions require the recorded q mesh, minimum frequency, tolerance, and consistent imaginary-mode classification.
 - Goal-hashed feature caching prevents duplicate expert calculations.
 - CIF, SMILES, sequences, original expert payloads, generator provenance, latent states, scheduler controls, and search history are persisted under the artifact root.
 - If FUSION_API_URL is unset, the deterministic local EvidenceDrivenFusionBackend is selected automatically.
@@ -61,14 +67,15 @@ Actual candidate selection is performed by the evidence store, deterministic exp
 - [Open the T4 material-discovery notebook in Google Colab](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb)
 - [View the legacy adaptive-loop notebook](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
 
-`MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb` is the recommended material-candidate workflow. It allocates 8-32 requested candidates across several MatterGen guidance and target profiles, evaluates every unique crystal with MatterSim and CHGNet, runs explicit MLIP relaxations, performs composition-scoped Pareto ranking, checks staged novelty, and creates DFT input packages for the top 1-5 candidates. The same stage-evidence router is available from the Python package and CLI; it is not notebook-only code.
+`MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb` is the recommended material-candidate workflow. It runs a budgeted, multi-round `fusion-search`: the MatterGen sidecar performs raw-geometry, tolerance-aware within-call and search-session duplicate rejection before MatterSim and CHGNet evaluation; evaluated candidates are then inserted into persistent evidence and branch pools and used to schedule the next round. The coordinator's attested-hash check is a defensive post-evaluation fallback, not a replacement for `StructureMatcher`. Global generator-call and generated-candidate limits cover every round, branch, frontier, and control variant. A MAXIMUM run does not fabricate candidates or silently accept a shortfall: rejection, sidecar failure, deduplication, or frontier exhaustion is preserved in the funnel and the notebook fails closed if it cannot establish the requested 8-32 crystallographically unique candidates. It then runs explicit MLIP relaxations, composition-scoped Pareto ranking with crowding, staged structural novelty checks, and research-only DFT input preparation for the top 1-5 candidates.
 
 ~~~text
-multiple guidance/target profiles -> authoritative MatterGen CIF candidates
--> exact-file and crystallographic deduplication -> geometry gate
--> MatterSim + CHGNet screening and relaxation -> model disagreement
--> composition-scoped Pareto ranking -> staged novelty lookup
--> top 1-5 DFT input packages
+bounded multi-round MatterGen search -> pre-expert strict duplicate rejection
+-> scaled-prototype relation retained separately
+-> geometry gate -> separate MatterSim + CHGNet screening and relaxation
+-> composition-scoped Pareto fronts + NSGA-II crowding
+-> property-space diversity branch + separate staged structural novelty lookup
+-> composition-diverse top 1-5 research-only DFT input packages
 ~~~
 
 At five intermediate boundaries the notebook also runs source-grounded validation context:
@@ -83,7 +90,11 @@ At five intermediate boundaries the notebook also runs source-grounded validatio
 
 Crossref, arXiv, and OpenAlex are bounded scholarly metadata sources. Optional MCP Streamable HTTP tools may be selected only from the stage variables above, with `MATERIAL_RAG_MCP_TOOL` as the administrator-configured generic fallback. The client verifies the selected tool through bounded `tools/list`, checks its input/output contract, and rejects unstructured evidence. A prompt or model output cannot select an endpoint or tool. Missing providers, missing credentials, empty retrieval, schema mismatch, or errors are recorded as `partial`, `skipped`, or `unknown`; they never become a candidate property score or a validator pass.
 
+RAG and MCP have distinct jobs here. RAG retrieves and closes scholarly evidence into citable records. The optional MCP route is only a configured structured evidence-provider interface; it is not permission to execute a model, database write, relaxation, or DFT job. Runtime sidecars, the strict structure matcher, external structure clients, and an explicitly configured periodic DFT backend remain the action validators.
+
 Each route persists a typed evidence handoff naming its consumer, payload schema, and still-required runtime validator. Only a source-grounded `generation_prior` handoff may guide a Fusion decision; identity, MLIP, relaxation, and DFT handoffs cannot steer generation. The evidence router never marks its listed validators as executed.
+
+The search selector's legacy branch ID `novelty` means nearest-neighbor diversity in normalized expert-property space only. It neither queries a structure database nor emits a novelty claim. Structural/database novelty is produced only by `StagedNoveltyAssessor`, with its batch, project-history, external-provider, query, matcher, timestamp, and database-version provenance.
 
 The notebook form exposes the non-secret RAG/MCP settings. OpenAlex requires its free API key when that source is used; pressing Enter skips OpenAlex while the other sources continue. OpenAlex, optional RAG-model, and optional MCP credentials appear as hidden `getpass` prompts in the Setup cell and are scanned out of the archive. Leave the paired RAG or MCP endpoint fields blank to skip that integration.
 
@@ -94,7 +105,7 @@ The legacy V11 notebook remains available for the older adaptive-loop interface.
 Linux and Colab use the POSIX launchers; PowerShell is not required:
 
 ~~~bash
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,materials]"
 ./bootstrap.sh --profile materials-open --accelerator cuda --include-weights
 ./start-sidecars.sh --component mattergen --component mattersim --component chgnet
 source .discovery/sidecars.env.sh
@@ -164,6 +175,8 @@ discovery-os fusion-search `
   --expert chgnet `
   --required-evaluator mattersim `
   --required-evaluator chgnet `
+  --max-generation-calls 24 `
+  --max-generated-candidates 32 `
   --artifacts runs/material-run-001
 ~~~
 
@@ -179,6 +192,15 @@ $env:CHGNET_API_URL = "http://127.0.0.1:8113"
 
 Prefer sourcing the environment file generated by the launcher instead of setting ports manually. Loopback HTTP requires the explicit development opt-in generated by the launcher. Production endpoints must use HTTPS and environment or secret-manager tokens.
 
+For the trusted `materials-open` profile, `--include-weights` downloads and verifies these exact public evaluator artifacts:
+
+| Evaluator | Immutable upstream revision | Bytes | SHA-256 |
+|---|---|---:|---|
+| MatterSim 5M | `40a1eb8f1189a53af310957b4f2c5dfbfe68d647` | `91,176,875` | `e3df9fa708725e3d453140646c7d1838324b347a3d1214cf1440522146f872b5` |
+| CHGNet 0.3.0 | `8d04abc467630b30cd8349c2fe12eeab10f62171` | `4,863,221` | `d14ab7c0f093efe64b60a7bcd540bca10e74fb7f46c86108a079af60524659d1` |
+
+Bootstrap rejects an unexpected size or digest and records `.artifact.json` beside the verified bytes. The launcher verifies that marker and rehashes the file before setting `MATTERSIM_CHECKPOINT_PATH` or `CHGNET_CHECKPOINT_PATH` and a `sha256:<digest>` weight revision. Do not set the old `managed-unattested:*` values for these defaults.
+
 To add live RAG to the same search, configure any optional scholarly credentials, RAG model, or MCP evidence tool and add these arguments:
 
 ~~~text
@@ -187,7 +209,7 @@ To add live RAG to the same search, configure any optional scholarly credentials
 --rag-index .discovery/evidence-index
 ~~~
 
-The evidence bundle is not converted into a material score. It allocates and adapts search branches, while MatterSim and CHGNet remain the candidate evaluators.
+The evidence bundle is not converted into a material score. Only source-closed generation-prior evidence may allocate or adapt search branches, while MatterSim and CHGNet remain proxy evaluators. This loop is adaptive screening, not active learning: no generator or expert weights are retrained.
 
 Run one stage route directly from code or automation with a strict request JSON:
 
@@ -248,17 +270,21 @@ energy_above_hull
 
 It does not invent unsupported lattice or atom-movement instructions. Explicit goal targets take priority. Invalid types, invalid space groups, unknown elements, incompatible units, and unsupported evidence are rejected or left without a numeric target.
 
-The scheduler lowers guidance alpha after sustained improvement, explores more broadly after stagnation, and reduces temperature or mutation when structural collapse rises. MatterGen v1 applies supported guidance, condition, seed, and batch controls; it does not expose temperature, mutation strength, or diversity strength, so those values remain provenance and warnings rather than being falsely reported as applied. REINVENT applies its supported sampling controls.
+For MatterGen, `alpha` maps to classifier-free guidance as `gamma = alpha * guidance_max`; the default `guidance_max=4` makes `alpha=0.5` equivalent to `gamma=2`. Sustained improvement increases guidance for condition-focused exploitation. Stagnation or structural collapse lowers guidance to broaden or stabilize sampling. Higher guidance can improve condition adherence at the cost of diversity or realism, so this direction is not interchangeable with generic temperature semantics. MatterGen v1 applies only supported checkpoint conditions, guidance, seed, and batch controls; it does not expose parent mutation, temperature, mutation strength, or diversity strength, so unsupported values remain requested-but-ignored provenance. REINVENT applies its own supported sampling controls.
+
+The released MatterGen model envelope represented by the adapter is a primitive cell of at most 20 atoms, excluding noble gases, Tc, Pm, and elements with atomic number above 84. Passing this gate is not a stability claim. Official checkpoint names have fixed condition allowlists. An unknown/custom checkpoint is unconditional unless the operator supplies `supported_condition_names`; the adapter validates only that the names are in its known condition vocabulary and records the declaration source. It does not inspect the custom training run or prove that those condition modules were trained and packaged with the weights. Treat the custom declaration as operator attestation and independently review the checkpoint inventory hash and training configuration. See the [MatterGen model card](https://github.com/microsoft/mattergen/blob/main/MODEL_CARD.md) and [Research foundations](docs/RESEARCH_FOUNDATIONS.md).
 
 ## Outputs and validation handoff
 
 Each artifact root contains candidate records, CIF/SMILES/sequence representations, original expert payloads, feature cache entries, latent states, generator provenance, scheduler history, branch pools, and the final diagnostic report.
 
-validation_handoff_candidate_refs is a bounded shortlist for a separately configured high-cost validator. It prioritizes Pareto candidates, then stability candidates, and removes exact scientific representation duplicates. It does not mean that DFT, relaxation, phonons, experiments, or synthesis have run.
+validation_handoff_candidate_refs is a bounded shortlist for a separately configured high-cost validator. It prioritizes Pareto candidates, then stability candidates, and removes exact scientific-representation duplicates. This coordinator shortlist check is not a tolerance-aware crystallographic identity decision; the MatterGen sidecar and T4 structure stages persist their separate matcher receipts. The handoff does not mean that DFT, relaxation, phonons, experiments, or synthesis have run.
 
-MatterSim and UMA expose total energy (eV) and energy_per_atom (eV/atom); the latter is comparable as an expert property axis with CHGNet. energy_per_atom is not energy_above_hull. Convex-hull stability requires reference phases, relaxation, and a dedicated validated hull connector.
+MatterSim and UMA expose total energy (eV) and `energy_per_atom` (eV/atom), but raw MLIP energy is compared only among aligned candidates with the same reduced composition. Cross-stoichiometry ordering requires reference-consistent formation energies; `energy_per_atom` is not `energy_above_hull`. Convex-hull stability requires relaxed structures, reference phases, a declared correction/mixing policy, and an executed validated hull workflow.
 
-Symmetry- and tolerance-aware crystal matching is implemented in `discovery_os.crystal_identity`. `candidate_content_hash` remains the immutable-record integrity hash; `canonical_structure_hash` and `StructureMatcher` grouping are separate scientific-identity operations.
+MatterSim-CHGNet agreement is not automatically calibrated uncertainty. `discovery_os.mlip_reliability` can consume a split-conformal artifact bound to exact weight revisions, DFT method/reference hashes, units, held-out coverage metadata, and a declared chemistry/exchangeability scope. Any mismatch is `uncalibrated_or_ood`, with no interval or coverage claim and an explicit DFT escalation.
+
+Symmetry context and deletion-safe identity are deliberately separate in `discovery_os.crystal_identity`. `candidate_content_hash` remains the immutable-record integrity hash. `canonical_structure_hash` describes the symmetry-standardized prototype context, while hard deletion uses `identity_structure_hash` from the non-symmetrized source-Niggli representation plus strict unscaled `StructureMatcher` checks and a per-atom volume guard.
 
 ## Sidecars and dependencies
 
@@ -287,6 +313,7 @@ The repository excludes local environments, caches, run artifacts, logs, credent
 - Literature RAG workflow: docs/LITERATURE_RAG.md
 - MCP evidence source for RAG: docs/MCP_RAG.md
 - Stage-specific validation evidence: docs/STAGE_VALIDATION_EVIDENCE.md
+- Research foundations and scientific claim boundaries: docs/RESEARCH_FOUNDATIONS.md
 - Codex material validation skill: .codex/skills/material-candidate-validation/SKILL.md
 - Genomic AlphaGenome evaluation branch: docs/GENOMIC_ALPHAGENOME.md
 

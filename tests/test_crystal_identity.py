@@ -63,18 +63,46 @@ def _rocksalt_structures():
     return base, reordered, translated, supercell
 
 
-def test_canonical_identity_ignores_atom_order_origin_and_supercell() -> None:
+def test_prototype_hash_and_raw_identity_hash_have_separate_scopes() -> None:
     base, reordered, translated, supercell = _rocksalt_structures()
 
-    hashes = {
-        canonical_structure_hash(item)
+    canonical = [
+        canonicalize_crystal_structure(item)
         for item in (base, reordered, translated, supercell)
-    }
+    ]
     grouped = group_crystal_structures((base, reordered, translated, supercell))
 
-    assert len(hashes) == 1
+    # The historical symmetry-standardized hash remains useful as prototype
+    # context. Hard deletion uses the separate raw-geometry identity hash.
+    assert len({item.structure_hash for item in canonical}) == 1
+    assert len({item.identity_structure_hash for item in canonical[:3]}) == 1
+    assert canonical[3].identity_structure_hash != canonical[0].identity_structure_hash
+    assert all(
+        item.identity_fingerprint["standardization"]
+        ["symmetry_refinement_used_for_identity"]
+        is False
+        for item in canonical
+    )
     assert grouped.unique_indices == (0,)
     assert grouped.groups[0].member_indices == (0, 1, 2, 3)
+
+
+def test_symmetry_refinement_cannot_create_a_hard_duplicate() -> None:
+    core = pytest.importorskip("pymatgen.core")
+    base, _reordered, _translated, _supercell = _rocksalt_structures()
+    distorted = base.copy()
+    distorted.translate_sites([1], [0.12, 0.0, 0.0], frac_coords=True)
+
+    first = canonicalize_crystal_structure(base, symprec=1.0)
+    second = canonicalize_crystal_structure(distorted, symprec=1.0)
+    grouped = group_crystal_structures(
+        (first, second),
+        canonicalization_kwargs={"symprec": 1.0},
+    )
+
+    assert first.identity_structure_hash != second.identity_structure_hash
+    assert grouped.unique_indices == (0, 1)
+    assert grouped.duplicate_count == 0
 
 
 def test_different_cif_text_for_same_structure_has_one_scientific_identity() -> None:

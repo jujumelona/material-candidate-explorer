@@ -25,6 +25,7 @@ from .fusion_search import (
     FusionSearchReport,
     FusionSearchRunner,
     PersistedFusionSearchReport,
+    SearchBudget,
     SearchControlPoint,
     SearchControlSweep,
 )
@@ -514,6 +515,20 @@ def _fusion_search(args: argparse.Namespace) -> int:
     generator = build_generator_from_environment(args.generator, required=True)
     if generator is None:
         raise SystemExit(f"generator {args.generator!r} is not configured")
+    if (args.max_generation_calls is None) != (
+        args.max_generated_candidates is None
+    ):
+        raise SystemExit(
+            "--max-generation-calls and --max-generated-candidates must be set together"
+        )
+    search_budget = (
+        SearchBudget(
+            max_generation_calls=args.max_generation_calls,
+            max_generated_candidates=args.max_generated_candidates,
+        )
+        if args.max_generation_calls is not None
+        else None
+    )
     persisted = FusionSearchRunner(
         FusionLoopRunner(runtime, generator),
         ExpertEvidenceStore(runtime.artifact_store),
@@ -534,6 +549,7 @@ def _fusion_search(args: argparse.Namespace) -> int:
         frontier_width=args.frontier_width,
         evidence_policy=evidence_policy,
         control_sweep=control_sweep,
+        search_budget=search_budget,
         ranking_limit=args.ranking_limit,
     )
     print(persisted.model_dump_json(indent=2))
@@ -705,6 +721,16 @@ def make_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="maximum number of final candidates emitted in unified ranked order",
+    )
+    fusion_search.add_argument(
+        "--max-generation-calls",
+        type=int,
+        help="global generation-call budget across all rounds, branches, and variants",
+    )
+    fusion_search.add_argument(
+        "--max-generated-candidates",
+        type=int,
+        help="global generated-candidate budget across the complete search",
     )
     fusion_search.add_argument("--cycle", type=int, default=0)
     fusion_search.add_argument("--previous-state")

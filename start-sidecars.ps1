@@ -160,7 +160,7 @@ if ($Backend -eq "wsl") {
         }
     }
     foreach ($pathName in @("CHEMPROP_CHECKPOINT_PATH", "REINVENT_MODEL_FILE", "MATTERGEN_CHECKPOINT_PATH",
-            "UNIMOL_CHECKPOINT_PATH", "UNIMOL_DICTIONARY_PATH", "MATTERSIM_CHECKPOINT_PATH",
+            "UNIMOL_CHECKPOINT_PATH", "UNIMOL_DICTIONARY_PATH", "MATTERSIM_CHECKPOINT_PATH", "CHGNET_CHECKPOINT_PATH",
             "SCGPT_CHECKPOINT_DIR", "QHNET_CHECKPOINT_PATH", "QHNET_CONFIG_PATH", "BOLTZ_CACHE")) {
         if (-not [string]::IsNullOrWhiteSpace((Get-Item "Env:$pathName" -ErrorAction SilentlyContinue).Value)) {
             $bridgeEntries += "$pathName/p"
@@ -356,6 +356,63 @@ function Get-WeightBinding {
         $runtime["SIDECAR_WEIGHT_ATTESTATION"] = "huggingface:$($item.repository)@$($item.revision)"
         return [PSCustomObject]@{ revision = [string]$item.revision; env_name = $envName; runtime = $runtime }
     }
+    if ($item.kind -eq "https") {
+        $downloadUri = [System.Uri]([string]$item.download_url)
+        $filename = [System.IO.Path]::GetFileName($downloadUri.AbsolutePath)
+        if ($filename -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,254}[A-Za-z0-9])?$') {
+            throw "HTTPS weight for '$($Entry.component_id)' has an unsafe filename."
+        }
+        $artifactRoot = [System.IO.Path]::GetFullPath(
+            (Join-Path $Root "models\$($Entry.component_id)\$($item.weight_id)\$($item.revision)")
+        )
+        $artifact = [System.IO.Path]::GetFullPath((Join-Path $artifactRoot $filename))
+        if (-not (Test-PathBelow $artifactRoot $Root) -or -not (Test-PathBelow $artifact $artifactRoot)) {
+            throw "HTTPS weight artifact escapes InstallRoot."
+        }
+        $markerPath = Join-Path $artifactRoot ".artifact.json"
+        if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+            throw "Verified artifact marker is missing: $markerPath"
+        }
+        try { $marker = Get-Content -Raw -Encoding UTF8 -LiteralPath $markerPath | ConvertFrom-Json }
+        catch { throw "Artifact marker is unreadable: $markerPath" }
+        if (
+            $marker.schema_version -ne "1.0" -or
+            $marker.download_url -ne $item.download_url -or
+            $marker.revision -ne $item.revision -or
+            $marker.filename -ne $filename -or
+            $marker.sha256 -ne $item.sha256 -or
+            [long]$marker.size_bytes -ne [long]$item.expected_size_bytes
+        ) {
+            throw "Artifact marker does not match the integration manifest for '$($Entry.component_id)'."
+        }
+        $attested = Get-FileAttestation $artifact "" $filename
+        $expectedRevision = "sha256:$($item.sha256)"
+        if (
+            $attested.revision -ne $expectedRevision -or
+            (Get-Item -LiteralPath $artifact).Length -ne [long]$item.expected_size_bytes
+        ) {
+            throw "Verified HTTPS weight bytes changed for '$($Entry.component_id)'."
+        }
+        if (
+            -not [string]::IsNullOrWhiteSpace($declared) -and
+            -not $declared.Equals($expectedRevision, [System.StringComparison]::OrdinalIgnoreCase)
+        ) {
+            throw "$envName conflicts with the manifest-pinned HTTPS weight."
+        }
+        $checkpointName = if ($Entry.component_id -eq "mattersim") {
+            "MATTERSIM_CHECKPOINT_PATH"
+        } elseif ($Entry.component_id -eq "chgnet") {
+            "CHGNET_CHECKPOINT_PATH"
+        } else {
+            $null
+        }
+        if ($null -eq $checkpointName) {
+            throw "HTTPS weight binding is not implemented for '$($Entry.component_id)'."
+        }
+        $runtime[$checkpointName] = $attested.path
+        $runtime["SIDECAR_WEIGHT_ATTESTATION"] = $expectedRevision
+        return [PSCustomObject]@{ revision = $expectedRevision; env_name = $envName; runtime = $runtime }
+    }
     if ($item.kind -eq "manual") {
         if ($Entry.component_id -eq "qhnet-source") {
             $checkpointRaw = Get-EnvironmentValue "QHNET_CHECKPOINT_PATH"
@@ -410,11 +467,18 @@ function Get-WeightBinding {
         return [PSCustomObject]@{ revision = $attested.revision; env_name = $envName; runtime = $runtime }
     }
     if ($item.kind -eq "managed") {
-        if ($Entry.component_id -eq "mattersim") {
-            $localPath = Get-EnvironmentValue "MATTERSIM_CHECKPOINT_PATH"
+        $managedPathName = if ($Entry.component_id -eq "mattersim") {
+            "MATTERSIM_CHECKPOINT_PATH"
+        } elseif ($Entry.component_id -eq "chgnet") {
+            "CHGNET_CHECKPOINT_PATH"
+        } else {
+            $null
+        }
+        if ($null -ne $managedPathName) {
+            $localPath = Get-EnvironmentValue $managedPathName
             if (-not [string]::IsNullOrWhiteSpace($localPath)) {
-                $attested = Get-FileAttestation $localPath $declared "MATTERSIM_CHECKPOINT_PATH"
-                $runtime["MATTERSIM_CHECKPOINT_PATH"] = $attested.path
+                $attested = Get-FileAttestation $localPath $declared $managedPathName
+                $runtime[$managedPathName] = $attested.path
                 $runtime["SIDECAR_WEIGHT_ATTESTATION"] = $attested.revision
                 return [PSCustomObject]@{ revision = $attested.revision; env_name = $envName; runtime = $runtime }
             }

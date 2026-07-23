@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from discovery_os.sidecars import experts as expert_module
 from discovery_os.configured_experts import build_expert_registry_from_environment
 from discovery_os.fusion_schemas import ExpertFeatureRequest, ScientificModality
 from discovery_os.hashing import candidate_content_hash
@@ -20,7 +21,7 @@ from discovery_os.schemas import (
     PropertyObjective,
     RepresentationKind,
 )
-from discovery_os.sidecars.errors import CandidateConversionError
+from discovery_os.sidecars.errors import CandidateConversionError, ModelExecutionError
 from discovery_os.sidecars.experts import (
     CHGNetExpert,
     ChempropExpert,
@@ -265,6 +266,70 @@ def test_direct_adapters_reject_requests_outside_their_declared_routes(
             )
         )
     assert not rnafm.loaded
+
+
+def test_chgnet_exact_checkpoint_uses_from_file_with_declared_version(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint = tmp_path / "chgnet.pth.tar"
+    checkpoint.write_bytes(b"exact-reviewed-chgnet-checkpoint")
+    calls: list[tuple[str, str]] = []
+
+    class FakeModel:
+        def to(self, device: str):
+            calls.append(("to", device))
+            return self
+
+    class FakeCHGNet:
+        @classmethod
+        def from_file(cls, path: str, *, version: str):
+            calls.append((path, version))
+            return FakeModel()
+
+        @classmethod
+        def load(cls, **_kwargs):
+            raise AssertionError("the upstream packaged default must not be selected")
+
+    monkeypatch.setattr(
+        expert_module,
+        "require_module",
+        lambda *_args, **_kwargs: SimpleNamespace(CHGNet=FakeCHGNet),
+    )
+    adapter = CHGNetExpert(
+        model_name="0.3.0",
+        checkpoint_path=str(checkpoint),
+        device="cpu",
+    )
+
+    adapter._ensure_loaded()
+
+    assert calls == [(str(checkpoint.resolve()), "0.3.0"), ("to", "cpu")]
+    assert adapter.provenance_parameters()["checkpoint_sha256"] == (
+        "8c25c145a196d2bc450657f1c54a8da2fff9d8b97c383ec79135f1926f4c97b1"
+    )
+
+
+def test_chgnet_rejects_checkpoint_tampering_after_construction(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint = tmp_path / "chgnet.pth.tar"
+    checkpoint.write_bytes(b"reviewed")
+    adapter = CHGNetExpert(
+        model_name="0.3.0",
+        checkpoint_path=str(checkpoint),
+        device="cpu",
+    )
+    checkpoint.write_bytes(b"tampered")
+    monkeypatch.setattr(
+        expert_module,
+        "require_module",
+        lambda *_args, **_kwargs: pytest.fail("tampered bytes must fail before import"),
+    )
+
+    with pytest.raises(ModelExecutionError, match="bytes changed"):
+        adapter._ensure_loaded()
 
 
 def test_chemprop_requires_named_unit_bearing_task_outputs(tmp_path: Path) -> None:

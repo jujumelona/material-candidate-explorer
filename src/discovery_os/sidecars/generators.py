@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import random
 import shutil
@@ -12,13 +13,15 @@ import tempfile
 import threading
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Iterable, Literal, Mapping
 
 from discovery_os.crystal_identity import (
+    CRYSTAL_IDENTITY_CANONICALIZATION,
     CrystalIdentityError,
     InvalidCrystalGeometryError,
     PymatgenRequiredError,
     canonicalize_crystal_structure,
+    classify_crystal_structure_relation,
     exact_file_hash,
     group_crystal_structures,
 )
@@ -32,9 +35,141 @@ from .conversions import (
     candidate_to_ase,
     pymatgen_to_cif,
 )
-from .errors import ModelExecutionError, ModelOutputError, ModelTimeoutError, OptionalDependencyError
+from .errors import (
+    ModelExecutionError,
+    ModelOutputError,
+    ModelTimeoutError,
+    OptionalDependencyError,
+)
 from .types import GeneratedBatch, GeneratedCandidateData
 from .weight_binding import directory_inventory_sha256, sha256_file
+
+_PERIODIC_TABLE_SYMBOLS = (
+    "H",
+    "He",
+    "Li",
+    "Be",
+    "B",
+    "C",
+    "N",
+    "O",
+    "F",
+    "Ne",
+    "Na",
+    "Mg",
+    "Al",
+    "Si",
+    "P",
+    "S",
+    "Cl",
+    "Ar",
+    "K",
+    "Ca",
+    "Sc",
+    "Ti",
+    "V",
+    "Cr",
+    "Mn",
+    "Fe",
+    "Co",
+    "Ni",
+    "Cu",
+    "Zn",
+    "Ga",
+    "Ge",
+    "As",
+    "Se",
+    "Br",
+    "Kr",
+    "Rb",
+    "Sr",
+    "Y",
+    "Zr",
+    "Nb",
+    "Mo",
+    "Tc",
+    "Ru",
+    "Rh",
+    "Pd",
+    "Ag",
+    "Cd",
+    "In",
+    "Sn",
+    "Sb",
+    "Te",
+    "I",
+    "Xe",
+    "Cs",
+    "Ba",
+    "La",
+    "Ce",
+    "Pr",
+    "Nd",
+    "Pm",
+    "Sm",
+    "Eu",
+    "Gd",
+    "Tb",
+    "Dy",
+    "Ho",
+    "Er",
+    "Tm",
+    "Yb",
+    "Lu",
+    "Hf",
+    "Ta",
+    "W",
+    "Re",
+    "Os",
+    "Ir",
+    "Pt",
+    "Au",
+    "Hg",
+    "Tl",
+    "Pb",
+    "Bi",
+    "Po",
+    "At",
+    "Rn",
+    "Fr",
+    "Ra",
+    "Ac",
+    "Th",
+    "Pa",
+    "U",
+    "Np",
+    "Pu",
+    "Am",
+    "Cm",
+    "Bk",
+    "Cf",
+    "Es",
+    "Fm",
+    "Md",
+    "No",
+    "Lr",
+    "Rf",
+    "Db",
+    "Sg",
+    "Bh",
+    "Hs",
+    "Mt",
+    "Ds",
+    "Rg",
+    "Cn",
+    "Nh",
+    "Fl",
+    "Mc",
+    "Lv",
+    "Ts",
+    "Og",
+)
+_ATOMIC_NUMBER_BY_SYMBOL = {
+    symbol: atomic_number
+    for atomic_number, symbol in enumerate(_PERIODIC_TABLE_SYMBOLS, start=1)
+}
+_NOBLE_GASES = frozenset({"He", "Ne", "Ar", "Kr", "Xe", "Rn", "Og"})
+_EXPLICIT_MODEL_CARD_EXCLUSIONS = frozenset({"Tc", "Pm"})
 
 
 class MatterGenGenerator(LazyModelAdapter[Any]):
@@ -56,6 +191,22 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
             "energy_above_hull",
         }
     )
+    # Public MatterGen 1.0 checkpoint contract.  These names and condition
+    # modules come from the released checkpoint inventory; do not infer a
+    # condition from a similarly named local directory.
+    _KNOWN_CHECKPOINT_CONDITIONS: Mapping[str, frozenset[str]] = {
+        "mattergen_base": frozenset(),
+        "mp_20_base": frozenset(),
+        "chemical_system": frozenset({"chemical_system"}),
+        "space_group": frozenset({"space_group"}),
+        "dft_mag_density": frozenset({"dft_mag_density"}),
+        "dft_band_gap": frozenset({"dft_band_gap"}),
+        "ml_bulk_modulus": frozenset({"ml_bulk_modulus"}),
+        "dft_mag_density_hhi_score": frozenset({"dft_mag_density", "hhi_score"}),
+        "chemical_system_energy_above_hull": frozenset(
+            {"chemical_system", "energy_above_hull"}
+        ),
+    }
 
     def __init__(
         self,
@@ -63,13 +214,14 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
         pretrained_name: str = "mattergen_base",
         checkpoint_path: str | None = None,
         objective_map: dict[str, str] | None = None,
+        supported_condition_names: Iterable[str] | None = None,
         guidance_max: float = 4.0,
         max_cif_bytes: int = 20_000,
         deduplication_max_generation_rounds: int = 4,
         minimum_distance_angstrom: float = 0.5,
-        matcher_ltol: float = 0.2,
-        matcher_stol: float = 0.3,
-        matcher_angle_tol: float = 5.0,
+        matcher_ltol: float = 0.02,
+        matcher_stol: float = 0.05,
+        matcher_angle_tol: float = 1.0,
         device: str = "auto",
     ) -> None:
         super().__init__(device=device)
@@ -78,16 +230,59 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
         if not 0.0 <= guidance_max <= 100.0:
             raise ValueError("guidance_max must be between 0 and 100")
         if not 1 <= deduplication_max_generation_rounds <= 16:
-            raise ValueError("deduplication_max_generation_rounds must be between 1 and 16")
+            raise ValueError(
+                "deduplication_max_generation_rounds must be between 1 and 16"
+            )
         if not 0.0 < minimum_distance_angstrom <= 10.0:
             raise ValueError("minimum_distance_angstrom must be between 0 and 10")
         if not 0.0 < matcher_ltol <= 1.0 or not 0.0 < matcher_stol <= 1.0:
-            raise ValueError("StructureMatcher length/site tolerances must be between 0 and 1")
+            raise ValueError(
+                "StructureMatcher length/site tolerances must be between 0 and 1"
+            )
         if not 0.0 < matcher_angle_tol <= 180.0:
             raise ValueError("matcher_angle_tol must be between 0 and 180")
-        self.pretrained_name = pretrained_name
+        self.pretrained_name = pretrained_name.strip()
         self.checkpoint_path = checkpoint_path
         self.objective_map = dict(objective_map or {})
+        explicit_conditions = (
+            None
+            if supported_condition_names is None
+            else frozenset(item.strip() for item in supported_condition_names)
+        )
+        if explicit_conditions is not None:
+            if "" in explicit_conditions:
+                raise ValueError(
+                    "supported_condition_names cannot contain a blank name"
+                )
+            unknown_conditions = explicit_conditions - self._CONDITION_NAMES
+            if unknown_conditions:
+                raise ValueError(
+                    "unsupported MatterGen condition declaration(s): "
+                    + ", ".join(sorted(unknown_conditions))
+                )
+        known_conditions = self._KNOWN_CHECKPOINT_CONDITIONS.get(self.pretrained_name)
+        if known_conditions is not None:
+            if (
+                explicit_conditions is not None
+                and explicit_conditions != known_conditions
+            ):
+                raise ValueError(
+                    f"official MatterGen checkpoint {self.pretrained_name!r} has the exact "
+                    "condition allowlist "
+                    f"{sorted(known_conditions)!r}; it cannot be widened or changed"
+                )
+            self.supported_condition_names = known_conditions
+            self.condition_contract_source = "official-checkpoint-allowlist"
+        else:
+            # Unknown/custom checkpoints are unconditional unless their adapter
+            # configuration explicitly declares the condition modules that were
+            # trained and packaged with those exact weights.
+            self.supported_condition_names = explicit_conditions or frozenset()
+            self.condition_contract_source = (
+                "explicit-custom-checkpoint-declaration"
+                if explicit_conditions is not None
+                else "undeclared-custom-checkpoint-unconditional-only"
+            )
         self.guidance_max = guidance_max
         self.max_cif_bytes = max_cif_bytes
         self.deduplication_max_generation_rounds = deduplication_max_generation_rounds
@@ -96,6 +291,7 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
         self.matcher_stol = matcher_stol
         self.matcher_angle_tol = matcher_angle_tol
         self._inference_lock = threading.Lock()
+        self._session_identity_structures: dict[str, list[Any]] = {}
         self.checkpoint_inventory_sha256 = (
             directory_inventory_sha256(checkpoint_path) if checkpoint_path else None
         )
@@ -112,7 +308,9 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
         if self.checkpoint_path is not None:
             path = Path(self.checkpoint_path).expanduser().resolve(strict=True)
             if not path.exists():
-                raise ModelExecutionError("configured MatterGen checkpoint path does not exist")
+                raise ModelExecutionError(
+                    "configured MatterGen checkpoint path does not exist"
+                )
             if (
                 self.checkpoint_inventory_sha256 is None
                 or directory_inventory_sha256(path) != self.checkpoint_inventory_sha256
@@ -151,15 +349,33 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
             ) from exc
 
     def generate(self, request: FusionGenerationRequest) -> GeneratedBatch:
-        generator = self._ensure_loaded()
         count = request.run_config.candidate_count
         controls = request.run_config.generation_controls
         conditions, condition_warnings = self._conditions(request)
+        # Reject an unsupported condition contract before loading a large
+        # checkpoint or allocating model memory.
+        generator = self._ensure_loaded()
+        requested_controls = controls.model_dump(mode="json")
+        diffusion_guidance_factor = (
+            round(controls.alpha * self.guidance_max, 8) if conditions else 0.0
+        )
+        ignored_controls = ["temperature", "mutation_strength", "diversity_strength"]
+        if not conditions:
+            ignored_controls.append("alpha")
+        applied_controls = {
+            "conditions": dict(conditions),
+            "diffusion_guidance_factor": diffusion_guidance_factor,
+            "alpha_to_gamma_scale": self.guidance_max,
+            "mapping": "gamma=alpha*alpha_to_gamma_scale when conditioned; otherwise gamma=0",
+        }
         warnings = [
             "MatterGen v1 has no parent-structure mutation operator; the parent is lineage "
             "and may only contribute an explicit chemical-system condition.",
             "MatterGen v1 does not expose temperature, mutation_strength, or "
             "diversity_strength; those controls were preserved in provenance but not applied.",
+            "MatterGen applied "
+            f"diffusion_guidance_factor={diffusion_guidance_factor:g}; requested and applied "
+            "controls are recorded separately.",
             *condition_warnings,
         ]
         raw_records: list[dict[str, Any]] = []
@@ -168,16 +384,45 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
         parsed_structure_count = 0
         geometry_rejected_count = 0
         canonicalization_rejected_count = 0
+        canonicalized_structure_count = 0
+        applicability_rejected_count = 0
+        condition_rejected_count = 0
+        source_atom_count_rejected_count = 0
+        primitive_atom_count_rejected_count = 0
+        model_card_element_rejected_count = 0
+        chemical_system_rejected_count = 0
+        space_group_rejected_count = 0
+        cross_call_duplicate_rejected_count = 0
+        cross_call_ambiguous_comparison_count = 0
         exact_file_hashes: set[str] = set()
         generation_rounds = 0
         grouping = group_crystal_structures(())
         with tempfile.TemporaryDirectory(prefix="discovery-mattergen-") as temporary:
             root = Path(temporary)
             with self._inference_lock:
-                generator.properties_to_condition_on = conditions
-                generator.diffusion_guidance_factor = (
-                    round(controls.alpha * self.guidance_max, 8) if conditions else 0.0
+                search_session_id = getattr(
+                    request.run_config,
+                    "search_session_id",
+                    None,
                 )
+                if (
+                    search_session_id is not None
+                    and search_session_id not in self._session_identity_structures
+                    and len(self._session_identity_structures) >= 64
+                ):
+                    self._session_identity_structures.pop(
+                        next(iter(self._session_identity_structures))
+                    )
+                prior_session_structures = list(
+                    self._session_identity_structures.get(
+                        search_session_id,
+                        [],
+                    )
+                    if search_session_id is not None
+                    else []
+                )
+                generator.properties_to_condition_on = conditions
+                generator.diffusion_guidance_factor = diffusion_guidance_factor
                 while (
                     len(grouping.groups) < count
                     and generation_rounds < self.deduplication_max_generation_rounds
@@ -240,6 +485,58 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
                                 f"raw structure {raw_index} rejected: {type(exc).__name__}: {exc}"
                             )
                             continue
+                        canonicalized_structure_count += 1
+                        rejection = _mattergen_output_contract_rejection(
+                            canonical,
+                            conditions=conditions,
+                        )
+                        if rejection is not None:
+                            category, reason, detail = rejection
+                            if category == "applicability":
+                                applicability_rejected_count += 1
+                                if reason == "source_atom_count":
+                                    source_atom_count_rejected_count += 1
+                                elif reason == "primitive_atom_count":
+                                    primitive_atom_count_rejected_count += 1
+                                elif reason == "model_card_element_domain":
+                                    model_card_element_rejected_count += 1
+                            else:
+                                condition_rejected_count += 1
+                                if reason == "chemical_system":
+                                    chemical_system_rejected_count += 1
+                                elif reason == "space_group":
+                                    space_group_rejected_count += 1
+                            rejected_details.append(
+                                f"raw structure {raw_index} rejected by MatterGen {category} "
+                                f"contract ({reason}): {detail}"
+                            )
+                            continue
+                        cross_call_duplicate = False
+                        for previous in prior_session_structures:
+                            assessment = classify_crystal_structure_relation(
+                                previous,
+                                canonical,
+                                strict_ltol=self.matcher_ltol,
+                                strict_stol=self.matcher_stol,
+                                strict_angle_tol=self.matcher_angle_tol,
+                            )
+                            if assessment.hard_deduplication_allowed:
+                                cross_call_duplicate = True
+                                break
+                            if assessment.relation.value == "ambiguous":
+                                cross_call_ambiguous_comparison_count += 1
+                                rejected_details.append(
+                                    "cross-call identity comparison was ambiguous and both "
+                                    "structures were preserved: "
+                                    + (assessment.reason or "unspecified matcher failure")
+                                )
+                        if cross_call_duplicate:
+                            cross_call_duplicate_rejected_count += 1
+                            rejected_details.append(
+                                f"raw structure {raw_index} duplicates a previously accepted "
+                                f"candidate in search session {search_session_id!r}; replacement requested"
+                            )
+                            continue
                         raw_records.append(
                             {
                                 "raw_index": raw_index,
@@ -248,6 +545,9 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
                                 "raw_cif": raw_cif,
                                 "source_exact_sha256": source_exact_sha256,
                                 "canonical": canonical,
+                                "composition_key": _canonical_composition_key(
+                                    canonical
+                                ),
                             }
                         )
                     try:
@@ -263,13 +563,22 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
                         raise ModelOutputError(
                             f"MatterGen crystal deduplication failed: {exc}"
                         ) from exc
+                if search_session_id is not None and len(grouping.groups) == count:
+                    accepted = [
+                        raw_records[item.representative_index]["canonical"]
+                        for item in grouping.groups
+                    ]
+                    self._session_identity_structures.setdefault(
+                        search_session_id,
+                        [],
+                    ).extend(accepted)
         unique_count = len(grouping.groups)
-        raw_geometry_valid_count = len(raw_records)
+        raw_geometry_valid_count = canonicalized_structure_count
         # The public funnel reports geometry-valid candidates after the
         # crystallographic grouping stage.  The pre-dedup count is retained
         # separately for auditability.
         geometry_valid_count = unique_count
-        duplicate_count = raw_geometry_valid_count - unique_count
+        duplicate_count = len(raw_records) - unique_count
         if unique_count != count:
             raise ModelOutputError(
                 "MatterGen could not satisfy the requested crystallographically unique "
@@ -278,6 +587,8 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
                 f"parsed_structures={parsed_structure_count}, "
                 f"exact_file_unique={len(exact_file_hashes)}, "
                 f"raw_geometry_valid={raw_geometry_valid_count}, "
+                f"applicability_rejected={applicability_rejected_count}, "
+                f"condition_rejected={condition_rejected_count}, "
                 f"geometry_valid={geometry_valid_count}, "
                 f"crystallographically_unique={unique_count}, duplicates_removed="
                 f"{duplicate_count}"
@@ -294,6 +605,17 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
             "parse_rejected": raw_structure_count - parsed_structure_count,
             "geometry_rejected": geometry_rejected_count,
             "canonicalization_rejected": canonicalization_rejected_count,
+            "applicability_rejected": applicability_rejected_count,
+            "condition_rejected": condition_rejected_count,
+            "source_atom_count_rejected": source_atom_count_rejected_count,
+            "primitive_atom_count_rejected": primitive_atom_count_rejected_count,
+            "model_card_element_rejected": model_card_element_rejected_count,
+            "chemical_system_rejected": chemical_system_rejected_count,
+            "space_group_rejected": space_group_rejected_count,
+            "cross_call_duplicate_rejected": cross_call_duplicate_rejected_count,
+            "cross_call_ambiguous_comparisons": (
+                cross_call_ambiguous_comparison_count
+            ),
             "duplicates_removed": duplicate_count,
             "generation_rounds": generation_rounds,
         }
@@ -313,7 +635,9 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
                 f"StructureMatcher removed {duplicate_count} crystallographic duplicate(s); "
                 "deterministic replacement generation retained the requested unique count."
             )
-        representatives = [raw_records[item.representative_index] for item in grouping.groups]
+        representatives = [
+            raw_records[item.representative_index] for item in grouping.groups
+        ]
         candidates = tuple(
             GeneratedCandidateData(
                 name=f"MatterGen candidate {index + 1}",
@@ -331,19 +655,36 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
                         metadata={
                             "source_entry": f"generated-{record['raw_index']}.cif",
                             "source_exact_sha256": record["source_exact_sha256"],
-                            "canonical_structure_sha256": record["canonical"].structure_hash,
-                            "identity_canonicalization": "primitive-niggli-v1",
+                            "identity_structure_sha256": record[
+                                "canonical"
+                            ].identity_structure_hash,
+                            "identity_canonicalization": (
+                                CRYSTAL_IDENTITY_CANONICALIZATION
+                            ),
                         },
                     ),
                 ),
                 attributes={
                     "mattergen_pretrained_name": self.pretrained_name,
                     "conditions": conditions,
-                    "generation_controls": controls.model_dump(mode="json"),
+                    # ``generation_controls`` remains as a compatibility alias
+                    # for consumers written before the requested/applied split.
+                    "generation_controls": requested_controls,
+                    "requested_generation_controls": requested_controls,
+                    "applied_generation_controls": applied_controls,
+                    "ignored_generation_controls": ignored_controls,
+                    "composition_key": record["composition_key"],
                     "crystal_identity": {
-                        "canonical_structure_sha256": record["canonical"].structure_hash,
+                        "identity_structure_sha256": record[
+                            "canonical"
+                        ].identity_structure_hash,
+                        "identity_canonicalization": (
+                            CRYSTAL_IDENTITY_CANONICALIZATION
+                        ),
                         "source_atom_count": record["canonical"].source_atom_count,
-                        "primitive_atom_count": record["canonical"].primitive_atom_count,
+                        "primitive_atom_count": record[
+                            "canonical"
+                        ].primitive_atom_count,
                         "conventional_atom_count": record[
                             "canonical"
                         ].conventional_atom_count,
@@ -364,8 +705,14 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
                     "raw_generation_round": record["generation_round"],
                     "raw_generation_seed": record["generation_seed"],
                     "source_exact_sha256": record["source_exact_sha256"],
-                    "canonical_structure_sha256": record["canonical"].structure_hash,
+                    "identity_structure_sha256": record[
+                        "canonical"
+                    ].identity_structure_hash,
+                    "identity_canonicalization": CRYSTAL_IDENTITY_CANONICALIZATION,
                     "deduplication": funnel,
+                    "requested_generation_controls": requested_controls,
+                    "applied_generation_controls": applied_controls,
+                    "ignored_generation_controls": ignored_controls,
                 },
             )
             for index, record in enumerate(representatives)
@@ -378,7 +725,10 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
             "pretrained_name": self.pretrained_name,
             "checkpoint_inventory_sha256": self.checkpoint_inventory_sha256,
             "objective_map": dict(sorted(self.objective_map.items())),
+            "supported_condition_names": sorted(self.supported_condition_names),
+            "condition_contract_source": self.condition_contract_source,
             "guidance_max": self.guidance_max,
+            "guidance_mapping": "gamma=alpha*guidance_max when conditioned; otherwise gamma=0",
             "max_cif_bytes": self.max_cif_bytes,
             "deduplication_max_generation_rounds": self.deduplication_max_generation_rounds,
             "minimum_distance_angstrom": self.minimum_distance_angstrom,
@@ -393,11 +743,18 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
     ) -> tuple[dict[str, str | float | int], list[str]]:
         conditions: dict[str, str | float | int] = {}
         warnings: list[str] = []
-        for objective in request.goal.objectives:
-            mapped = self.objective_map.get(objective.property_name, objective.property_name)
+        objectives = list(request.goal.objectives)
+        for objective in objectives:
+            mapped = self.objective_map.get(
+                objective.property_name, objective.property_name
+            )
             if mapped not in self._CONDITION_NAMES or objective.target_value is None:
                 continue
-            conditions[mapped] = _condition_value(mapped, objective.target_value)
+            conditions[mapped] = _condition_value(
+                mapped,
+                objective.target_value,
+                unit=getattr(objective, "unit", None),
+            )
         proposal = request.revision_proposal
         if proposal is not None:
             warnings.append(
@@ -407,7 +764,9 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
             for change in proposal.desired_changes:
                 if change.property_name is None:
                     continue
-                mapped = self.objective_map.get(change.property_name, change.property_name)
+                mapped = self.objective_map.get(
+                    change.property_name, change.property_name
+                )
                 if change.target_value is None:
                     if mapped in self._CONDITION_NAMES:
                         warnings.append(
@@ -421,17 +780,67 @@ class MatterGenGenerator(LazyModelAdapter[Any]):
                         "condition and was not applied"
                     )
                     continue
-                value = _condition_value(mapped, change.target_value)
+                matching_objective = next(
+                    (
+                        objective
+                        for objective in objectives
+                        if self.objective_map.get(
+                            objective.property_name, objective.property_name
+                        )
+                        == mapped
+                    ),
+                    None,
+                )
+                value = _condition_value(
+                    mapped,
+                    change.target_value,
+                    unit=(
+                        change.unit
+                        if getattr(change, "unit", None) is not None
+                        else getattr(matching_objective, "unit", None)
+                        if matching_objective is not None
+                        else None
+                    ),
+                )
                 if mapped in conditions and conditions[mapped] != value:
                     warnings.append(
                         f"revision target for {mapped!r} overrides the original goal target "
                         "for this iteration"
                     )
                 conditions[mapped] = value
-        if self.pretrained_name in {"chemical_system", "chemical_system_energy_above_hull"}:
+        if "chemical_system" in self.supported_condition_names:
             if "chemical_system" not in conditions:
                 parent_atoms = candidate_to_ase(request.parent_candidate)
                 conditions["chemical_system"] = ase_chemical_system(parent_atoms)
+        unsupported = frozenset(conditions) - self.supported_condition_names
+        if unsupported:
+            if self.pretrained_name in self._KNOWN_CHECKPOINT_CONDITIONS:
+                contract = f"official checkpoint allowlist={sorted(self.supported_condition_names)!r}"
+            else:
+                contract = (
+                    "custom checkpoint requires explicit supported_condition_names; "
+                    f"declared={sorted(self.supported_condition_names)!r}"
+                )
+            raise ModelExecutionError(
+                f"MatterGen checkpoint {self.pretrained_name!r} cannot apply requested "
+                f"condition(s) {sorted(unsupported)!r}; {contract}"
+            )
+        if "chemical_system" in conditions:
+            # Parse before inference so requests outside the released model-card
+            # domain never consume GPU time or masquerade as supported output.
+            requested_system = _validated_chemical_system(
+                conditions["chemical_system"]
+            )
+            allowed_system = _declared_goal_chemical_system(request.goal)
+            if allowed_system is not None and requested_system != allowed_system:
+                raise ModelExecutionError(
+                    "MatterGen chemical_system differs from the immutable hard goal "
+                    "constraint; expanded-system/dopant branches require explicit user opt-in"
+                )
+        if "space_group" in conditions:
+            conditions["space_group"] = _validated_space_group(
+                conditions["space_group"]
+            )
         return conditions, warnings
 
 
@@ -543,7 +952,9 @@ class ReinventGenerator(LazyModelAdapter[str]):
             }
             if self.mode == "mol2mol":
                 seed_file = root / "parent.smi"
-                seed_file.write_text(candidate_smiles(request.parent_candidate) + "\n", encoding="utf-8")
+                seed_file.write_text(
+                    candidate_smiles(request.parent_candidate) + "\n", encoding="utf-8"
+                )
                 parameters["smiles_file"] = str(seed_file)
             else:
                 warnings.append(
@@ -558,7 +969,9 @@ class ReinventGenerator(LazyModelAdapter[str]):
             }
             config_path = root / "sampling.json"
             config_path.write_text(
-                json.dumps(config, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
+                json.dumps(
+                    config, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+                ),
                 encoding="utf-8",
             )
             result = _run_bounded_process(
@@ -619,7 +1032,9 @@ class ReinventGenerator(LazyModelAdapter[str]):
 
 
 class _ProcessResult:
-    def __init__(self, returncode: int, stdout: bytes, stderr: bytes, *, truncated: bool) -> None:
+    def __init__(
+        self, returncode: int, stdout: bytes, stderr: bytes, *, truncated: bool
+    ) -> None:
         self.returncode = returncode
         suffix = " [log truncated]" if truncated else ""
         self.stdout_text = stdout.decode("utf-8", errors="replace").strip() + suffix
@@ -629,8 +1044,12 @@ class _ProcessResult:
 def _seed_mattergen(seed: int) -> None:
     """Apply the request's generator seed to every RNG MatterGen uses."""
 
-    numpy = require_module("numpy", install_hint="install MatterGen's pinned NumPy build")
-    torch = require_module("torch", install_hint="install MatterGen's pinned PyTorch build")
+    numpy = require_module(
+        "numpy", install_hint="install MatterGen's pinned NumPy build"
+    )
+    torch = require_module(
+        "torch", install_hint="install MatterGen's pinned PyTorch build"
+    )
     random.seed(seed)
     numpy.random.seed(seed % (2**32))
     torch.manual_seed(seed)
@@ -662,7 +1081,9 @@ def _run_bounded_process(
             creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
         )
     except OSError as exc:
-        raise ModelExecutionError(f"could not start model CLI: {type(exc).__name__}: {exc}") from exc
+        raise ModelExecutionError(
+            f"could not start model CLI: {type(exc).__name__}: {exc}"
+        ) from exc
     buffers = [bytearray(), bytearray()]
     truncated = [False, False]
 
@@ -694,7 +1115,9 @@ def _run_bounded_process(
         process.wait()
         for thread in threads:
             thread.join(timeout=5)
-        raise ModelTimeoutError(f"model CLI exceeded its {timeout:g} second process timeout") from exc
+        raise ModelTimeoutError(
+            f"model CLI exceeded its {timeout:g} second process timeout"
+        ) from exc
     for thread in threads:
         thread.join(timeout=5)
     return _ProcessResult(
@@ -731,9 +1154,13 @@ def _read_cif_archive(
     try:
         size = path.stat().st_size
     except OSError as exc:
-        raise ModelOutputError("MatterGen did not produce generated_crystals_cif.zip") from exc
+        raise ModelOutputError(
+            "MatterGen did not produce generated_crystals_cif.zip"
+        ) from exc
     if size <= 0 or size > max_archive_bytes:
-        raise ModelOutputError("MatterGen CIF archive is empty or exceeds the configured size limit")
+        raise ModelOutputError(
+            "MatterGen CIF archive is empty or exceeds the configured size limit"
+        )
     try:
         with zipfile.ZipFile(path) as archive:
             entries = [item for item in archive.infolist() if not item.is_dir()]
@@ -745,40 +1172,69 @@ def _read_cif_archive(
             total = 0
             for entry in sorted(entries, key=lambda item: item.filename):
                 pure = PurePosixPath(entry.filename)
-                if pure.is_absolute() or ".." in pure.parts or pure.suffix.lower() != ".cif":
-                    raise ModelOutputError("MatterGen archive contains an unsafe or non-CIF entry")
+                if (
+                    pure.is_absolute()
+                    or ".." in pure.parts
+                    or pure.suffix.lower() != ".cif"
+                ):
+                    raise ModelOutputError(
+                        "MatterGen archive contains an unsafe or non-CIF entry"
+                    )
                 if entry.file_size <= 0 or entry.file_size > max_cif_bytes:
-                    raise ModelOutputError("MatterGen CIF exceeds the per-representation size limit")
-                if entry.compress_size == 0 or entry.file_size / entry.compress_size > 200:
-                    raise ModelOutputError("MatterGen archive has a suspicious compression ratio")
+                    raise ModelOutputError(
+                        "MatterGen CIF exceeds the per-representation size limit"
+                    )
+                if (
+                    entry.compress_size == 0
+                    or entry.file_size / entry.compress_size > 200
+                ):
+                    raise ModelOutputError(
+                        "MatterGen archive has a suspicious compression ratio"
+                    )
                 total += entry.file_size
                 if total > expected_count * max_cif_bytes:
-                    raise ModelOutputError("MatterGen archive exceeds the uncompressed size limit")
+                    raise ModelOutputError(
+                        "MatterGen archive exceeds the uncompressed size limit"
+                    )
                 raw = archive.read(entry)
                 if len(raw) != entry.file_size:
-                    raise ModelOutputError("MatterGen archive entry size changed while reading")
+                    raise ModelOutputError(
+                        "MatterGen archive entry size changed while reading"
+                    )
                 output.append((entry.filename, raw.decode("utf-8")))
             return output
     except ModelOutputError:
         raise
     except (OSError, UnicodeError, zipfile.BadZipFile) as exc:
-        raise ModelOutputError(f"MatterGen returned an invalid CIF archive: {type(exc).__name__}: {exc}") from exc
+        raise ModelOutputError(
+            f"MatterGen returned an invalid CIF archive: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
-def _read_reinvent_csv(path: Path, *, requested_count: int, max_output_bytes: int) -> list[str]:
+def _read_reinvent_csv(
+    path: Path, *, requested_count: int, max_output_bytes: int
+) -> list[str]:
     try:
         size = path.stat().st_size
     except OSError as exc:
-        raise ModelOutputError("REINVENT did not produce the configured sampling CSV") from exc
+        raise ModelOutputError(
+            "REINVENT did not produce the configured sampling CSV"
+        ) from exc
     if size <= 0 or size > max_output_bytes:
-        raise ModelOutputError("REINVENT sampling CSV is empty or exceeds the size limit")
+        raise ModelOutputError(
+            "REINVENT sampling CSV is empty or exceeds the size limit"
+        )
     try:
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
             if reader.fieldnames is None:
                 raise ModelOutputError("REINVENT sampling CSV has no header")
             smiles_name = next(
-                (name for name in reader.fieldnames if name.strip().lower() in {"smiles", "smile"}),
+                (
+                    name
+                    for name in reader.fieldnames
+                    if name.strip().lower() in {"smiles", "smile"}
+                ),
                 None,
             )
             if smiles_name is None:
@@ -787,7 +1243,9 @@ def _read_reinvent_csv(path: Path, *, requested_count: int, max_output_bytes: in
     except ModelOutputError:
         raise
     except (OSError, UnicodeError, csv.Error) as exc:
-        raise ModelOutputError(f"REINVENT returned an invalid CSV: {type(exc).__name__}: {exc}") from exc
+        raise ModelOutputError(
+            f"REINVENT returned an invalid CSV: {type(exc).__name__}: {exc}"
+        ) from exc
     chem = require_module(
         "rdkit.Chem",
         install_hint="install RDKit in the REINVENT sidecar to validate generated SMILES",
@@ -819,16 +1277,260 @@ def _reinvent_device(device: str) -> str:
     return "cpu"
 
 
-def _condition_value(name: str, value: Any) -> str | float | int:
-    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+def _condition_value(
+    name: str,
+    value: Any,
+    *,
+    unit: str | None,
+) -> str | float | int:
+    """Validate and normalize one public MatterGen condition.
+
+    Numeric strings are deliberately rejected.  A target such as ``1500`` is
+    unsafe without its declared unit because passing meV as eV would silently
+    move the diffusion condition by three orders of magnitude.
+    """
+
+    if name == "chemical_system":
+        if unit not in {None, ""}:
+            raise ModelExecutionError(
+                "MatterGen chemical_system must not declare a numeric unit"
+            )
+        _validated_chemical_system(value)
+        return str(value).strip()
+    if name == "space_group":
+        if not _dimensionless_unit(unit):
+            raise ModelExecutionError(
+                "MatterGen space_group must be dimensionless"
+            )
+        return _validated_space_group(value)
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ModelExecutionError(
-            f"MatterGen condition {name!r} must be a string or finite scalar"
+            f"MatterGen numeric condition {name!r} requires a finite number, not a string"
         )
-    if isinstance(value, float) and not (-1e100 < value < 1e100):
+    numeric = float(value)
+    if not math.isfinite(numeric):
         raise ModelExecutionError(f"MatterGen condition {name!r} is not finite")
-    if isinstance(value, str) and not value.strip():
-        raise ModelExecutionError(f"MatterGen condition {name!r} cannot be blank")
+
+    normalized_unit = _normalized_condition_unit(unit)
+    contracts: dict[str, dict[str, float]] = {
+        "energy_above_hull": {"ev/atom": 1.0, "mev/atom": 0.001},
+        "dft_band_gap": {"ev": 1.0, "mev": 0.001},
+        "ml_bulk_modulus": {"gpa": 1.0, "mpa": 0.001},
+        "dft_mag_density": {
+            "ub/angstrom^3": 1.0,
+            "u_b/angstrom^3": 1.0,
+            "mub/angstrom^3": 1.0,
+            "mu_b/angstrom^3": 1.0,
+            "bohrmagneton/angstrom^3": 1.0,
+        },
+    }
+    if name == "hhi_score":
+        if not _dimensionless_unit(unit):
+            raise ModelExecutionError("MatterGen hhi_score must be dimensionless")
+        return numeric
+    allowed = contracts.get(name)
+    if allowed is None:
+        raise ModelExecutionError(f"unknown MatterGen condition contract {name!r}")
+    if normalized_unit not in allowed:
+        expected = ", ".join(sorted(allowed))
+        raise ModelExecutionError(
+            f"MatterGen condition {name!r} has incompatible or missing unit {unit!r}; "
+            f"accepted normalized units are: {expected}"
+        )
+    return numeric * allowed[normalized_unit]
+
+
+def _normalized_condition_unit(unit: str | None) -> str | None:
+    if unit is None:
+        return None
+    normalized = unit.strip().replace("Å", "angstrom").replace("Å", "angstrom")
+    normalized = normalized.replace("μ", "u").replace("µ", "u")
+    normalized = normalized.replace(" ", "").casefold()
+    return normalized or None
+
+
+def _dimensionless_unit(unit: str | None) -> bool:
+    normalized = _normalized_condition_unit(unit)
+    return normalized in {None, "1", "dimensionless", "unitless"}
+
+
+def _validated_chemical_system(value: Any) -> frozenset[str]:
+    """Validate a requested element set against the released model-card domain."""
+
+    if not isinstance(value, str):
+        raise ModelExecutionError(
+            "MatterGen chemical_system must be a hyphen-separated string"
+        )
+    normalized = value.strip()
+    tokens = normalized.split("-")
+    if (
+        not normalized
+        or any(not token or token.strip() != token for token in tokens)
+        or len(set(tokens)) != len(tokens)
+    ):
+        raise ModelExecutionError(
+            "MatterGen chemical_system must contain unique element symbols separated by '-'"
+        )
+    unknown = sorted(
+        symbol for symbol in tokens if symbol not in _ATOMIC_NUMBER_BY_SYMBOL
+    )
+    if unknown:
+        raise ModelExecutionError(
+            f"MatterGen chemical_system contains unknown element symbol(s): {unknown!r}"
+        )
+    excluded = _model_card_excluded_symbols(tokens)
+    if excluded:
+        raise ModelExecutionError(
+            "MatterGen chemical_system is outside the released model-card domain; "
+            "noble gases, Tc/Pm, and elements with atomic number greater than 84 are "
+            f"excluded (requested={excluded!r})"
+        )
+    return frozenset(tokens)
+
+
+def _declared_goal_chemical_system(goal: Any) -> frozenset[str] | None:
+    declared: set[frozenset[str]] = set()
+    for constraint in getattr(goal, "constraints", []):
+        if (
+            getattr(constraint, "hard", False)
+            and getattr(constraint, "property_name", None)
+            in {"chemical_system", "allowed_chemical_system"}
+            and getattr(constraint, "operator", None) == "eq"
+            and isinstance(getattr(constraint, "value", None), str)
+        ):
+            declared.add(_validated_chemical_system(constraint.value))
+    if len(declared) > 1:
+        raise ModelExecutionError(
+            "goal contains conflicting hard chemical-system constraints"
+        )
+    return next(iter(declared)) if declared else None
+
+
+def _model_card_excluded_symbols(symbols: Iterable[str]) -> list[str]:
+    return sorted(
+        symbol
+        for symbol in symbols
+        if symbol in _NOBLE_GASES
+        or symbol in _EXPLICIT_MODEL_CARD_EXCLUSIONS
+        or _ATOMIC_NUMBER_BY_SYMBOL[symbol] > 84
+    )
+
+
+def _validated_space_group(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 230:
+        raise ModelExecutionError(
+            "MatterGen space_group must be an integer from 1 through 230"
+        )
     return value
+
+
+def _canonical_element_symbols(canonical: Any) -> frozenset[str] | None:
+    for attribute in ("primitive_structure", "canonical_structure"):
+        structure = getattr(canonical, attribute, None)
+        composition = getattr(structure, "composition", None)
+        elements = getattr(composition, "elements", None)
+        if elements is not None:
+            symbols = frozenset(
+                str(getattr(element, "symbol", element)).strip() for element in elements
+            )
+            if symbols and all(
+                symbol in _ATOMIC_NUMBER_BY_SYMBOL for symbol in symbols
+            ):
+                return symbols
+    fingerprint = getattr(canonical, "fingerprint", None)
+    if isinstance(fingerprint, Mapping):
+        composition = fingerprint.get("composition")
+        if isinstance(composition, Mapping):
+            symbols = frozenset(str(symbol).strip() for symbol in composition)
+            if symbols and all(
+                symbol in _ATOMIC_NUMBER_BY_SYMBOL for symbol in symbols
+            ):
+                return symbols
+    return None
+
+
+def _canonical_composition_key(canonical: Any) -> str | None:
+    explicit = getattr(canonical, "composition_key", None)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    for attribute in ("primitive_structure", "canonical_structure"):
+        structure = getattr(canonical, attribute, None)
+        composition = getattr(structure, "composition", None)
+        reduced_formula = getattr(composition, "reduced_formula", None)
+        if isinstance(reduced_formula, str) and reduced_formula.strip():
+            return reduced_formula.strip()
+    return None
+
+
+def _mattergen_output_contract_rejection(
+    canonical: Any,
+    *,
+    conditions: Mapping[str, str | float | int],
+) -> tuple[str, str, str] | None:
+    """Return a fail-closed applicability/condition rejection, if any."""
+
+    source_atom_count = getattr(canonical, "source_atom_count", None)
+    if not isinstance(source_atom_count, int) or source_atom_count < 1:
+        return (
+            "applicability",
+            "source_atom_count",
+            "generated unit-cell atom count could not be verified",
+        )
+    if source_atom_count > 20:
+        return (
+            "applicability",
+            "source_atom_count",
+            f"generated unit-cell atom count {source_atom_count} exceeds the released limit of 20",
+        )
+    primitive_atom_count = getattr(canonical, "primitive_atom_count", None)
+    if not isinstance(primitive_atom_count, int) or primitive_atom_count < 1:
+        return (
+            "applicability",
+            "primitive_atom_count",
+            "primitive atom count could not be verified",
+        )
+    if primitive_atom_count > 20:
+        return (
+            "applicability",
+            "primitive_atom_count",
+            f"primitive atom count {primitive_atom_count} exceeds the released limit of 20",
+        )
+    actual_symbols = _canonical_element_symbols(canonical)
+    if actual_symbols is None:
+        return (
+            "applicability",
+            "model_card_element_domain",
+            "generated primitive composition could not be verified",
+        )
+    excluded_symbols = _model_card_excluded_symbols(actual_symbols)
+    if excluded_symbols:
+        return (
+            "applicability",
+            "model_card_element_domain",
+            "generated structure contains element(s) outside the released model-card "
+            f"domain: {excluded_symbols!r}",
+        )
+    requested_chemical_system = conditions.get("chemical_system")
+    if requested_chemical_system is not None:
+        requested_symbols = _validated_chemical_system(requested_chemical_system)
+        if actual_symbols != requested_symbols:
+            return (
+                "condition",
+                "chemical_system",
+                f"requested={sorted(requested_symbols)!r}, generated={sorted(actual_symbols)!r}",
+            )
+    requested_space_group = conditions.get("space_group")
+    if requested_space_group is not None:
+        requested_number = _validated_space_group(requested_space_group)
+        actual_number = getattr(canonical, "space_group_number", None)
+        if actual_number != requested_number:
+            return (
+                "condition",
+                "space_group",
+                f"requested={requested_number}, generated={actual_number!r}",
+            )
+    return None
 
 
 __all__ = ["MatterGenGenerator", "ReinventGenerator"]

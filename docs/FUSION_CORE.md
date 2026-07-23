@@ -128,7 +128,7 @@ class FusionBackend(Protocol):
 
 `propose_revision()`이 낼 수 있는 조건 이름은 `chemical_system`, `space_group`, `dft_mag_density`, `dft_band_gap`, `ml_bulk_modulus`, `hhi_score`, `energy_above_hull`뿐입니다. 명시적인 goal target을 우선하고, 근거가 없거나 단위·형식이 맞지 않으면 숫자를 만들어내지 않습니다. `chemical_system`은 검증된 원소 기호를 정렬하고 `space_group`은 1~230 정수만 허용합니다. hull 값은 `eV/atom`으로 정규화하며 `meV/atom`은 명시적으로 변환하고, 단위가 없는 혼합 panel은 닫습니다. 안정 후보가 부족하면 hull 목표를 `0.00`으로 좁히고, 안정 후보가 확보된 뒤에는 분기에 따라 `0.00`, `0.03`, `0.05`, `0.08`을 사용합니다. 불일치 분기의 제안은 낮은 confidence로 유지해 추가 평가 대상으로 보존합니다. hull 이외 조건은 명시 target 또는 명시 range 중간값만 쓰며 전문가 극값을 새 생성 목표로 복사하지 않습니다.
 
-MatterSim·UMA의 `energy_per_atom`은 총 potential energy를 원자 수로 나눈 `eV/atom` 값이며 CHGNet의 같은 이름 property와 함께 전문가별 Pareto 축으로 보존할 수 있습니다. 이것은 `energy_above_hull`이 아닙니다. convex-hull 안정성에는 구조 이완, 기준 상 에너지와 조성별 hull 계산을 수행하는 별도 고정밀 connector가 필요하며, 이 계층은 `energy_per_atom`에서 hull 값을 추정해 만들지 않습니다.
+MatterSim·UMA의 `energy_per_atom`은 총 potential energy를 원자 수로 나눈 `eV/atom` 값이며 CHGNet의 같은 이름 property와 함께 전문가별 축으로 보존할 수 있습니다. 그러나 raw MLIP energy의 절대 기준은 모델과 조성에 의존하므로 Pareto dominance와 불일치는 같은 reduced composition 안에서만 비교합니다. 이것은 `energy_above_hull`이 아닙니다. convex-hull 안정성에는 구조 이완, 일관된 기준 상 에너지와 조성별 hull 계산을 수행하는 별도 고정밀 connector가 필요하며, 이 계층은 `energy_per_atom`에서 hull 값을 추정해 만들지 않습니다.
 
 원격 Fusion AI를 사용할 때만 운영 endpoint와 선택적 token을 환경변수로 연결합니다.
 
@@ -207,9 +207,9 @@ iteration = loop.iterate(
 
 선택기는 전문가 출력을 평균내지 않습니다. 각 `ExpertFeaturePayload`와 원래 `ExpertFeatureRef`를 content-addressed `ExpertEvidenceStore`에 저장하고, failed/partial/OOD/누락 evaluator/단위 불일치 후보를 보간하지 않고 제외합니다. 후보 JSON과 CIF·SMILES·서열 원문, 생성 provenance, 반복 history, latent state, 매 단계 생성 control도 함께 저장합니다.
 
-`AdaptiveGenerationScheduler`는 raw expert objective utility의 반복 간 개선량, 구조 붕괴 비율과 불일치 후보를 관찰합니다. 개선이 지속되면 alpha를 낮추고, 정체가 지속되면 temperature·mutation·diversity를 높이며, 붕괴가 증가하면 temperature와 mutation을 낮춥니다. 실제 generator가 해당 control을 지원하지 않으면 sidecar가 적용한 척하지 않고 경고를 반환합니다.
+`AdaptiveGenerationScheduler`는 raw expert objective utility의 반복 간 개선량, 구조 붕괴 비율과 불일치 후보를 관찰합니다. 일반적인 backend에서는 기존 alpha 의미를 유지하지만, MatterGen에서는 `gamma = alpha * guidance_max`인 classifier-free guidance 의미를 사용합니다. 따라서 MatterGen은 개선이 지속되면 조건 집중을 위해 alpha를 높이고, 정체되면 탐색 폭을 넓히기 위해 alpha를 낮춥니다. 붕괴가 증가하면 guidance·temperature·mutation을 낮춥니다. MatterGen v1이 실제로 적용하지 않는 temperature·mutation·diversity는 requested-but-ignored provenance로 남으며, sidecar가 적용한 척하지 않습니다.
 
-최종 보고서의 `validation_handoff_candidate_refs`는 Pareto 후보를 우선하고 안정성 후보를 이어 붙인 후 정확히 같은 과학 표현을 중복 제거한 고비용 검증 입력 목록입니다. 이 필드는 DFT·구조 이완·phonon·실험을 실행했다는 뜻이 아닙니다. 대칭과 수치 허용오차를 고려한 결정 중복 제거도 아직 별도의 `StructureMatcher`/표준화 connector가 필요합니다.
+최종 보고서의 `validation_handoff_candidate_refs`는 Pareto 후보를 우선하고 안정성 후보를 이어 붙인 후 정확히 같은 과학 표현을 중복 제거한 고비용 검증 입력 목록입니다. 이 필드는 DFT·구조 이완·phonon·실험을 실행했다는 뜻이 아닙니다. 결정 후보 파이프라인은 별도의 `discovery_os.crystal_identity` 단계에서 pymatgen `StructureMatcher`와 표준화를 실행하며, hard dedup은 species-preserving·unscaled strict match에만 허용합니다. volume scaling이 필요한 동일 prototype 관계와 애매한 비교는 삭제하지 않습니다.
 
 ## Workspace OFF/ON 비교
 

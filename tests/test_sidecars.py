@@ -618,7 +618,13 @@ def test_mattergen_revision_targets_are_used_without_inventing_direction_values(
     generator = MatterGenGenerator(pretrained_name="dft_band_gap", device="cpu")
     request = SimpleNamespace(
         goal=SimpleNamespace(
-            objectives=[SimpleNamespace(property_name="dft_band_gap", target_value=1.5)]
+            objectives=[
+                SimpleNamespace(
+                    property_name="dft_band_gap",
+                    target_value=1.5,
+                    unit="eV",
+                )
+            ]
         ),
         revision_proposal=SimpleNamespace(
             desired_changes=[
@@ -702,9 +708,16 @@ def test_mattergen_python_runtime_loads_checkpoint_once(monkeypatch, tmp_path: P
 
     def fake_canonicalize(structure: object, **_kwargs: Any) -> Any:
         index = next(canonical_counter)
+        composition = SimpleNamespace(
+            elements=(SimpleNamespace(symbol="Li"), SimpleNamespace(symbol="O")),
+            reduced_formula="Li2O",
+        )
         return SimpleNamespace(
             canonical_cif=f"data_fixture_{index}\n_cell_length_a 1\n",
+            primitive_structure=SimpleNamespace(composition=composition),
+            canonical_structure=SimpleNamespace(composition=composition),
             structure_hash=f"hash-{index}",
+            identity_structure_hash=f"hash-{index}",
             source_atom_count=1,
             primitive_atom_count=1,
             conventional_atom_count=1,
@@ -768,9 +781,16 @@ def test_mattergen_replaces_structurematcher_duplicates_before_returning_batch(
             return [RawStructure("replacement")]
 
     def fake_canonicalize(structure: RawStructure, **_kwargs: Any) -> Any:
+        composition = SimpleNamespace(
+            elements=(SimpleNamespace(symbol="Li"), SimpleNamespace(symbol="O")),
+            reduced_formula="Li2O",
+        )
         return SimpleNamespace(
             canonical_cif=f"data_{structure.identity}\n_cell_length_a 4\n",
+            primitive_structure=SimpleNamespace(composition=composition),
+            canonical_structure=SimpleNamespace(composition=composition),
             structure_hash=f"hash-{structure.identity}",
+            identity_structure_hash=f"hash-{structure.identity}",
             source_atom_count=2,
             primitive_atom_count=2,
             conventional_atom_count=2,
@@ -812,7 +832,7 @@ def test_mattergen_replaces_structurematcher_duplicates_before_returning_batch(
     assert model.batch_sizes == [2, 1]
     assert len(batch.candidates) == 2
     assert {
-        item.attributes["crystal_identity"]["canonical_structure_sha256"]
+        item.attributes["crystal_identity"]["identity_structure_sha256"]
         for item in batch.candidates
     } == {"hash-duplicate", "hash-replacement"}
     assert all(not item.representations[0].canonical for item in batch.candidates)
@@ -833,6 +853,15 @@ def test_mattergen_replaces_structurematcher_duplicates_before_returning_batch(
         "parse_rejected": 0,
         "geometry_rejected": 0,
         "canonicalization_rejected": 0,
+        "applicability_rejected": 0,
+        "condition_rejected": 0,
+        "source_atom_count_rejected": 0,
+        "primitive_atom_count_rejected": 0,
+        "model_card_element_rejected": 0,
+        "chemical_system_rejected": 0,
+        "space_group_rejected": 0,
+        "cross_call_duplicate_rejected": 0,
+        "cross_call_ambiguous_comparisons": 0,
         "duplicates_removed": 1,
         "generation_rounds": 2,
     }

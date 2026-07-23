@@ -39,6 +39,20 @@ E0~E2는 **발견을 위한 계산 리드**입니다. 공개적인 신물질 발
 
 `success`인 tool run은 프로그램이 정상 종료했다는 뜻입니다. gate 통과는 필요한 `EvidenceRecord`의 속성·조건·품질과 provenance를 코드 정책이 별도로 판정합니다. 모델의 `confirmed_findings`나 `finish` 제안만으로 gate를 통과할 수 없습니다.
 
+## 소재 T4의 현재 5단계 증거 라우팅
+
+문헌 RAG, RAG 모델, MCP 도구, Codex skill은 계산기가 아니라 **범위가 제한된 증거 문맥 제공자**입니다. record 수, citation 수, 요약문, MCP prose를 에너지·힘·hull 값·신규성 Boolean·수렴 판정·Pareto utility·DFT 결과로 바꾸지 않습니다. `skipped`, 빈 결과, schema 오류, 호출 실패는 `unknown`이며 통과가 아닙니다.
+
+| 단계 | RAG/MCP가 제공할 수 있는 문맥 | 실제 판정 권한 | 현재 구현 경계 |
+|---|---|---|---|
+| `generation_prior` | 보고된 상, 실패한 합성, 조성 범위, 안정성 제약 | 공식 MatterGen checkpoint allowlist + 결정론적 Fusion controller | source-closed handoff만 생성 분기에 사용 가능. custom checkpoint allowlist는 운영자 attestation이며 학습 설정 자동 검증이 아님 |
+| `identity_novelty` | 상 이름·결정학 alias·검색 범위 | source-Niggli 무대칭 identity + strict unscaled pymatgen `StructureMatcher`; 외부 lookup 결과의 로컬 strict 재검사 | 내부 branch ID `novelty`는 속성 공간 다양성일 뿐. 외부 `no_match`도 조회 범위 내 결과이며 보편적 신규성 증명이 아님 |
+| `mlip_disagreement` | 적용 범위, 자성·전하 상태, 알려진 실패 양상 | exact SHA-256 artifact로 고정된 별도 MatterSim/CHGNet 결과, 단위 정규화, 동일 조성·정렬 후보의 상대 에너지 | raw cross-model absolute energy 차이는 audit-only. singleton·정렬 불명·weight 불일치는 unknown/DFT escalation |
+| `relaxation_validation` | 상변환, 압력·온도, 동적 불안정 문맥 | 각 모델의 실제 `/v1/relax`, optimizer convergence, periodic geometry gate | 실행 성공·수렴·구조 유효성·과학적 채택을 분리 기록 |
+| `dft_handoff` | reference phase, 자성, functional/U, pseudopotential, 수렴·phonon 검토 항목 | 실제 실행형 `PeriodicDFTBackend`와 immutable input/output/convergence provenance | portable backend는 CIF/POSCAR/pw.in만 준비. `completed` 결과에는 manifest·method·output·convergence hash가 필요 |
+
+각 단계는 전용 `MATERIAL_RAG_MCP_TOOL_<STAGE>`를 먼저 사용하고 관리자 설정의 generic fallback만 허용합니다. RAG는 문헌을 검색해 출처가 닫힌 증거 record를 만드는 경로이고, 이 MCP 경로는 관리자 설정의 **구조화 증거 제공 인터페이스**일 뿐 실행 권한이 아닙니다. prompt, RAG 모델 출력, 후보 관찰값이 endpoint나 tool을 고를 수 없습니다. MCP `tools/list` 및 schema 검증을 통과한 구조화 record만 문맥으로 저장합니다. 실제 action validator는 구조 matcher, 외부 구조 client, MatterSim/CHGNet sidecar, `/v1/relax`, 실행형 DFT backend입니다. 저장소의 `material-candidate-validation` skill은 이 라우팅 절차를 Codex에 안내할 뿐, MCP 서버·구조 matcher·MLIP·DFT backend를 실행하거나 대체하지 않습니다.
+
 ## 1. 의약 저분자 (`medicinal_chemistry`)
 
 [RDKit sanitization](https://www.rdkit.org/docs/RDKit_Book.html)은 허용 원자가, 방향족성, kekulization 등 구조 표현의 합리성을 검사하지만 실제 안정성·합성 가능성·약효·안전성을 증명하지 않습니다. 의약품은 발견 이후에도 비임상, 임상 및 규제 검토가 필요합니다. [FDA의 전체 개발 절차](https://www.fda.gov/patients/learn-about-drug-and-device-approvals/drug-development-process)를 기준 경계로 삼습니다.
@@ -65,10 +79,10 @@ E0~E2는 **발견을 위한 계산 리드**입니다. 공개적인 신물질 발
 | 단계 | 필수 또는 권장 검증 | 통과 증거 | 현재 상태 |
 |---|---|---|---|
 | 조성 기초 | 화학식 token, 알려진 원소, 양의 유한 화학량론 계수, 조성 정규화 | canonical composition, parser version | **실행 가능 MVP** |
-| 구조 기초 | CIF/POSCAR parse, 양의 cell volume, 유한 좌표, occupancy, 원자 간 거리·밀도 sanity | 표준화 구조와 경고 | **커넥터 자리**: pymatgen/spglib 등 필요 |
-| 대칭·중복 | primitive/standard cell, tolerance 민감도, exact/StructureMatcher 중복 | 표준화 파라미터와 match | **커넥터 자리** |
+| 구조 기초 | CIF/POSCAR parse, 양의 cell volume, 유한 좌표, occupancy, 원자 간 거리·밀도 sanity | 구조 보고서와 경고 | **코드 구현·선택 의존성 필요**: `pymatgen` 설치 시 volume/atom, occupancy, 최소 periodic distance gate 실행 |
+| 대칭·중복 | source-derived identity와 표준화 prototype 문맥 분리, strict/scale-normalized 관계, tolerance와 ambiguous 결과 | matcher 설정·관계·raw identity hash | **코드 구현·선택 의존성 필요**: hard deletion은 symmetry refinement 전 source-Niggli 구조와 strict `scale=False` matcher만 사용 |
 | 화학 plausibility | 산화수·전하 중성·bond valence; 희귀 화학은 경고와 전문가 검토 | 규칙·예외·confidence | **커넥터 자리** |
-| 구조 완화 | DFT 또는 검증된 MLIP relaxation, force/stress/energy 수렴, OOD | 초기/최종 구조와 수렴 기록 | **커넥터 자리** |
+| 구조 완화 | DFT 또는 검증된 MLIP relaxation, force/stress/energy 수렴, OOD | 초기/최종 구조와 수렴 기록 | **sidecar 계약 구현·실제 모델 필요**: MatterSim/CHGNet `/v1/relax` 결과, optimizer 수렴, geometry gate를 분리 기록 |
 | 열역학 안정성 | 동일 functional·pseudopotential·보정 체계의 경쟁상, formation energy, energy above hull | reference snapshot과 hull artifact | **커넥터 자리**; DB에 경쟁상이 없으면 불충분 |
 | 동적·기계 안정성 | phonon dispersion, imaginary mode 확인, elastic tensor와 안정 조건 | q-mesh·수렴·mode artifact | **커넥터 자리** |
 | 조건 안정성 | 목표 온도·압력에서 free-energy 근사/AIMD, 분해·산화·수분 민감성 | 조건과 trajectory/오차 | **커넥터 자리** |

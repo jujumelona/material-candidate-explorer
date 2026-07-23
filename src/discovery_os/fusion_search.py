@@ -8,7 +8,7 @@ payload through ``ExpertEvidenceStore`` before a candidate can enter a branch.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from math import fsum
 from typing import Literal, Protocol
@@ -16,6 +16,7 @@ from typing import Literal, Protocol
 from pydantic import Field, JsonValue, model_validator
 
 from ._compat import StrEnum
+from .crystal_identity import CRYSTAL_IDENTITY_CANONICALIZATION
 from .fusion_exploration import (
     AdaptiveGenerationScheduler,
     CandidatePool,
@@ -375,6 +376,19 @@ class SearchControlSweep(StrictSchema):
         return self
 
 
+class SearchBudget(StrictSchema):
+    """Global hard limits across rounds, branches, frontiers, and variants."""
+
+    max_generation_calls: int = Field(ge=1, le=10_000)
+    max_generated_candidates: int = Field(ge=1, le=100_000)
+
+
+class SearchBudgetUsage(StrictSchema):
+    generation_calls: int = Field(default=0, ge=0)
+    generated_candidates: int = Field(default=0, ge=0)
+    exhausted: bool = False
+
+
 class SearchControlAttemptRecord(StrictSchema):
     attempt_id: Identifier
     round_index: int = Field(ge=0)
@@ -503,6 +517,8 @@ class FusionSearchReport(StrictSchema):
     branches: list[SearchBranchReport]
     final_selection: ExplorationSelection
     control_sweep: SearchControlSweep | None = None
+    search_budget: SearchBudget | None = None
+    budget_usage: SearchBudgetUsage = Field(default_factory=SearchBudgetUsage)
     control_attempts: list[SearchControlAttemptRecord] = Field(default_factory=list)
     ranking_limit: int = Field(default=50, gt=0, le=1_024)
     ranked_candidates: list[RankedSearchCandidate] = Field(default_factory=list)
@@ -562,6 +578,34 @@ class FusionSearchReport(StrictSchema):
         for attempt in self.control_attempts:
             if attempt.success and attempt.cycle_record_id not in known_cycles:
                 raise ValueError("successful control attempt cites an unknown cycle")
+        if self.search_budget is not None:
+            if self.budget_usage.generation_calls > self.search_budget.max_generation_calls:
+                raise ValueError("search exceeded its generation-call budget")
+            if (
+                self.budget_usage.generated_candidates
+                > self.search_budget.max_generated_candidates
+            ):
+                raise ValueError("search exceeded its generated-candidate budget")
+            if self.budget_usage.generation_calls != len(self.control_attempts):
+                raise ValueError(
+                    "budgeted search generation-call usage must match control attempts"
+                )
+            generated_child_count = sum(
+                len(item.child_record_ids) for item in self.cycle_records
+            )
+            if self.budget_usage.generated_candidates != generated_child_count:
+                raise ValueError(
+                    "budgeted search generated-candidate usage must match cycle children"
+                )
+            if self.budget_usage.exhausted and (
+                self.budget_usage.generation_calls
+                < self.search_budget.max_generation_calls
+                and self.budget_usage.generated_candidates
+                < self.search_budget.max_generated_candidates
+            ):
+                raise ValueError(
+                    "budget usage cannot be exhausted before either hard limit is reached"
+                )
         expected_ranking = _ranked_candidate_results(
             self.final_selection,
             self.candidate_records,
@@ -609,6 +653,13 @@ class _FrontierNode:
     origin_record: SearchCandidateRecord | None
 
 
+@dataclass(frozen=True)
+class _RawSearchUtility:
+    values: dict[tuple[str, str, str | None], float]
+    raw_energy_dimensions: frozenset[tuple[str, str, str | None]]
+    composition_scope: str | None
+
+
 class FusionSearchRunner:
     """Run batch Fusion iterations while keeping five independent branches."""
 
@@ -632,9 +683,7 @@ class FusionSearchRunner:
         self.loop_runner = loop_runner
         self.evidence_store = evidence_store
         self.selector = selector or DeterministicExplorationSelector(evidence_store)
-        self.scheduler_factory = scheduler_factory or (
-            lambda controls: AdaptiveGenerationScheduler(controls)
-        )
+        self.scheduler_factory = scheduler_factory
 
     def run(
         self,
@@ -656,6 +705,7 @@ class FusionSearchRunner:
         observation_provider: SearchObservationProvider | None = None,
         evidence_policy: LiteratureEvidencePolicy | None = None,
         control_sweep: SearchControlSweep | None = None,
+        search_budget: SearchBudget | None = None,
         ranking_limit: int = 50,
     ) -> PersistedFusionSearchReport:
         safe_search_id = self.loop_runner.runtime.artifact_store.safe_component(search_id)
@@ -671,12 +721,26 @@ class FusionSearchRunner:
             control_sweep = SearchControlSweep.model_validate_json(
                 control_sweep.model_dump_json(), strict=True
             )
+        if search_budget is not None:
+            search_budget = SearchBudget.model_validate_json(
+                search_budget.model_dump_json(), strict=True
+            )
         goal = DiscoveryGoal.model_validate_json(goal.model_dump_json(), strict=True)
         initial_candidate = Candidate.model_validate_json(
             initial_candidate.model_dump_json(), strict=True
         )
         base_run_config = WorkspaceRunConfig.model_validate_json(
             base_run_config.model_dump_json(), strict=True
+        )
+        if base_run_config.search_session_id not in {None, search_id}:
+            raise FusionSearchError(
+                "base run configuration belongs to another search session"
+            )
+        base_run_config = WorkspaceRunConfig.model_validate_json(
+            base_run_config.model_copy(
+                update={"search_session_id": search_id}
+            ).model_dump_json(),
+            strict=True,
         )
         self._validate_initial(
             goal,
@@ -699,9 +763,34 @@ class FusionSearchRunner:
         )
         contexts = list(context_entities or [])
         relation_rows = list(relations or [])
-        branch_order = list(ExplorationBranch)
+        # Budget boundaries must not systematically starve the Pareto controller.
+        # The enum keeps the reader-facing branch order, while generation starts
+        # with Pareto so a small (8-candidate) search can apply a scheduler update
+        # before the global budget is exhausted.
+        branch_order = [
+            ExplorationBranch.PARETO,
+            ExplorationBranch.STABILITY,
+            ExplorationBranch.TARGET_PROPERTY,
+            ExplorationBranch.NOVELTY,
+            ExplorationBranch.EXPERT_DISAGREEMENT,
+        ]
+        scheduler_factory = self.scheduler_factory or (
+            lambda controls: AdaptiveGenerationScheduler(
+                controls,
+                alpha_semantics=(
+                    "classifier_free_guidance"
+                    if base_run_config.generator_id == "mattergen"
+                    else "generic"
+                ),
+            )
+        )
         schedulers = {
-            branch: self.scheduler_factory(base_run_config.generation_controls)
+            branch: scheduler_factory(
+                _branch_seed_controls(
+                    base_run_config.generation_controls,
+                    branch,
+                )
+            )
             for branch in branch_order
         }
         frontiers: dict[ExplorationBranch, list[_FrontierNode]] = {
@@ -728,6 +817,10 @@ class FusionSearchRunner:
         history_artifacts: list[ContentArtifactRef] = []
         round_history: list[SearchRoundRecord] = []
         final_selection = self._empty_selection(f"{search_id}-unstarted")
+        generation_calls_used = 0
+        generated_candidates_used = 0
+        budget_exhausted = False
+        strict_identity_representatives: dict[str, SearchCandidateRecord] = {}
 
         for round_index in range(rounds):
             round_cycles: list[SearchCycleRecord] = []
@@ -811,6 +904,22 @@ class FusionSearchRunner:
                     successful_variant = False
                     pending_failures: list[tuple[int, GenerationControls, Exception]] = []
                     for variant_index, controls in enumerate(control_variants):
+                        remaining_candidates = (
+                            search_budget.max_generated_candidates
+                            - generated_candidates_used
+                            if search_budget is not None
+                            else base_run_config.candidate_count
+                        )
+                        if search_budget is not None and (
+                            generation_calls_used >= search_budget.max_generation_calls
+                            or remaining_candidates <= 0
+                        ):
+                            budget_exhausted = True
+                            break
+                        requested_candidate_count = min(
+                            base_run_config.candidate_count,
+                            remaining_candidates,
+                        )
                         run_config = self._clone_config(
                             base_run_config,
                             parent=node.candidate.candidate_ref,
@@ -819,6 +928,7 @@ class FusionSearchRunner:
                             controls=controls,
                             control_variant_index=variant_index,
                             control_variant_count=len(control_variants),
+                            candidate_count_override=requested_candidate_count,
                         )
                         decision_context = self._decision_context(
                             branch,
@@ -827,6 +937,7 @@ class FusionSearchRunner:
                             evidence_assignment=evidence_assignment,
                         )
                         try:
+                            generation_calls_used += 1
                             iteration = self.loop_runner.iterate(
                                 goal=goal,
                                 parent_candidate=node.candidate,
@@ -863,6 +974,64 @@ class FusionSearchRunner:
                             iteration=iteration,
                             decision_context=decision_context,
                         )
+                        # MatterGen performs tolerance-aware identity grouping
+                        # inside one call. Across calls the coordinator can use
+                        # only the adapter-attested non-symmetrized identity
+                        # hash (it does not
+                        # re-run StructureMatcher here). A repeated hash keeps
+                        # its lineage/provenance record, but cannot consume a
+                        # selector slot. The first eligible representative is
+                        # shared into the current branch instead.
+                        evaluated_records = [parent_record, *children]
+                        identity_representatives_for_branch: dict[
+                            str, SearchCandidateRecord
+                        ] = {}
+                        rewritten_records: list[SearchCandidateRecord] = []
+                        for record in evaluated_records:
+                            identity_key = _attested_crystal_identity_hash_key(
+                                record.candidate
+                            )
+                            representative = (
+                                strict_identity_representatives.get(identity_key)
+                                if identity_key is not None
+                                else None
+                            )
+                            if representative is None:
+                                if identity_key is not None and record.selection_eligible:
+                                    strict_identity_representatives[identity_key] = record
+                                rewritten_records.append(record)
+                                continue
+                            if (
+                                representative.candidate.candidate_ref
+                                == record.candidate.candidate_ref
+                            ):
+                                if record.selection_eligible:
+                                    strict_identity_representatives[identity_key] = record
+                                rewritten_records.append(record)
+                                continue
+                            reason = (
+                                "attested_crystal_hash_duplicate: raw-geometry identity already "
+                                f"represented by {representative.record_id}"
+                            )
+                            updated = record.model_copy(
+                                update={
+                                    "selection_eligible": False,
+                                    "exclusion_reasons": sorted(
+                                        {*record.exclusion_reasons, reason}
+                                    ),
+                                }
+                            )
+                            updated = SearchCandidateRecord.model_validate_json(
+                                updated.model_dump_json(), strict=True
+                            )
+                            rewritten_records.append(updated)
+                            if representative.selection_eligible:
+                                identity_representatives_for_branch[
+                                    representative.record_id
+                                ] = representative
+                        parent_record = rewritten_records[0]
+                        children = rewritten_records[1:]
+                        generated_candidates_used += len(children)
                         successful_variant = True
                         control_attempts.append(
                             _control_attempt_record(
@@ -877,6 +1046,14 @@ class FusionSearchRunner:
                         )
                         candidate_records[parent_record.record_id] = parent_record
                         evaluated_records = [parent_record, *children]
+                        for representative in identity_representatives_for_branch.values():
+                            ref_key = _candidate_ref_key(
+                                representative.candidate.candidate_ref
+                            )
+                            branch_records_by_ref[branch].setdefault(
+                                ref_key, representative
+                            )
+                            current_by_ref.setdefault(ref_key, representative)
                         for record in evaluated_records:
                             ref_key = _candidate_ref_key(record.candidate.candidate_ref)
                             branch_prior = branch_records_by_ref[branch].get(ref_key)
@@ -961,6 +1138,15 @@ class FusionSearchRunner:
                                 structural_collapse_rate=1.0,
                                 failed=True,
                             )
+                    # A budget boundary can be reached while retrying a node
+                    # whose final permitted call failed. Persist that failure
+                    # before leaving the branch; otherwise the report would
+                    # incorrectly look like a clean, merely exhausted search.
+                    if budget_exhausted:
+                        break
+
+                if budget_exhausted:
+                    break
 
             unique_current = sorted(
                 current_by_ref.values(),
@@ -1182,7 +1368,7 @@ class FusionSearchRunner:
                 branch_frontiers=branch_frontier_ids,
             )
             round_history.append(round_record)
-            if not any(frontiers.values()):
+            if budget_exhausted or not any(frontiers.values()):
                 break
 
         if failure_records:
@@ -1233,6 +1419,12 @@ class FusionSearchRunner:
             branches=branch_reports,
             final_selection=final_selection,
             control_sweep=control_sweep,
+            search_budget=search_budget,
+            budget_usage=SearchBudgetUsage(
+                generation_calls=generation_calls_used,
+                generated_candidates=generated_candidates_used,
+                exhausted=budget_exhausted,
+            ),
             control_attempts=control_attempts,
             ranking_limit=ranking_limit,
             ranked_candidates=_ranked_candidate_results(
@@ -1393,20 +1585,67 @@ class FusionSearchRunner:
             return 0.0
         prior_vectors = [item for item in previous if item is not None]
         current_vectors = [item for item in current if item is not None]
-        dimensions = set(prior_vectors[0])
-        if not dimensions or any(
-            set(item) != dimensions for item in [*prior_vectors, *current_vectors]
+        all_vectors = [*prior_vectors, *current_vectors]
+        dimensions = set(prior_vectors[0].values)
+        if not dimensions or any(set(item.values) != dimensions for item in all_vectors):
+            return 0.0
+        raw_energy_dimensions = set(prior_vectors[0].raw_energy_dimensions)
+        if any(
+            set(item.raw_energy_dimensions) != raw_energy_dimensions
+            for item in all_vectors
         ):
             return 0.0
-        current_covers_previous = _set_pareto_covers(
-            current_vectors, prior_vectors, dimensions
-        )
-        previous_covers_current = _set_pareto_covers(
-            prior_vectors, current_vectors, dimensions
-        )
-        if current_covers_previous and not previous_covers_current:
+
+        comparisons: list[float] = []
+        non_energy_dimensions = dimensions - raw_energy_dimensions
+        if non_energy_dimensions:
+            comparisons.append(
+                _ordinal_set_improvement(
+                    [item.values for item in prior_vectors],
+                    [item.values for item in current_vectors],
+                    non_energy_dimensions,
+                )
+            )
+
+        # Raw total/per-atom energies have model- and composition-dependent
+        # gauges.  They may influence the scheduler only inside a composition
+        # represented on both sides of the round transition.
+        if raw_energy_dimensions:
+            prior_scopes = {
+                item.composition_scope
+                for item in prior_vectors
+                if item.composition_scope is not None
+            }
+            current_scopes = {
+                item.composition_scope
+                for item in current_vectors
+                if item.composition_scope is not None
+            }
+            for scope in sorted(prior_scopes & current_scopes):
+                comparisons.append(
+                    _ordinal_set_improvement(
+                        [
+                            item.values
+                            for item in prior_vectors
+                            if item.composition_scope == scope
+                        ],
+                        [
+                            item.values
+                            for item in current_vectors
+                            if item.composition_scope == scope
+                        ],
+                        raw_energy_dimensions,
+                    )
+                )
+        if not comparisons:
+            return 0.0
+        if all(item >= 0.0 for item in comparisons) and any(
+            item > 0.0 for item in comparisons
+        ):
             return 1.0
-        if previous_covers_current and not current_covers_previous:
+        if all(item <= 0.0 for item in comparisons) and any(
+            item < 0.0 for item in comparisons
+        ):
             return -1.0
         return 0.0
 
@@ -1416,11 +1655,12 @@ class FusionSearchRunner:
         *,
         goal: DiscoveryGoal,
         required_evaluator_ids: list[str],
-    ) -> dict[tuple[str, str, str | None], float] | None:
+    ) -> _RawSearchUtility | None:
         objectives = {item.property_name: item for item in goal.objectives}
         if len(objectives) != len(goal.objectives):
             return None
         values: dict[tuple[str, str, str | None], float] = {}
+        raw_energy_dimensions: set[tuple[str, str, str | None]] = set()
         evaluator_ids: set[str] = set()
         returned_properties: set[str] = set()
         candidate_ref = record.candidate.candidate_ref
@@ -1452,6 +1692,8 @@ class FusionSearchRunner:
                 if utility is None:
                     return None
                 values[dimension] = utility
+                if _is_raw_energy_property(prop.property_name):
+                    raw_energy_dimensions.add(dimension)
                 returned_properties.add(prop.property_name)
         if not set(required_evaluator_ids).issubset(evaluator_ids):
             return None
@@ -1460,7 +1702,13 @@ class FusionSearchRunner:
         }
         if not required_properties.issubset(returned_properties):
             return None
-        return values or None
+        if not values:
+            return None
+        return _RawSearchUtility(
+            values=values,
+            raw_energy_dimensions=frozenset(raw_energy_dimensions),
+            composition_scope=_candidate_composition_scope(record.candidate),
+        )
 
     @staticmethod
     def _validate_initial(
@@ -1778,6 +2026,7 @@ class FusionSearchRunner:
         controls: GenerationControls,
         control_variant_index: int = 0,
         control_variant_count: int = 1,
+        candidate_count_override: int | None = None,
     ) -> WorkspaceRunConfig:
         parent = self._validate_parent(parent)
         pair_key = f"{base.pair_key}-{branch.value}"
@@ -1786,6 +2035,20 @@ class FusionSearchRunner:
         if len(pair_key) > 256:
             pair_key = f"SEARCH-{stable_hash(pair_key)[:48]}"
         payload = base.model_dump(mode="json")
+        effective_candidate_count = (
+            candidate_count_override
+            if candidate_count_override is not None
+            else base.candidate_count
+        )
+        parameter_payload = {
+            "base_parameters_hash": base.generator_parameters_hash,
+            "generation_controls": controls,
+        }
+        # Preserve the historical parameters hash for ordinary search calls.
+        # The count becomes part of the immutable receipt only when the global
+        # budget truncates the final generator call.
+        if effective_candidate_count != base.candidate_count:
+            parameter_payload["candidate_count"] = effective_candidate_count
         payload.update(
             {
                 "parent_candidate_ref": parent.model_dump(mode="json"),
@@ -1800,12 +2063,8 @@ class FusionSearchRunner:
                     control_variant_count=control_variant_count,
                 ),
                 "generation_controls": controls.model_dump(mode="json"),
-                "generator_parameters_hash": stable_hash(
-                    {
-                        "base_parameters_hash": base.generator_parameters_hash,
-                        "generation_controls": controls,
-                    }
-                ),
+                "candidate_count": effective_candidate_count,
+                "generator_parameters_hash": stable_hash(parameter_payload),
             }
         )
         return WorkspaceRunConfig.model_validate_json(
@@ -1907,6 +2166,39 @@ def _control_variants(
     if not variants:
         raise FusionSearchError("control sweep produced no valid alpha/temperature variants")
     return variants
+
+
+_BRANCH_GUIDANCE_OFFSETS: dict[ExplorationBranch, tuple[float, float]] = {
+    ExplorationBranch.PARETO: (0.0, 0.0),
+    ExplorationBranch.STABILITY: (0.15, -0.10),
+    ExplorationBranch.TARGET_PROPERTY: (0.10, -0.05),
+    ExplorationBranch.NOVELTY: (-0.20, 0.25),
+    ExplorationBranch.EXPERT_DISAGREEMENT: (-0.10, 0.15),
+}
+
+
+def _branch_seed_controls(
+    base: GenerationControls,
+    branch: ExplorationBranch,
+) -> GenerationControls:
+    """Give every retained branch a distinct, bounded operating profile.
+
+    This makes the five-pool search real even under the minimum global budget:
+    guidance diversity is applied by the generator, while later scheduler
+    observations continue to move each branch independently.
+    """
+
+    alpha_offset, temperature_offset = _BRANCH_GUIDANCE_OFFSETS[branch]
+    return GenerationControls(
+        alpha=max(0.0, min(1.0, base.alpha + alpha_offset)),
+        temperature=max(0.01, min(5.0, base.temperature + temperature_offset)),
+        mutation_strength=base.mutation_strength,
+        diversity_strength=base.diversity_strength,
+        schedule_step=base.schedule_step,
+        decision_reason=(
+            f"{base.decision_reason}; initial {branch.value} branch guidance profile"
+        ),
+    )
 
 
 def _control_attempt_record(
@@ -2220,6 +2512,33 @@ def _explicit_structural_collapse_reasons(reasons: Iterable[str]) -> list[str]:
     )
 
 
+def _attested_crystal_identity_hash_key(candidate: Candidate) -> str | None:
+    """Return an adapter-attested non-symmetrized crystal hash, if present.
+
+    The coordinator does not parse CIFs or invent a structure hash.  It accepts
+    the key only when the candidate-level identity receipt and at least one raw
+    representation metadata receipt agree on the same SHA-256 digest.
+    """
+
+    identity = candidate.attributes.get("crystal_identity")
+    if not isinstance(identity, Mapping):
+        return None
+    digest = identity.get("identity_structure_sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return None
+    attested = any(
+        representation.metadata.get("identity_structure_sha256") == digest
+        and representation.metadata.get("identity_canonicalization")
+        == CRYSTAL_IDENTITY_CANONICALIZATION
+        for representation in candidate.representations
+    )
+    return f"attested-crystal-hash:{digest}" if attested else None
+
+
 def _unique_candidate_refs(refs: Iterable[CandidateRef]) -> list[CandidateRef]:
     by_key = {_candidate_ref_key(item): item for item in refs}
     return [by_key[key] for key in sorted(by_key)]
@@ -2265,6 +2584,49 @@ def _set_pareto_covers(
         any(_weakly_dominates(candidate, baseline, dimensions) for candidate in left)
         for baseline in right
     )
+
+
+def _ordinal_set_improvement(
+    previous: list[dict[tuple[str, str, str | None], float]],
+    current: list[dict[tuple[str, str, str | None], float]],
+    dimensions: set[tuple[str, str, str | None]],
+) -> float:
+    if not previous or not current or not dimensions:
+        return 0.0
+    current_covers_previous = _set_pareto_covers(current, previous, dimensions)
+    previous_covers_current = _set_pareto_covers(previous, current, dimensions)
+    if current_covers_previous and not previous_covers_current:
+        return 1.0
+    if previous_covers_current and not current_covers_previous:
+        return -1.0
+    return 0.0
+
+
+_RAW_ENERGY_PROPERTY_NAMES = frozenset(
+    {"energy", "energy_per_atom", "potential_energy", "total_energy"}
+)
+
+
+def _is_raw_energy_property(name: str) -> bool:
+    return name.strip().casefold().replace("-", "_") in _RAW_ENERGY_PROPERTY_NAMES
+
+
+def _candidate_composition_scope(candidate: Candidate) -> str | None:
+    for key in ("composition_key", "reduced_formula"):
+        value = candidate.attributes.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    formulas = [
+        item
+        for item in candidate.representations
+        if item.kind == RepresentationKind.CHEMICAL_FORMULA
+    ]
+    canonical = [item for item in formulas if item.canonical]
+    selected = canonical[0] if len(canonical) == 1 else formulas[0] if formulas else None
+    if selected is None:
+        return None
+    normalized = "".join(selected.value.split())
+    return normalized or None
 
 
 def _representation_artifact_spec(
@@ -2326,6 +2688,8 @@ __all__ = [
     "SearchBranchReport",
     "SearchBranchFailurePayload",
     "SearchBranchFailureRecord",
+    "SearchBudget",
+    "SearchBudgetUsage",
     "SearchCandidateRecord",
     "SearchCycleRecord",
     "SearchObservationContext",

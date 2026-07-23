@@ -21,13 +21,15 @@ Use literature RAG and the administrator-configured MCP tool for each stage as b
 
 | Stage | Stage MCP tool variable | Retrieve with RAG and configured MCP | Runtime authority |
 |---|---|---|---|
-| `generation_prior` | `MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR` | Reported phases, failed synthesis, composition ranges, stability constraints | MatterGen-supported condition allowlist plus deterministic Evidence Fusion controller |
-| `identity_novelty` | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` | Reported phases, crystallographic aliases, scoped database context | pymatgen `StructureMatcher`; configured Materials Project `find_structure` for external identity lookup |
-| `mlip_disagreement` | `MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT` | Model-domain limits, magnetic/charge-state caveats, relevant published calculations | Separate MatterSim and CHGNet sidecar results with explicit units and unit-normalized cross-model disagreement |
+| `generation_prior` | `MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR` | Reported phases, failed synthesis, composition ranges, stability constraints | Fixed official MatterGen checkpoint allowlist plus deterministic Evidence Fusion controller; a custom allowlist is operator attestation, not training-config verification |
+| `identity_novelty` | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` | Reported phases, crystallographic aliases, scoped database context | Non-symmetrized source-Niggli identity plus strict unscaled pymatgen `StructureMatcher`; Materials Project `find_structure` is only a prefilter whose returned structures require local strict recheck |
+| `mlip_disagreement` | `MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT` | Model-domain limits, magnetic/charge-state caveats, relevant published calculations | Separate MatterSim and CHGNet sidecar results with explicit units; cross-model energy evidence requires aligned same-composition relative energies, while raw absolute differences are audit-only |
 | `relaxation_validation` | `MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION` | Phase transformations, instability, pressure/temperature, relaxation and phonon context | Separate MatterSim and CHGNet `/v1/relax` payloads, optimizer convergence, and strict periodic geometry gates |
-| `dft_handoff` | `MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF` | Reference phases, magnetic order, functional/U, pseudopotential and convergence considerations | Actual `PeriodicDFTBackend` execution and its recorded inputs/outputs; require explicit pseudopotential and convergence review |
+| `dft_handoff` | `MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF` | Reference phases, magnetic order, functional/U, pseudopotential and convergence considerations | Actual executing `PeriodicDFTBackend`; completed results require input-manifest, method-policy, immutable output and convergence evidence, with reference-set/phonon fields when applicable |
 
 OpenAlex is appropriate for `generation_prior` and `identity_novelty`; use Crossref and arXiv for all five routes. Use the configured MCP tool only as another structured evidence provider. A literature provider or MCP response is never the runtime authority.
+
+RAG retrieves and closes scholarly evidence to records. The configured MCP tool is an evidence-provider interface, not an action validator. Do not use this evidence route to mutate a candidate, run a sidecar, relax a structure, submit DFT, or write an external database; invoke and attest the named runtime validator separately.
 
 ## Enforce MCP boundaries
 
@@ -42,10 +44,14 @@ OpenAlex is appropriate for `generation_prior` and `identity_novelty`; use Cross
 
 - Keep `property_score_created` fixed to `false` and `scientific_role` fixed to `search_and_validation_context_only`.
 - Treat absence from literature or Materials Project as unknown, not novel.
+- Keep the selector branch named `novelty` separate from scientific novelty: it is property-space diversity only. Structural/database novelty comes only from the staged assessor and remains scoped to recorded providers and snapshots.
+- Give `unknown`, skipped, failed, or partial external novelty no ranking credit. A DFT portfolio may reserve at most one slot for an otherwise eligible strict external scoped-no-match candidate; record that as a bounded prioritization rule, never a novelty proof.
+- Preserve the three duplicate boundaries: MatterGen strict tolerance-aware within-call and search-session checks happen before expert evaluation; the coordinator's exact attested-hash check is only a post-evaluation fallback; a final notebook grouping is a separate audit. Do not describe one boundary as if it performs all three.
 - Compare energies only within a reduced composition; never rank different stoichiometries by raw MLIP total energy.
 - Require explicit unit normalization before comparing MatterSim and CHGNet.
+- For the trusted default MatterSim/CHGNet panel, require bootstrap and launcher provenance to match the trusted manifest's exact HTTPS artifact size and SHA-256. The current defaults are MatterSim 5M `e3df9fa708725e3d453140646c7d1838324b347a3d1214cf1440522146f872b5` and CHGNet 0.3.0 `d14ab7c0f093efe64b60a7bcd540bca10e74fb7f46c86108a079af60524659d1`. Reject `managed-unattested:*`, changed bytes, and missing attestation instead of treating them as comparable expert evidence.
 - Separate execution success, optimizer convergence, structural validity, and scientific acceptance.
-- Keep CIF/POSCAR/Quantum ESPRESSO input generation distinct from an executed DFT result. Never claim a DFT value from a prepared input package.
+- Keep CIF/POSCAR/Quantum ESPRESSO input generation distinct from an executed DFT result. Never claim a DFT value from a prepared input package. A completed result must retain its input manifest, immutable output and convergence artifacts, method policy, explicit convergence, and any required reference-set or phonon provenance.
 - Escalate missing stress, failed relaxation, large model disagreement, structural collapse, or incomplete provenance instead of silently scoring it.
 
 ## Verify changes
