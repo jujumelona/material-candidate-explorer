@@ -61,6 +61,21 @@ The scientific choices and claim boundaries are mapped to primary sources in [Re
 - If FUSION_API_URL is unset, the deterministic local EvidenceDrivenFusionBackend is selected automatically.
 - Remote Fusion requests keep the legacy strict payload by default. Extended local search context requires FUSION_SEND_EXTENDED_REQUEST_CONTEXT=1.
 
+## Material Goal Discovery & Usage Guide
+
+Run natural-language material goal discovery from the command line:
+
+```bash
+discovery-os material-goal-run \
+  --goal "High ionic conductivity solid electrolyte candidate for all-solid-state lithium batteries" \
+  --export-markdown battery_electrolyte_report.md \
+  --export-json battery_electrolyte_report.json
+```
+
+This command automatically classifies the domain (`battery`), target application role (`solid_electrolyte`), executes 5-stage literature RAG (arXiv, CrossRef, OpenAlex) & MCP validation skills, performs multi-expert MLIP relaxations (MatterSim, CHGNet), checks external database novelty (OPTIMADE, COD, Materials Project), and generates a **standardized 7-section scientific candidate report** (`RichMaterialCandidateReport`).
+
+For detailed CLI option reference, Python API examples, and report section breakdowns, see [Material Goal Discovery Guide](docs/MATERIAL_GOAL_DISCOVERY_GUIDE.md).
+
 ## Interactive notebook
 
 - [Open the application-material recommender in Google Colab](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_APPLICATION_RECOMMENDER_T4.ipynb)

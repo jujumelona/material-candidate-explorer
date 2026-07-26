@@ -201,3 +201,18 @@ Credentials, private candidates, model weights, downloaded databases, and local 
 - Critical analysis of computational stability prediction: [Bartel et al.](https://doi.org/10.1038/s41524-020-00362-y)
 - Universal-MLIP softening during relaxation: [systematic study](https://doi.org/10.1038/s41524-024-01500-6)
 - Batch multi-objective Bayesian optimization: [qNEHVI](https://proceedings.neurips.cc/paper/2021/hash/11704817e347269b7254e744b5e22dac-Abstract.html)
+
+## 9. Natural-Language Goal Routing & Rich Candidate Reporting Foundations
+
+The `material-goal-run` execution pipeline implements an end-to-end framework translating unstructured natural-language requests into rigorous scientific candidate reports.
+
+### Primary Design Foundations:
+1. **Domain & Application Role Taxonomy**: Grounded in Ashby's systematic materials selection methodology ([Ashby 1989](https://doi.org/10.1179/mst.1989.5.6.517)), mapping requirements to role-scoped objective functions (e.g. ionic conductivity for solid electrolytes, overpotential for catalysts, critical temperature for superconductors).
+2. **5-Stage Literature RAG & MCP Protocol**: Implements multi-stage scholarly retrieval (arXiv, CrossRef, OpenAlex APIs) and standardized tool execution contracts (Model Context Protocol). Literature context is restricted to generation prior and evidence citation; it never fabricates numerical physical properties.
+3. **Structured 7-Section Reporting Contract (`RichMaterialCandidateReport`)**:
+   - **Identity**: Niggli identity hash, space group, cell dimensions, unscaled CIF (`StructureMatcher`).
+   - **MLIP Relaxation**: CHGNet 0.3.0 & MatterSim 5M geometry gate, stress gate validation, formation energy ($\Delta E_f$), hull distance ($\Delta E_{\text{hull}}$).
+   - **Reliability & Disagreement**: Energy disagreement ($\sigma_{\text{expert}}$), split-conformal coverage score, NSGA-II Pareto rank.
+   - **Database Novelty**: OPTIMADE, COD, and Materials Project unscaled structure prefiltering.
+   - **Downstream DFT Handoff**: Portable POSCAR / QE input skeletons with explicit k-point meshes and cutoffs ($E_{\text{cutwfc}}$, $E_{\text{cutrho}}$).
+
