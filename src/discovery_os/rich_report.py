@@ -51,10 +51,12 @@ SUPPORTED_MLIP_EXPERT_IDS: list[str] = [
     "uma_small",
 ]
 
-# Supported crystal generator IDs.
+# Supported crystal & molecular generator IDs.
 # MatterGen (Zeni et al., Nature 2025), DiffCSP++ (Jiao et al. 2024),
 # FlowMM (Miller et al., ICML 2024), CrystaLLM (LLM-based, 2024),
-# CDVAE (Xie et al., NeurIPS 2022), SCIGEN (Nat Mater 2025)
+# CDVAE (Xie et al., NeurIPS 2022), SCIGEN (Nat Mater 2025),
+# RFdiffusion3 (Baker Lab 2025/2026), ESM3 (Evolutionary Scale 2024),
+# MolMIM / BioNeMo (NVIDIA 2025), AlphaFold3 (DeepMind/Isomorphic 2024)
 SUPPORTED_GENERATOR_IDS: list[str] = [
     "mattergen",
     "diffcsp_pp",
@@ -62,6 +64,24 @@ SUPPORTED_GENERATOR_IDS: list[str] = [
     "crystalllm",
     "cdvae",
     "scigen",
+    "rfdiffusion3",
+    "esm3",
+    "molmim",
+    "bionemo_gen",
+    "alphafold3_binder",
+]
+
+# Supported scientific MCP (Model Context Protocol) agent frameworks.
+# Anthropic MCP v1 (2024/2026), ChemCrow (Bran et al. 2024),
+# Coscientist (Boiko et al. 2023/2024), TeLLAgent (2025),
+# ChatInvent (AstraZeneca 2025), DrugPilot (2025)
+SUPPORTED_MCP_AGENT_FRAMEWORKS: list[str] = [
+    "mcp_v1_standard",
+    "chemcrow_agent",
+    "coscientist_agent",
+    "tellagent_supervisor",
+    "chatinvent_agent",
+    "drugpilot_agent",
 ]
 
 
@@ -108,15 +128,40 @@ class StageLiteratureEvidenceSummary(StrictSchema):
     arxiv_ids: list[str] = Field(default_factory=list)
     evidence_claims_count: int = 0
     literature_confidence: Literal["supported", "partial", "unsupported"] = "supported"
+    # Extended Multi-Modal & Graph RAG Benchmarks (ChemRAG, BioRAG, GraphRAG)
+    rag_benchmark_provenance: str | None = None
+    graph_rag_entities_queried: int = 0
 
 
 class GeneratorProvenanceSummary(StrictSchema):
-    """Records which crystal generator produced this candidate."""
+    """Records which crystal or molecular generator produced this candidate."""
     generator_id: str = Field(default="mattergen")
     checkpoint_id: str = Field(default="mattergen_base")
     guidance_alpha: float | None = None
     conditions_applied: list[str] = Field(default_factory=list)
     conditions_ignored: list[str] = Field(default_factory=list)
+
+
+class MolecularDrugCandidateDetails(StrictSchema):
+    """Crystallographic & chemical identity details for small molecule or drug candidates."""
+    smiles: str | None = None
+    inchi_key: str | None = None
+    molecular_weight_g_per_mol: float | None = None
+    log_p: float | None = None
+    qed_drug_likeness: float | None = None  # Quantitative Estimate of Drug-likeness [0, 1]
+    synthetic_accessibility_score: float | None = None  # SA score [1, 10]
+    predicted_binding_affinity_kd_nm: float | None = None  # Kd / Ki in nM
+    target_protein_pdb_id: str | None = None
+    admet_gate_status: Literal["pass", "fail", "not_run"] = "not_run"
+
+
+class McpAgentExecutionProvenance(StrictSchema):
+    """Records Model Context Protocol (MCP) agent interactions, tool calls, and governance logs."""
+    agent_framework: str = Field(default="mcp_v1_standard")
+    tools_invoked: list[str] = Field(default_factory=list)
+    mcp_server_uris: list[str] = Field(default_factory=list)
+    governance_audit_logged: bool = True
+    robotic_lab_handoff_ready: bool = False
 
 
 class DftHandoffSpecSummary(StrictSchema):
@@ -148,6 +193,8 @@ class RichMaterialCandidateReport(StrictSchema):
     generator: GeneratorProvenanceSummary = Field(
         default_factory=GeneratorProvenanceSummary
     )
+    molecular_drug: MolecularDrugCandidateDetails | None = None
+    mcp_agent: McpAgentExecutionProvenance | None = None
     dft_handoff: DftHandoffSpecSummary
 
 
@@ -165,6 +212,8 @@ def build_rich_candidate_report(
     novelty: DatabaseNoveltyCheckSummary | None = None,
     literature: StageLiteratureEvidenceSummary | None = None,
     generator: GeneratorProvenanceSummary | None = None,
+    molecular_drug: MolecularDrugCandidateDetails | None = None,
+    mcp_agent: McpAgentExecutionProvenance | None = None,
     dft_handoff: DftHandoffSpecSummary | None = None,
 ) -> RichMaterialCandidateReport:
     """Constructs a complete, validated RichMaterialCandidateReport."""
@@ -199,6 +248,8 @@ def build_rich_candidate_report(
         novelty=novelty,
         literature=literature,
         generator=generator,
+        molecular_drug=molecular_drug,
+        mcp_agent=mcp_agent,
         dft_handoff=dft_handoff,
     )
 
@@ -301,6 +352,10 @@ def format_material_candidate_markdown_report(report: RichMaterialCandidateRepor
     lines.append(f"- **Executed RAG Stage Receipts**: {report.literature.stage_receipts_count} stages (`generation_prior`, `identity_novelty`, `mlip_disagreement`, `relaxation_validation`, `dft_handoff`)")
     lines.append(f"- **Evidence Claims Count**: {report.literature.evidence_claims_count}")
     lines.append(f"- **Literature Support Confidence**: `{report.literature.literature_confidence}`")
+    if report.literature.rag_benchmark_provenance:
+        lines.append(f"- **RAG Benchmark / Provenance**: `{report.literature.rag_benchmark_provenance}`")
+    if report.literature.graph_rag_entities_queried > 0:
+        lines.append(f"- **Graph RAG Entities Queried**: {report.literature.graph_rag_entities_queried}")
     lines.append("")
     if report.literature.citation_dois:
         lines.append("**DOI References**:")
@@ -327,7 +382,45 @@ def format_material_candidate_markdown_report(report: RichMaterialCandidateRepor
         lines.append(f"| **Conditions Ignored** | {', '.join(f'`{c}`' for c in report.generator.conditions_ignored)} |")
     lines.append("")
 
-    lines.append("## 7. Portable Downstream DFT Handoff Package")
+    if report.molecular_drug is not None:
+        lines.append("## 7. Molecular & Bio-Therapeutic Pharmacological Identity")
+        lines.append("")
+        lines.append("| Metric | Evaluated Value | Note / Standard |")
+        lines.append("| :--- | :--- | :--- |")
+        if report.molecular_drug.smiles:
+            lines.append(f"| **SMILES** | `{report.molecular_drug.smiles}` | Chemical Structure |")
+        if report.molecular_drug.inchi_key:
+            lines.append(f"| **InChIKey** | `{report.molecular_drug.inchi_key}` | Standard Identifier |")
+        if report.molecular_drug.molecular_weight_g_per_mol is not None:
+            lines.append(f"| **Molecular Weight** | `{report.molecular_drug.molecular_weight_g_per_mol:.2f} g/mol` | Lipinski Rule of 5 |")
+        if report.molecular_drug.log_p is not None:
+            lines.append(f"| **LogP (Lipophilicity)** | `{report.molecular_drug.log_p:.2f}` | Partition Coefficient |")
+        if report.molecular_drug.qed_drug_likeness is not None:
+            lines.append(f"| **QED Drug-Likeness** | `{report.molecular_drug.qed_drug_likeness:.3f}` | Bickerton et al. Score [0,1] |")
+        if report.molecular_drug.synthetic_accessibility_score is not None:
+            lines.append(f"| **Synthetic Accessibility (SA)** | `{report.molecular_drug.synthetic_accessibility_score:.2f}` | Ertl et al. Score [1,10] |")
+        if report.molecular_drug.predicted_binding_affinity_kd_nm is not None:
+            lines.append(f"| **Binding Affinity ($K_d / K_i$)** | `{report.molecular_drug.predicted_binding_affinity_kd_nm:.2f} nM` | Target Interaction |")
+        if report.molecular_drug.target_protein_pdb_id:
+            lines.append(f"| **Target Protein PDB** | `{report.molecular_drug.target_protein_pdb_id}` | Macromolecular Target |")
+        lines.append(f"| **ADMET Gate Status** | `{report.molecular_drug.admet_gate_status}` | Toxicity & Pharmacokinetics |")
+        lines.append("")
+
+    if report.mcp_agent is not None:
+        lines.append("## 8. Model Context Protocol (MCP) Scientific Agent Session")
+        lines.append("")
+        lines.append("| Audit Metric | Details |")
+        lines.append("| :--- | :--- |")
+        lines.append(f"| **Agent Framework** | `{report.mcp_agent.agent_framework}` |")
+        if report.mcp_agent.tools_invoked:
+            lines.append(f"| **Tools Invoked** | {', '.join(f'`{t}`' for t in report.mcp_agent.tools_invoked)} |")
+        if report.mcp_agent.mcp_server_uris:
+            lines.append(f"| **MCP Server URIs** | {', '.join(f'`{u}`' for u in report.mcp_agent.mcp_server_uris)} |")
+        lines.append(f"| **Governance Audit Logged** | `{'Yes' if report.mcp_agent.governance_audit_logged else 'No'}` |")
+        lines.append(f"| **Robotic Lab Handoff Ready** | `{'Yes' if report.mcp_agent.robotic_lab_handoff_ready else 'No'}` |")
+        lines.append("")
+
+    lines.append("## 9. Portable Downstream DFT / Simulation Handoff Package")
     lines.append("")
     lines.append("| DFT Requirement | Parameter / Specification |")
     lines.append("| :--- | :--- |")

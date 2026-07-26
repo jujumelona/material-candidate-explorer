@@ -289,3 +289,48 @@ Critical note on GNoME novelty: Cheetham & Seshadri (Chem. Mater. 2024) argue ma
 
 The `DftHandoffSpecSummary.workflow_engine` field records which automated workflow system (if any) should receive the generated POSCAR and input skeleton for execution.
 
+## 11. Drug Discovery, Bio-molecular Generation, Scientific MCP Agents & Multi-modal RAG Landscape (2024–2026 Survey)
+
+This section documents the research landscape across de novo drug design, bio-molecular generation models, Model Context Protocol (MCP) scientific agents, and specialized domain RAG frameworks.
+
+### 11.1 De Novo Drug Design & Biomolecular Generative Models
+
+| Model / System | Reference | Key Contribution | Pipeline Relevance |
+| :--- | :--- | :--- | :--- |
+| **RFdiffusion3 (RFD3)** | Baker Lab 2025/2026 | All-atom diffusion generating protein structures in non-protein atom contexts (ligands, nucleic acids) | Supported generator (`rfdiffusion3`) |
+| **AlphaFold3** | DeepMind / Isomorphic 2024–2026 | Joint structure prediction of protein-ligand, protein-DNA, and complex assemblies | Validation backend (`alphafold3_binder`) |
+| **ESM3** | Evolutionary Scale 2024 | Multimodal generative language model reasoning over protein sequence, structure, and function | Supported generator (`esm3`) |
+| **BioNeMo / MolMIM** | NVIDIA 2024–2025 | Microservice platform & controlled molecular generative models with property optimization | Supported generator (`molmim`, `bionemo_gen`) |
+| **BADGER / BINDDM** | 2025 | Binding-affinity guidance for diffusion models; explicit $K_d$/$K_i$ optimization | Design reference for affinity steering |
+
+### 11.2 Model Context Protocol (MCP) & Scientific Autonomous Agents
+
+| Agent / Framework | Reference | Key Contribution | Pipeline Integration |
+| :--- | :--- | :--- | :--- |
+| **Anthropic MCP Standard** | Agentic AI Foundation / Linux Foundation 2024–2026 | Open "USB-C for AI" standard connecting LLMs to lab robotics (Opentrons), ELNs, and DBs | Core protocol (`mcp_v1_standard`) |
+| **ChemCrow** | Bran et al., Nat. Mach. Intell. 2024 | Chemistry-augmented LLM agent orchestrating synthesis planning & safety checking | Supported agent (`chemcrow_agent`) |
+| **Coscientist** | Boiko et al., Nature 2023–2024 | Autonomous multi-agent system executing real-world chemical synthesis via lab robotics | Supported agent (`coscientist_agent`) |
+| **TeLLAgent** | 2025 | Supervisor-executor dual agent framework separating strategic reasoning from tool execution | Supported agent (`tellagent_supervisor`) |
+| **ChatInvent** | AstraZeneca 2025 | Enterprise agentic molecular design system integrated into build-measure-learn loops | Supported agent (`chatinvent_agent`) |
+| **DrugPilot** | 2025 | Parameterized reasoning agent for automated lead optimization | Supported agent (`drugpilot_agent`) |
+
+### 11.3 Domain-Specific RAG Benchmarks & Knowledge Graphs (BioRAG, ChemRAG, PharmRAG)
+
+| Framework / Benchmark | Reference | Key Contribution | Pipeline Integration |
+| :--- | :--- | :--- | :--- |
+| **ChemRAG / ChemRAG-Bench** | 2025/2026 | Benchmark & retrieval toolkit over PubChem, PubMed, and chemistry literature | Literature RAG benchmark provenance |
+| **CLADD** | 2026 | RAG-empowered collaborative LLM agents querying biomedical databases without fine-tuning | Agentic RAG reference |
+| **Graph RAG / BioGraph** | NeurIPS 2024–2025 | Knowledge graph traversal over drug-target-pathway-disease networks | `graph_rag_entities_queried` tracking |
+| **MolRAG** | ACL 2025 | Analogical molecule retrieval for chain-of-thought property prediction | Structure-analog retrieval reference |
+
+### 11.4 Pharmacological & ADMET Screening Gates
+
+For small molecule and bio-therapeutic discovery goals, candidate validation enforces standardized pharmacological metrics:
+- **QED (Quantitative Estimate of Drug-likeness)**: Bickerton et al. score in $[0, 1]$.
+- **Synthetic Accessibility (SA)**: Ertl et al. score in $[1, 10]$ where $\le 6$ indicates synthetic feasibility.
+- **Lipinski Rule of 5**: Molecular Weight $\le 500$ g/mol, $\text{LogP} \le 5$, H-bond donors $\le 5$, H-bond acceptors $\le 10$.
+- **Predicted Binding Affinity ($K_d / K_i$)**: Target interaction potency in nM.
+- **ADMET Gate**: ADMETox prediction gate (absorption, distribution, metabolism, excretion, toxicity).
+
+
+

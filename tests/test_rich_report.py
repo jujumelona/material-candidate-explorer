@@ -12,10 +12,13 @@ from discovery_os.rich_report import (
     DftHandoffSpecSummary,
     EvaluatedPropertiesSummary,
     GeneratorProvenanceSummary,
+    McpAgentExecutionProvenance,
     MlipExpertResult,
+    MolecularDrugCandidateDetails,
     MultiExpertReliabilitySummary,
     RichMaterialCandidateReport,
     SUPPORTED_GENERATOR_IDS,
+    SUPPORTED_MCP_AGENT_FRAMEWORKS,
     SUPPORTED_MLIP_EXPERT_IDS,
     StageLiteratureEvidenceSummary,
     build_rich_candidate_report,
@@ -165,7 +168,20 @@ def test_supported_ids_lists() -> None:
     assert "crystalllm" in SUPPORTED_GENERATOR_IDS
     assert "cdvae" in SUPPORTED_GENERATOR_IDS
     assert "scigen" in SUPPORTED_GENERATOR_IDS
-    assert len(SUPPORTED_GENERATOR_IDS) == 6
+    assert "rfdiffusion3" in SUPPORTED_GENERATOR_IDS
+    assert "esm3" in SUPPORTED_GENERATOR_IDS
+    assert "molmim" in SUPPORTED_GENERATOR_IDS
+    assert "bionemo_gen" in SUPPORTED_GENERATOR_IDS
+    assert "alphafold3_binder" in SUPPORTED_GENERATOR_IDS
+    assert len(SUPPORTED_GENERATOR_IDS) == 11
+
+    assert "mcp_v1_standard" in SUPPORTED_MCP_AGENT_FRAMEWORKS
+    assert "chemcrow_agent" in SUPPORTED_MCP_AGENT_FRAMEWORKS
+    assert "coscientist_agent" in SUPPORTED_MCP_AGENT_FRAMEWORKS
+    assert "tellagent_supervisor" in SUPPORTED_MCP_AGENT_FRAMEWORKS
+    assert "chatinvent_agent" in SUPPORTED_MCP_AGENT_FRAMEWORKS
+    assert "drugpilot_agent" in SUPPORTED_MCP_AGENT_FRAMEWORKS
+    assert len(SUPPORTED_MCP_AGENT_FRAMEWORKS) == 6
 
 
 def test_mlip_expert_result_schema() -> None:
@@ -281,4 +297,53 @@ def test_rich_report_with_extended_fields_and_markdown() -> None:
     assert "atomate2" in md
     # Section numbering updated
     assert "## 6. Generator Provenance" in md
-    assert "## 7. Portable Downstream DFT Handoff" in md
+    assert "## 9. Portable Downstream DFT" in md
+
+
+def test_molecular_drug_and_mcp_agent_report_rendering() -> None:
+    """Verify drug candidate details and MCP agent sessions render cleanly in markdown."""
+    report = build_rich_candidate_report(
+        report_id="DRUG-MCP-001",
+        user_goal="Discover novel small molecule inhibitor for SARS-CoV-2 main protease",
+        domain="pharmaceutical",
+        target_role="small_molecule_inhibitor",
+        candidate_id="CAND-DRUG-99",
+        formula="C21H23N5O4",
+        generator=GeneratorProvenanceSummary(
+            generator_id="rfdiffusion3",
+            checkpoint_id="rfd3_all_atom_v1",
+        ),
+        molecular_drug=MolecularDrugCandidateDetails(
+            smiles="CC(C)CC(NC(=O)C(F)(F)F)C(=O)NC(Cc1ccccc1)C=O",
+            inchi_key="InChIKey=XYZ123456789",
+            molecular_weight_g_per_mol=425.45,
+            log_p=2.35,
+            qed_drug_likeness=0.82,
+            synthetic_accessibility_score=3.2,
+            predicted_binding_affinity_kd_nm=12.5,
+            target_protein_pdb_id="7TLL",
+            admet_gate_status="pass",
+        ),
+        mcp_agent=McpAgentExecutionProvenance(
+            agent_framework="chemcrow_agent",
+            tools_invoked=["pubchem_lookup", "rdkit_sa_score", "opentrons_liquid_handler"],
+            mcp_server_uris=["mcp://chem.lab.internal/v1"],
+            governance_audit_logged=True,
+            robotic_lab_handoff_ready=True,
+        ),
+    )
+
+    assert report.molecular_drug is not None
+    assert report.molecular_drug.qed_drug_likeness == pytest.approx(0.82)
+    assert report.mcp_agent is not None
+    assert report.mcp_agent.agent_framework == "chemcrow_agent"
+
+    md = format_material_candidate_markdown_report(report)
+    assert "Molecular & Bio-Therapeutic Pharmacological Identity" in md
+    assert "CC(C)CC(NC(=O)C(F)(F)F)C(=O)NC(Cc1ccccc1)C=O" in md
+    assert "7TLL" in md
+    assert "0.820" in md
+    assert "Model Context Protocol (MCP) Scientific Agent Session" in md
+    assert "chemcrow_agent" in md
+    assert "opentrons_liquid_handler" in md
+    assert "mcp://chem.lab.internal/v1" in md
