@@ -1,10 +1,17 @@
 # Research foundations and scientific claim boundaries
 
-This document maps the implemented material-candidate workflow to primary literature and official model or database documentation. The software is a screening and orchestration system: it generates hypotheses, preserves evidence and provenance, and prepares expensive validation. It does not establish synthesis, novelty, thermodynamic stability, superconductivity, medical efficacy, or any other experimental claim.
+This is a bibliography and claim-boundary document, not a feature inventory.
+It maps repository contracts to primary literature and official model or
+database documentation. A citation does not mean that the cited model,
+database, calculation, or experiment is bundled, configured, or executed. The
+software is a screening and orchestration system: it generates hypotheses,
+preserves evidence and provenance, and prepares expensive validation. It does
+not establish synthesis, novelty, thermodynamic stability, superconductivity,
+medical efficacy, or any other experimental claim.
 
-## What the pipeline implements
+## Repository contracts and their design sources
 
-| Pipeline decision | Implemented contract | Research or official source |
+| Pipeline decision | Repository contract | Research or official source |
 |---|---|---|
 | Conditional crystal generation | Use the fixed condition allowlist for a named official MatterGen checkpoint; treat any custom-checkpoint allowlist as operator attestation, not automatic training-config verification; record requested, applied, and ignored controls separately | [MatterGen paper](https://www.nature.com/articles/s41586-025-08628-5), [official repository](https://github.com/microsoft/mattergen), [official model card](https://github.com/microsoft/mattergen/blob/main/MODEL_CARD.md) |
 | Crystal identity | Hard-delete only a strict, species-preserving, unscaled crystallographic duplicate; retain volume-scaled prototype similarity as a separate relation | [pymatgen `StructureMatcher`](https://pymatgen.org/pymatgen.core.html#pymatgen.core.structure_matcher.StructureMatcher), [AFLOW-XtalFinder](https://www.nature.com/articles/s41524-020-00483-4) |
@@ -14,6 +21,7 @@ This document maps the implemented material-candidate workflow to primary litera
 | Benchmark interpretation | Treat benchmark performance as evidence about a fixed dataset and task, not a universal guarantee for a new chemistry | [Matbench Discovery](https://doi.org/10.1038/s42256-025-01055-1), [benchmark repository](https://github.com/janosh/matbench-discovery) |
 | DFT handoff | Prepare reviewable structures and input skeletons while leaving cutoffs, pseudopotentials, convergence, reference phases, and execution explicit | [Quantum ESPRESSO `pw.x` input reference](https://www.quantum-espresso.org/Doc/INPUT_PW.html), [SSSP](https://www.nature.com/articles/s41524-018-0127-2), [DFT reproducibility study](https://doi.org/10.1126/science.aad3000) |
 | Literature and MCP context | Route five narrow evidence questions to scholarly retrieval and an optional administrator-configured MCP tool; never replace the stage validator | [Crossref REST API](https://www.crossref.org/documentation/retrieve-metadata/rest-api/), [arXiv API](https://info.arxiv.org/help/api/user-manual.html), [OpenAlex API](https://developers.openalex.org/) |
+| Application-driven selection | Compile a broad question into function roles, conditions, hard constraints, and objectives; compare candidates only inside one role and exact condition group | [Ashby systematic materials selection](https://doi.org/10.1179/mst.1989.5.6.517), [NIST FET benchmarking guidance](https://www.nist.gov/publications/how-report-and-benchmark-emerging-field-effect-transistors), [OPTIMADE specification](https://www.optimade.org/specification/latest/) |
 
 The code also leaves room for alternative or complementary generators such as [DiffCSP](https://proceedings.neurips.cc/paper_files/paper/2023/hash/38b787fc530d0b31825827e2cc306656-Abstract-Conference.html), [FlowMM](https://proceedings.mlr.press/v235/miller24a.html), and [SCIGEN](https://www.nature.com/articles/s41563-025-02355-y). They are research references, not bundled or silently selected runtime backends. Raw sample count is never reported as discovery success: the pipeline retains the generation, parsing, applicability, identity, geometry, MLIP, relaxation, and ranking funnel. [LeMat-GenBench](https://arxiv.org/abs/2512.04562) reports that no evaluated generator dominates stability, novelty, and diversity together and documents trade-offs among them. That evidence supports keeping stability, Pareto objectives, property-space diversity, and externally scoped structural novelty as separate signals instead of collapsing them into one score. It does not validate any candidate from this repository.
 
@@ -110,7 +118,55 @@ RAG and an optional MCP source provide stage-specific context only. They do not 
 
 Each stage selects only its administrator-configured tool name and verifies the bounded MCP `tools/list` and schema contract. Prompts, model output, and retrieved records cannot choose an endpoint or tool. Failed, skipped, empty, or invalid sources remain unknown. Only a source-closed `generation_prior` branch may influence generation; later-stage evidence can recommend checks but cannot steer the generator. See [Stage-specific validation evidence](STAGE_VALIDATION_EVIDENCE.md) and [MCP evidence sources](MCP_RAG.md).
 
-## 7. Multi-round search and Colab budget
+## 7. Application-driven material selection
+
+The application front end does not turn an open-ended prompt directly into a
+material score. It compiles the prompt into a code-owned selection problem:
+
+```text
+field -> component/function role -> operating conditions
+-> hard constraints and objectives -> candidate-family retrieval
+-> condition-complete observations -> robust Pareto portfolio
+```
+
+This follows the function, constraints, objectives, and free-variable
+separation used in systematic material selection. A broad request produces
+several role portfolios; a battery positive electrode is not cross-ranked
+against its negative electrode or electrolyte, just as a semiconductor gate
+dielectric is not cross-ranked against a contact or thermal spreader.
+
+The optional main model may propose only allowlisted fields and roles and must
+cite literal spans from the input. Code verifies those spans and owns the
+schemas, units, validators, endpoints, MCP tools, hard gates, and ranking. A
+model confidence value is routing metadata, not material-property uncertainty.
+
+Literature NLP can retrieve material names, property reports, synthesis
+conditions, and failure evidence at useful scale
+([Tshitoyan et al.](https://www.nature.com/articles/s41586-019-1335-8),
+[MatScholar](https://www.osti.gov/pages/biblio/1581363), and
+[LLM polymer-property extraction](https://www.nature.com/articles/s43246-024-00708-9)).
+Those studies motivate source-grounded retrieval, not automatic acceptance of
+an extracted number. The implementation therefore requires an exact source
+record and keeps unit, method, sample, and operating conditions attached.
+Conflicting reports remain conflicting; no citation count or RAG record count
+becomes performance credit.
+
+Candidate-family seeds are retrieval queries, not recommendations. Retrieved
+or user-supplied candidates become comparable only after a role-named
+validator returns the exact unit and complete condition signature. Missing,
+failed, wrong-unit, wrong-condition, or wrong-validator evidence remains
+unknown or incomparable. Hard gates use the entire uncertainty interval.
+Robust Pareto dominance requires one candidate's worst bound to be no worse
+than another candidate's best bound on every objective, with a strict
+improvement on at least one. Any optional scalar score requires explicit
+operator or source-closed weights and is labelled as pool-relative decision
+support, never a probability or a cross-role truth.
+
+See [Application-driven material decisions](APPLICATION_MATERIAL_DECISIONS.md)
+for the field/role registry, JSON contracts, notebook, evidence tasks, and
+output interpretation.
+
+## 8. Multi-round search and Colab budget
 
 The T4 notebook uses the same `fusion-search` engine as the CLI. It is a true closed screening loop:
 

@@ -436,7 +436,7 @@ class RankedSearchCandidate(StrictSchema):
     priority_score: float = Field(ge=0.0, le=1.0)
     pareto_member: bool
     branch_ranks: dict[str, int]
-    branch_scores: dict[str, float]
+    branch_scores: dict[str, float | None]
     expert_property_vectors: dict[str, list[DiagnosticProperty]]
     mean_reported_uncertainty: float | None = Field(default=None, ge=0.0)
     max_reported_uncertainty: float | None = Field(default=None, ge=0.0)
@@ -2269,7 +2269,7 @@ def _ranked_candidate_results(
             latest_by_ref[key] = record
 
     branch_ranks: dict[str, dict[str, int]] = {}
-    branch_scores: dict[str, dict[str, float]] = {}
+    branch_scores: dict[str, dict[str, float | None]] = {}
     expert_vectors: dict[str, dict[str, list[DiagnosticProperty]]] = {}
     for branch_result in selection.branches:
         branch_name = str(branch_result.branch)
@@ -2297,9 +2297,11 @@ def _ranked_candidate_results(
     rows = []
     for key, ranks in branch_ranks.items():
         record = latest_by_ref[key]
+        branch_score_map = branch_scores[key]
         raw = fsum(
             _RANK_BRANCH_WEIGHTS[name] / (reciprocal_k + rank)
             for name, rank in ranks.items()
+            if branch_score_map.get(name) is not None
         )
         priority = 0.0 if maximum <= 0.0 else min(1.0, raw / maximum)
         vectors = expert_vectors[key]
@@ -2309,7 +2311,9 @@ def _ranked_candidate_results(
             for prop in properties
             if prop.uncertainty is not None
         ]
-        branch_score_map = branch_scores[key]
+        disagreement_score = branch_score_map.get(
+            ExplorationBranch.EXPERT_DISAGREEMENT.value
+        )
         rows.append(
             {
                 "key": key,
@@ -2323,11 +2327,10 @@ def _ranked_candidate_results(
                     fsum(uncertainties) / len(uncertainties) if uncertainties else None
                 ),
                 "max_uncertainty": max(uncertainties) if uncertainties else None,
-                "disagreement": max(
-                    0.0,
-                    branch_score_map.get(
-                        ExplorationBranch.EXPERT_DISAGREEMENT.value, 0.0
-                    ),
+                "disagreement": (
+                    max(0.0, disagreement_score)
+                    if disagreement_score is not None
+                    else 0.0
                 ),
             }
         )
@@ -2357,6 +2360,17 @@ def _ranked_candidate_results(
             "Unified priority uses weighted reciprocal branch ranks; raw scientific values are not averaged.",
             "Candidate entered branches: " + ", ".join(branch_names),
         ]
+        unknown_score_branches = [
+            name
+            for name in branch_names
+            if item["scores"].get(name) is None
+        ]
+        if unknown_score_branches:
+            rationale.append(
+                "Unknown branch scores were preserved as null and contributed no "
+                "reciprocal-rank priority: "
+                + ", ".join(unknown_score_branches)
+            )
         if item["pareto"]:
             rationale.append("Candidate is non-dominated in the final expert objective panel.")
         if item["disagreement"] > 0.0:

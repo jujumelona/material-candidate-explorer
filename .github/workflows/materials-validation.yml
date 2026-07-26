@@ -57,20 +57,33 @@ jobs:
             tests/test_generator_sidecar_contract.py \
             tests/test_validation_evidence.py \
             tests/test_mcp_client.py \
+            tests/test_material_application_decision.py \
+            tests/test_material_application_multidomain_routing.py \
+            tests/test_material_application_stage_rag.py \
+            tests/test_material_recommendation_fail_closed.py \
+            tests/test_material_search_bridge.py \
+            tests/test_role_specific_application_criteria.py \
+            tests/test_application_notebook_contract.py \
+            tests/test_material_application_docs_contract.py \
             tests/test_t4_notebook_contract.py
 
-      - name: Confirm notebook is clean JSON with compilable code cells
+      - name: Confirm notebooks are clean JSON with compilable code cells
         shell: python
         run: |
           import json
           from pathlib import Path
 
-          path = Path("MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb")
-          notebook = json.loads(path.read_text(encoding="utf-8"))
-          for index, cell in enumerate(notebook.get("cells", [])):
-              if cell.get("cell_type") != "code":
-                  continue
-              if cell.get("execution_count") is not None or cell.get("outputs"):
-                  raise SystemExit(f"notebook code cell {index} contains saved runtime output")
-              source = "".join(cell.get("source", []))
-              compile(source, f"{path}:cell-{index}", "exec")
+          for path in (
+              Path("MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb"),
+              Path("MATERIAL_APPLICATION_RECOMMENDER_T4.ipynb"),
+          ):
+              notebook = json.loads(path.read_text(encoding="utf-8"))
+              for index, cell in enumerate(notebook.get("cells", [])):
+                  if cell.get("cell_type") != "code":
+                      continue
+                  if cell.get("execution_count") is not None or cell.get("outputs"):
+                      raise SystemExit(
+                          f"notebook code cell {path}:{index} contains saved runtime output"
+                      )
+                  source = "".join(cell.get("source", []))
+                  compile(source, f"{path}:cell-{index}", "exec")

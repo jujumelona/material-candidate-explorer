@@ -19,6 +19,18 @@ Each profile fixes:
 - authoritative numerical or experimental validators;
 - an explicit boundary on the scientific claim.
 
+For broad questions that do not yet name a crystal target, the application
+layer in
+[`src/discovery_os/material_applications.py`](../src/discovery_os/material_applications.py)
+first decomposes the selected field into component/function roles. For
+example, it keeps a battery positive electrode, negative electrode, and
+solid-electrolyte interface as separate selection problems. The same rule
+applies to every field; semiconductor roles are examples, not a privileged
+special case. See
+[Application-driven material decisions](APPLICATION_MATERIAL_DECISIONS.md)
+for the complete role registry, exact-condition comparison contract, notebook,
+and output schema.
+
 ## Resolve the field first
 
 List every code-owned profile:
@@ -407,66 +419,11 @@ humidity, and activation state.
   `required_for_field_claim` have authoritative, condition-complete results and
   the profile's experimental boundary is stated.
 
-## Research basis and official implementations
+## External design references
 
-These sources ground the route design; they are not imported as numerical
-results:
-
-- General generation and stability: [MatterGen, Nature
-  (2025)](https://www.nature.com/articles/s41586-025-08628-5),
-  [Materials Project phase-diagram
-  documentation](https://docs.materialsproject.org/methodology/materials-methodology/thermodynamic-stability/phase-diagrams-pds),
-  and [Quantum ESPRESSO `pw.x`
-  inputs](https://www.quantum-espresso.org/Doc/INPUT_PW.html).
-- Battery electrodes: [Materials Project Battery Explorer
-  tutorial](https://docs.materialsproject.org/apps/explorer-apps/battery-explorer/tutorial)
-  and [pymatgen battery
-  analysis](https://pymatgen.org/pymatgen.analysis.battery.html).
-- Solid electrolytes: [Famprikis et al., Nature Materials
-  (2019)](https://www.nature.com/articles/s41563-019-0431-3) and
-  [Zhao et al., Nature Reviews Materials
-  (2020)](https://www.nature.com/articles/s41578-019-0165-5).
-- Superconductors: [EPW official
-  documentation](https://docs.epw-code.org/), [EPW method
-  paper](https://doi.org/10.1016/j.cpc.2016.07.028), and
-  [Allen-Dynes strong-coupling
-  analysis](https://journals.aps.org/prb/abstract/10.1103/PhysRevB.12.905).
-- Catalysts: [OC20, ACS Catalysis
-  (2021)](https://pubs.acs.org/doi/10.1021/acscatal.0c04525),
-  [OC22, ACS Catalysis
-  (2023)](https://pubs.acs.org/doi/10.1021/acscatal.2c05426), and
-  [CatMAP](https://doi.org/10.1002/cctc.201300825).
-- Semiconductors: [Materials Project electronic-structure
-  methodology](https://docs.materialsproject.org/methodology/materials-methodology/electronic-structure)
-  and [AMSET first-principles scattering and
-  transport](https://www.nature.com/articles/s41524-021-00529-1).
-- Photovoltaics: [Yu and Zunger's SLME
-  paper](https://journals.aps.org/prl/abstract/10.1103/PhysRevLett.108.068701).
-- Thermoelectrics: [BoltzTraP2](https://doi.org/10.1016/j.cpc.2018.05.010),
-  [phono3py](https://phonopy.github.io/phono3py/), and
-  [ShengBTE](https://doi.org/10.1016/j.cpc.2014.02.015).
-- Magnetic materials: [Materials Project magnetic-property
-  methodology](https://docs.materialsproject.org/methodology/materials-methodology/magnetic-properties)
-  and [pymatgen magnetic-order
-  analysis](https://pymatgen.org/pymatgen.analysis.magnetism.html).
-- Ferroelectrics and piezoelectrics: [modern polarization
-  theory](https://journals.aps.org/rmp/abstract/10.1103/RevModPhys.66.899)
-  and [Materials Project piezoelectric
-  methodology](https://docs.materialsproject.org/methodology/materials-methodology/piezoelectric-constants).
-- Structural alloys: [pycalphad](https://pycalphad.org/docs/latest/),
-  [OpenCalphad](https://www.nist.gov/publications/open-calphad-free-thermodynamic-software),
-  and [Materials Project elasticity
-  methodology](https://docs.materialsproject.org/methodology/materials-methodology/elasticity).
-- Porous frameworks: [CoRE MOF
-  2019](https://pubs.acs.org/doi/10.1021/acs.jced.9b00835),
-  [RASPA](https://www.tandfonline.com/doi/full/10.1080/08927022.2015.1010082),
-  and [Zeo++](https://pubs.acs.org/doi/10.1021/acs.chemmater.7b01475).
-- Evidence and interoperability: [OPTIMADE
-  specification](https://www.optimade.org/optimade/),
-  [Materials Project API](https://materialsproject.github.io/api/),
-  [AiiDA provenance](https://www.aiida.net/), and the
-  [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25).
-
-Use the sources to choose hypotheses, boundary conditions, convergence studies,
-and experiments. Preserve the raw runtime outputs that actually determine a
-candidate's scientific status.
+The bibliography and the mapping from code contracts to their design sources
+live in [Research foundations](RESEARCH_FOUNDATIONS.md). Those papers,
+databases, model cards, and software manuals are not repository capabilities
+and are not evidence that a named calculation or experiment ran. The
+executable profiles, runtime receipts, raw validator outputs, and tests are the
+only implementation evidence used by this workflow.

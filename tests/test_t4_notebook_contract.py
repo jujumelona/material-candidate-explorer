@@ -34,6 +34,22 @@ def test_t4_notebook_is_clean_and_compilable() -> None:
             compile(source, f"{NOTEBOOK.name}:cell-{index}", "exec")
 
 
+def test_t4_notebook_does_not_claim_unexecuted_authorities_ran() -> None:
+    source = "\n".join(
+        "".join(cell["source"]) for cell in _load_notebook()["cells"]
+    )
+
+    assert "and the stage's real runtime authority" not in source
+    assert (
+        "records whether the stage's named runtime authority actually ran"
+        in source
+    )
+    assert (
+        "absent, skipped, failed, or input-only authorities remain `unknown`"
+        in source
+    )
+
+
 def test_t4_notebook_preserves_the_material_screening_contract() -> None:
     notebook = _load_notebook()
     source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
@@ -310,9 +326,11 @@ def test_t4_notebook_routes_one_audited_material_field_fail_closed() -> None:
         "GENERIC_T4_FIELD_PROPERTY_BOUNDARY",
     ):
         assert contract in source
+    # Five stage-evidence checkpoints use the resolved field. The sixth use is
+    # the persisted application brief, which does not execute or rank candidates.
     assert source.count(
         "material_field=domain_plan.profile.material_field"
-    ) == 5
+    ) == 6
     assert source.count(
         "application_subtype=domain_plan.resolution.application_subtype"
     ) == 5
@@ -323,6 +341,39 @@ def test_t4_notebook_routes_one_audited_material_field_fail_closed() -> None:
     assert source.index(
         "domain_plan = build_material_domain_plan("
     ) < source.index("draft_parent = Candidate(")
+
+
+def test_t4_notebook_persists_an_application_brief_without_cross_role_ranking() -> None:
+    notebook = _load_notebook()
+    source = "\n".join("".join(cell["source"]) for cell in notebook["cells"])
+
+    for contract in (
+        "from discovery_os.material_applications import "
+        "build_material_application_brief",
+        "application_brief = build_material_application_brief(",
+        "material_field=domain_plan.profile.material_field",
+        "chemical_system=chemical_system",
+        "problem_context=material_problem_context",
+        'APPLICATION_BRIEF_PATH = RUN_ROOT / "material-application-brief.json"',
+        "application_brief.model_dump_json(indent=2)",
+        '"application_brief_id": application_brief.brief_id',
+        '"application_question_kind": application_brief.question_kind',
+        '"application_role_ids": [item.role_id for item in application_brief.roles]',
+        '"application_cross_role_ranking_allowed": '
+        "application_brief.cross_role_ranking_allowed",
+        "Use MATERIAL_APPLICATION_RECOMMENDER_T4.ipynb for broad component maps",
+        "this notebook remains the real 8-32 bulk-crystal generation and MLIP triage path",
+    ):
+        assert contract in source
+
+    assert source.index("domain_plan = build_material_domain_plan(") < source.index(
+        "application_brief = build_material_application_brief("
+    )
+    assert source.index(
+        "application_brief = build_material_application_brief("
+    ) < source.index("draft_parent = Candidate(")
+    assert "MaterialDecisionRunner" not in source
+    assert "rank_material_application_candidates" not in source
 
 
 def test_t4_notebook_uses_one_global_adaptive_fusion_search() -> None:

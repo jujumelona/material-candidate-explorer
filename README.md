@@ -1,6 +1,6 @@
 # Material Candidate Explorer
 
-[![Run T4 Discovery in Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb) [![View T4 Notebook](https://img.shields.io/badge/T4%20Discovery-GitHub-181717?logo=github)](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb) [![Materials validation](https://github.com/jujumelona/material-candidate-explorer/actions/workflows/materials-validation.yml/badge.svg)](https://github.com/jujumelona/material-candidate-explorer/actions/workflows/materials-validation.yml)
+[![Ask a material application question in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_APPLICATION_RECOMMENDER_T4.ipynb) [![Run T4 crystal discovery in Colab](https://img.shields.io/badge/Colab-T4%20Crystal%20Discovery-F9AB00?logo=googlecolab)](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb) [![Materials validation](https://github.com/jujumelona/material-candidate-explorer/actions/workflows/materials-validation.yml/badge.svg)](https://github.com/jujumelona/material-candidate-explorer/actions/workflows/materials-validation.yml)
 
 Material Candidate Explorer is a model-agnostic orchestration engine for exploring and prioritizing material candidates across chemistry, crystal materials, superconductors, batteries, catalysts, polymers, and medicinal chemistry.
 
@@ -63,11 +63,39 @@ The scientific choices and claim boundaries are mapped to primary sources in [Re
 
 ## Interactive notebook
 
+- [Open the application-material recommender in Google Colab](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_APPLICATION_RECOMMENDER_T4.ipynb)
+- [View the application-material recommender on GitHub](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_APPLICATION_RECOMMENDER_T4.ipynb)
 - [View the T4 material-discovery notebook on GitHub](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb)
 - [Open the T4 material-discovery notebook in Google Colab](https://colab.research.google.com/github/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb)
 - [View the legacy adaptive-loop notebook](https://github.com/jujumelona/material-candidate-explorer/blob/main/MATERIAL_CANDIDATE_EXPLORER_V11_PROMPT_RAG_REAL_GENERATION.ipynb)
 
-`MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb` is the recommended material-candidate workflow. It runs a budgeted, multi-round `fusion-search`: the MatterGen sidecar performs raw-geometry, tolerance-aware within-call and search-session duplicate rejection before MatterSim and CHGNet evaluation; evaluated candidates are then inserted into persistent evidence and branch pools and used to schedule the next round. The coordinator's attested-hash check is a defensive post-evaluation fallback, not a replacement for `StructureMatcher`. Global generator-call and generated-candidate limits cover every round, branch, frontier, and control variant. A MAXIMUM run does not fabricate candidates or silently accept a shortfall: rejection, sidecar failure, deduplication, or frontier exhaustion is preserved in the funnel and the notebook fails closed if it cannot establish the requested 8-32 crystallographically unique candidates. It then runs explicit MLIP relaxations, composition-scoped Pareto ranking with crowding, staged structural novelty checks, and research-only DFT input preparation for the top 1-5 candidates.
+Use `MATERIAL_APPLICATION_RECOMMENDER_T4.ipynb` for questions such as
+"which materials fit each part of this battery, catalyst, magnet, optical
+device, structural component, or semiconductor?" It produces separate
+role-specific portfolios and shows what evidence is missing. Its application
+decision stage does not run a generator or specialist validator. Instead, it
+writes a per-role manual handoff receipt; the operator must choose one role and
+supply a realizable chemical system before moving to
+`MATERIAL_CANDIDATE_DISCOVERY_T4.ipynb` or explicitly enabling the typed
+single-role bridge.
+
+The T4 crystal notebook runs generation and screening when its pinned model
+sidecars and required external services are available. It uses a budgeted,
+multi-round `fusion-search`: the MatterGen
+sidecar performs raw-geometry, tolerance-aware within-call and search-session
+duplicate rejection before MatterSim and CHGNet evaluation; evaluated
+candidates are then inserted into persistent evidence and branch pools and
+used to schedule the next round. The coordinator's attested-hash check is a
+defensive post-evaluation fallback, not a replacement for `StructureMatcher`.
+Global generator-call and generated-candidate limits cover every round,
+branch, frontier, and control variant. A MAXIMUM run does not fabricate
+candidates or silently accept a shortfall: rejection, sidecar failure,
+deduplication, or frontier exhaustion is preserved in the funnel and the
+notebook fails closed if it cannot establish the requested 8-32
+crystallographically unique candidates. It then runs explicit MLIP
+relaxations, composition-scoped Pareto ranking with crowding, staged
+structural novelty checks, and research-only DFT input preparation for the top
+1-5 candidates.
 
 ### Field-aware T4 routing
 
@@ -97,6 +125,70 @@ confidence is an uncalibrated routing signal, not scientific uncertainty or a
 material-property probability.
 
 The 12 profiles are `general_inorganic`, `battery_electrode`, `solid_electrolyte`, `superconductor`, `heterogeneous_catalyst`, `semiconductor`, `photovoltaic_absorber`, `thermoelectric`, `magnetic_material`, `ferroelectric_piezoelectric`, `structural_alloy`, and `porous_framework`. Each profile fixes its required problem context, property names and units, preferred calculations, experimental confirmation, RAG questions, MCP capabilities, and fail-closed claim boundary.
+
+### Natural-language application decisions
+
+`material-recommend` handles questions about where a material should be used,
+not only prompts that already name a chemical system. It first resolves the
+field and then decomposes it into code-owned component/function roles. The
+registry covers all 12 fields: battery positive/negative electrodes, solid
+electrolyte bulk/interface roles, catalyst active phase/support, photovoltaic
+absorber/transport layers, thermoelectric n/p legs and contacts,
+superconducting magnet/power/RF/Josephson roles, magnetic, ferroelectric,
+structural-alloy, porous-framework, general-inorganic, and 13 semiconductor
+device roles.
+
+~~~bash
+# Broad scenario map: several role-specific candidate-family portfolios
+discovery-os material-recommend \
+  --prompt "Which materials should be used in each part of a semiconductor device?" \
+  --field AUTO \
+  --main-model-routing off \
+  --artifacts runs/application-map
+
+# Another field: positive and negative electrodes remain separate portfolios
+discovery-os material-recommend \
+  --prompt "Which cathode and anode materials fit a fast-charge sodium-ion cell?" \
+  --field battery_electrode \
+  --context-json '{"working_ion":"Na","cell_use_case":"fast_charge"}' \
+  --run-rag \
+  --artifacts runs/sodium-cell
+~~~
+
+A broad question returns incumbent/emerging **retrieval seeds**, not fabricated
+property scores. Candidate performance remains `UNKNOWN` until a role-named
+validator returns the exact unit and complete operating conditions. Supplied
+candidates and observations are ranked only inside one role and one exact
+condition group. Hard gates use full uncertainty intervals; robust Pareto
+dominance compares worst versus best bounds. An optional scalar score exists
+only with explicit operator/source-closed weights and is labelled as
+pool-relative decision support, never a probability or cross-role truth.
+Search priority, model confidence, citation counts, RAG record counts, and
+missing values cannot create performance credit.
+
+Application RAG runs five isolated validation-stage requests rather than one
+mixed prompt: generation prior, identity/novelty, MLIP disagreement,
+relaxation validation, and DFT handoff. Every role contributes its
+stage-specific question, source allowlist, and MCP capability subset.
+Administrator configuration owns MCP endpoints and tools; prompts and models
+cannot select them. OpenAlex is requested only in the first two stages;
+Crossref and arXiv cover all five. A configured MCP tool is another
+read-only evidence source and never a specialist calculation. See
+[Application-driven material decisions](docs/APPLICATION_MATERIAL_DECISIONS.md)
+for all roles, schemas, CLI inputs, scoring rules, RAG/MCP boundaries, output
+files, and scientific boundaries.
+
+`material-fusion-search` is the separate execution bridge. It invokes the real
+multi-round `FusionSearchRunner` only for one explicitly selected
+`bulk_crystal` role with an immutable CIF/mmCIF/POSCAR parent, matching typed
+goal and workspace-ON run configuration, at least three rounds, a global 8-32
+candidate budget, and at least two configured non-dummy experts. The
+application Colab exposes this as the opt-in
+`RUN_SINGLE_ROLE_BULK_SEARCH` cell and requires MatterGen, MatterSim, and CHGNet
+URLs plus uploaded goal, parent, and run-configuration JSON. Broad or
+multi-role prompts stay manual; retrieval seeds are never promoted into
+structures, application RAG is not a runtime validator, and the bridge reports
+diagnostic search priority rather than application fitness.
 
 Inspect or resolve the same profiles without opening the notebook:
 

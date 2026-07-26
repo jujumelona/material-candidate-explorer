@@ -80,6 +80,36 @@ from .material_domains import (
     build_material_domain_plan,
     get_material_field_profile,
 )
+from .material_applications import (
+    ApplicationCriterion,
+    ApplicationEvidenceTask,
+    ApplicationRoleProfile,
+    MaterialApplicationBrief,
+    MaterialApplicationModelDecision,
+    MaterialApplicationModelRun,
+)
+from .material_decision_runner import (
+    ApplicationRagStageReceipt,
+    MaterialDecisionRun,
+    MaterialDecisionRunner,
+)
+from .material_recommendation import (
+    CandidateCriterionResult,
+    MaterialApplicationCandidate,
+    MaterialApplicationObservation,
+    MaterialDecisionPreference,
+    MaterialRecommendationCandidate,
+    MaterialRecommendationReport,
+    MaterialRoleRecommendation,
+    RecommendationCitation,
+)
+from .material_search_bridge import (
+    MaterialApplicationFusionSearchBridge,
+    MaterialApplicationFusionSearchReport,
+    MaterialApplicationFusionSearchRequest,
+    PersistedMaterialApplicationFusionSearchReport,
+    build_material_application_fusion_search_request,
+)
 from .mock_model import MockDiscoveryModel
 from .dft_handoff import DFTInputHandoffReport, DFTInputManifest
 from .novelty import ScientificNoveltyAssessment
@@ -160,6 +190,25 @@ SCHEMA_TYPES = {
         MaterialPropertyDecision,
         MaterialPropertyObservation,
         MaterialStageRoute,
+        ApplicationCriterion,
+        ApplicationEvidenceTask,
+        ApplicationRoleProfile,
+        MaterialApplicationBrief,
+        MaterialApplicationModelDecision,
+        MaterialApplicationModelRun,
+        MaterialApplicationCandidate,
+        MaterialApplicationObservation,
+        MaterialDecisionPreference,
+        CandidateCriterionResult,
+        RecommendationCitation,
+        MaterialRecommendationCandidate,
+        MaterialRoleRecommendation,
+        MaterialRecommendationReport,
+        ApplicationRagStageReceipt,
+        MaterialDecisionRun,
+        MaterialApplicationFusionSearchRequest,
+        MaterialApplicationFusionSearchReport,
+        PersistedMaterialApplicationFusionSearchReport,
         WorkspaceComparisonReport,
         WorkspaceEntityInput,
         WorkspacePairedRunReport,
@@ -304,6 +353,50 @@ def _material_route(args: argparse.Namespace) -> int:
             "AUTO material-field routing is ambiguous; pass an explicit --field"
         )
     print(plan.model_dump_json(indent=2))
+    return 0
+
+
+def _material_recommend(args: argparse.Namespace) -> int:
+    try:
+        context = json.loads(args.context_json) if args.context_json else {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit("--context-json must contain valid JSON") from exc
+    if not isinstance(context, dict):
+        raise SystemExit("--context-json must decode to a JSON object")
+    bundle = load_evidence_bundle(args.rag_bundle) if args.rag_bundle else None
+    run = MaterialDecisionRunner(artifact_root=args.artifacts).run(
+        args.prompt,
+        material_field=args.field,
+        chemical_system=args.chemical_system,
+        problem_context=context,
+        main_model_routing=args.main_model_routing,
+        explicit_role_ids=args.role,
+        require_condition_complete=args.require_condition_complete,
+        include_retrieval_seeds=not args.no_retrieval_seeds,
+        candidates=_model_list_from_file(
+            MaterialApplicationCandidate,
+            args.candidates,
+        ),
+        observations=_model_list_from_file(
+            MaterialApplicationObservation,
+            args.observations,
+        ),
+        preferences=_model_list_from_file(
+            MaterialDecisionPreference,
+            args.preferences,
+        ),
+        rag_bundle=bundle,
+        run_rag=args.run_rag,
+        rag_sources=(
+            [LiteratureSource(item) for item in args.rag_source]
+            if args.rag_source
+            else None
+        ),
+        rag_from_date=_parse_iso_date(args.rag_from_date),
+        rag_to_date=_parse_iso_date(args.rag_to_date),
+        rag_max_results_per_query=args.rag_max_results,
+    )
+    print(run.model_dump_json(indent=2))
     return 0
 
 
@@ -651,6 +744,82 @@ def _fusion_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _material_fusion_search(args: argparse.Namespace) -> int:
+    """Execute one code-selected application role through the real search loop."""
+
+    brief = _model_from_file(MaterialApplicationBrief, args.brief)
+    goal = _model_from_file(DiscoveryGoal, args.goal)
+    parent = _model_from_file(Candidate, args.parent)
+    config = _model_from_file(WorkspaceRunConfig, args.run_config)
+    previous = (
+        _model_from_file(UnifiedLatentStateRef, args.previous_state)
+        if args.previous_state
+        else None
+    )
+    control_sweep = None
+    if args.control_point:
+        raw_points = args.control_point
+        control_sweep = SearchControlSweep(
+            points=[
+                _parse_control_point(value, index=index)
+                for index, value in enumerate(raw_points)
+            ],
+            include_adaptive_center=True,
+            max_variants_per_parent=args.max_control_variants,
+        )
+    if (args.max_generation_calls is None) != (
+        args.max_generated_candidates is None
+    ):
+        raise SystemExit(
+            "--max-generation-calls and --max-generated-candidates must be set together"
+        )
+    search_budget = (
+        SearchBudget(
+            max_generation_calls=args.max_generation_calls,
+            max_generated_candidates=args.max_generated_candidates,
+        )
+        if args.max_generation_calls is not None
+        else None
+    )
+    generator = build_generator_from_environment(args.generator, required=True)
+    if generator is None:
+        raise SystemExit(f"generator {args.generator!r} is not configured")
+    runtime = _fusion_runtime_from_environment(args.artifacts)
+    search_runner = FusionSearchRunner(
+        FusionLoopRunner(runtime, generator),
+        ExpertEvidenceStore(runtime.artifact_store),
+    )
+    request = build_material_application_fusion_search_request(
+        brief,
+        role_id=args.role,
+        search_id=args.search_id,
+        goal=goal,
+        initial_candidate=parent,
+        base_run_config=config,
+        expert_ids=args.expert,
+        required_primary_evaluator_ids=args.required_evaluator,
+        rounds=args.rounds,
+        initial_cycle=args.cycle,
+        initial_state=previous,
+        context_entities=_model_list_from_file(
+            WorkspaceEntityInput,
+            args.context,
+        ),
+        relations=_model_list_from_file(WorkspaceRelation, args.relations),
+        workspace_id=args.workspace_id,
+        frontier_width=args.frontier_width,
+        control_sweep=control_sweep,
+        search_budget=search_budget,
+        ranking_limit=args.ranking_limit,
+    )
+    persisted = MaterialApplicationFusionSearchBridge(search_runner).execute(
+        brief=brief,
+        request=request,
+    )
+    print(persisted.model_dump_json(indent=2))
+    return 0
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="discovery-os",
@@ -714,6 +883,75 @@ def make_parser() -> argparse.ArgumentParser:
         help="stop instead of falling back to general screening when AUTO ties",
     )
     material_route.set_defaults(handler=_material_route)
+
+    material_recommend = subparsers.add_parser(
+        "material-recommend",
+        help=(
+            "decompose a natural-language application question into role-specific "
+            "candidate portfolios with bounded RAG context, scores, reasons, "
+            "uncertainty, and next validators"
+        ),
+    )
+    material_recommend.add_argument("--prompt", required=True)
+    material_recommend.add_argument("--field", default="AUTO")
+    material_recommend.add_argument("--chemical-system")
+    material_recommend.add_argument(
+        "--context-json",
+        help="JSON object containing operating, geometry, process, and service conditions",
+    )
+    material_recommend.add_argument(
+        "--role",
+        action="append",
+        help="explicit code-owned role id; repeat for a role portfolio",
+    )
+    material_recommend.add_argument(
+        "--main-model-routing",
+        choices=["auto", "required", "off"],
+        default="auto",
+        help="typed field/role classification policy",
+    )
+    material_recommend.add_argument(
+        "--require-condition-complete",
+        action="store_true",
+        help="stop the brief at clarification when role conditions are missing",
+    )
+    material_recommend.add_argument(
+        "--no-retrieval-seeds",
+        action="store_true",
+        help="omit code-owned incumbent/emerging material-family search seeds",
+    )
+    material_recommend.add_argument(
+        "--candidates",
+        help="JSON array of MaterialApplicationCandidate rows",
+    )
+    material_recommend.add_argument(
+        "--observations",
+        help="JSON array of condition-complete MaterialApplicationObservation rows",
+    )
+    material_recommend.add_argument(
+        "--preferences",
+        help="JSON array of operator/source-closed criterion weights and constraints",
+    )
+    rag_choice = material_recommend.add_mutually_exclusive_group()
+    rag_choice.add_argument("--rag-bundle")
+    rag_choice.add_argument(
+        "--run-rag",
+        action="store_true",
+        help="retrieve source-grounded application evidence before assembling the report",
+    )
+    material_recommend.add_argument(
+        "--rag-source",
+        action="append",
+        choices=[item.value for item in LiteratureSource],
+    )
+    material_recommend.add_argument("--rag-from-date")
+    material_recommend.add_argument("--rag-to-date")
+    material_recommend.add_argument("--rag-max-results", type=int, default=12)
+    material_recommend.add_argument(
+        "--artifacts",
+        default="runs/material-decisions",
+    )
+    material_recommend.set_defaults(handler=_material_recommend)
 
     schema = subparsers.add_parser("schema", help="print a model-connection JSON Schema")
     schema.add_argument("name")
@@ -910,6 +1148,72 @@ def make_parser() -> argparse.ArgumentParser:
     )
     fusion_search.add_argument("--rag-require-model", action="store_true")
     fusion_search.set_defaults(handler=_fusion_search)
+
+    material_fusion_search = subparsers.add_parser(
+        "material-fusion-search",
+        help=(
+            "validate one application role and execute a real multi-round "
+            "bulk-crystal Fusion search without promoting RAG seeds to structures"
+        ),
+    )
+    material_fusion_search.add_argument("--brief", required=True)
+    material_fusion_search.add_argument("--role", required=True)
+    material_fusion_search.add_argument("--search-id", required=True)
+    material_fusion_search.add_argument("--goal", required=True)
+    material_fusion_search.add_argument("--parent", required=True)
+    material_fusion_search.add_argument("--run-config", required=True)
+    material_fusion_search.add_argument("--generator", required=True)
+    material_fusion_search.add_argument(
+        "--rounds",
+        required=True,
+        type=int,
+        help="at least three adaptive rounds are required by this application bridge",
+    )
+    material_fusion_search.add_argument("--frontier-width", type=int, default=1)
+    material_fusion_search.add_argument(
+        "--control-point",
+        action="append",
+        help=(
+            "alpha:temperature operating point; repeat for a bounded adaptive sweep"
+        ),
+    )
+    material_fusion_search.add_argument(
+        "--max-control-variants",
+        type=int,
+        default=3,
+    )
+    material_fusion_search.add_argument("--ranking-limit", type=int, default=50)
+    material_fusion_search.add_argument("--max-generation-calls", type=int)
+    material_fusion_search.add_argument("--max-generated-candidates", type=int)
+    material_fusion_search.add_argument("--cycle", type=int, default=0)
+    material_fusion_search.add_argument("--previous-state")
+    material_fusion_search.add_argument(
+        "--context",
+        help="JSON array of WorkspaceEntityInput",
+    )
+    material_fusion_search.add_argument(
+        "--relations",
+        help="JSON array of WorkspaceRelation",
+    )
+    material_fusion_search.add_argument("--workspace-id")
+    material_fusion_search.add_argument(
+        "--expert",
+        action="append",
+        required=True,
+        help="configured structural expert id; repeat for an explicit panel of two or more",
+    )
+    material_fusion_search.add_argument(
+        "--required-evaluator",
+        action="append",
+        help=(
+            "required primary evaluator id; defaults to the complete explicit panel"
+        ),
+    )
+    material_fusion_search.add_argument(
+        "--artifacts",
+        default=".discovery/fusion",
+    )
+    material_fusion_search.set_defaults(handler=_material_fusion_search)
     return parser
 
 
