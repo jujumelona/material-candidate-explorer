@@ -38,6 +38,42 @@ class EvaluatedPropertiesSummary(StrictSchema):
     role_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
+# Supported MLIP expert model IDs for multi-expert evaluation.
+# CHGNet (Deng et al., Nat Mach Intell 2023), MatterSim (Microsoft 2024),
+# MACE-MP-0 (Batatia et al. 2024), SevenNet (Park et al. 2024),
+# ORB (Orbital Materials 2024), UMA (Meta FAIR 2025)
+SUPPORTED_MLIP_EXPERT_IDS: list[str] = [
+    "chgnet_0.3.0",
+    "mattersim_5m",
+    "mace_mp_0",
+    "sevennet_0",
+    "orb_v2",
+    "uma_small",
+]
+
+# Supported crystal generator IDs.
+# MatterGen (Zeni et al., Nature 2025), DiffCSP++ (Jiao et al. 2024),
+# FlowMM (Miller et al., ICML 2024), CrystaLLM (LLM-based, 2024),
+# CDVAE (Xie et al., NeurIPS 2022), SCIGEN (Nat Mater 2025)
+SUPPORTED_GENERATOR_IDS: list[str] = [
+    "mattergen",
+    "diffcsp_pp",
+    "flowmm",
+    "crystalllm",
+    "cdvae",
+    "scigen",
+]
+
+
+class MlipExpertResult(StrictSchema):
+    """Single MLIP expert evaluation result for one candidate."""
+    expert_id: str = Field(min_length=1)
+    energy_ev_per_atom: float | None = None
+    max_force_ev_per_angstrom: float | None = None
+    stress_trace_gpa: float | None = None
+    weight_revision: str = Field(default="unknown")
+
+
 class MultiExpertReliabilitySummary(StrictSchema):
     chgnet_energy_ev_per_atom: float | None = None
     mattersim_energy_ev_per_atom: float | None = None
@@ -45,14 +81,24 @@ class MultiExpertReliabilitySummary(StrictSchema):
     disagreement_status: Literal["low", "medium", "high", "unknown"] = "unknown"
     conformal_coverage_score: float | None = None
     pareto_rank: int | None = None
+    # Extended expert results for additional MLIP foundation models
+    additional_experts: list[MlipExpertResult] = Field(default_factory=list)
+
+
+_NOVELTY_STATUS = Literal["no_match", "match", "unresolved"]
 
 
 class DatabaseNoveltyCheckSummary(StrictSchema):
     current_batch_unique: bool = True
     project_history_unique: bool = True
-    optimade_match_status: Literal["no_match", "match", "unresolved"] = "unresolved"
-    cod_match_status: Literal["no_match", "match", "unresolved"] = "unresolved"
-    materials_project_match_status: Literal["no_match", "match", "unresolved"] = "unresolved"
+    optimade_match_status: _NOVELTY_STATUS = "unresolved"
+    cod_match_status: _NOVELTY_STATUS = "unresolved"
+    materials_project_match_status: _NOVELTY_STATUS = "unresolved"
+    # Extended database providers (Alexandria, GNoME, AFLOW, NOMAD)
+    alexandria_match_status: _NOVELTY_STATUS = "unresolved"
+    gnome_match_status: _NOVELTY_STATUS = "unresolved"
+    aflow_match_status: _NOVELTY_STATUS = "unresolved"
+    nomad_match_status: _NOVELTY_STATUS = "unresolved"
     aggregate_novelty_status: Literal["scoped_no_match", "matched", "unknown"] = "unknown"
 
 
@@ -64,6 +110,15 @@ class StageLiteratureEvidenceSummary(StrictSchema):
     literature_confidence: Literal["supported", "partial", "unsupported"] = "supported"
 
 
+class GeneratorProvenanceSummary(StrictSchema):
+    """Records which crystal generator produced this candidate."""
+    generator_id: str = Field(default="mattergen")
+    checkpoint_id: str = Field(default="mattergen_base")
+    guidance_alpha: float | None = None
+    conditions_applied: list[str] = Field(default_factory=list)
+    conditions_ignored: list[str] = Field(default_factory=list)
+
+
 class DftHandoffSpecSummary(StrictSchema):
     target_code: str = "Quantum ESPRESSO"
     kpoints_mesh: list[int] = Field(default_factory=lambda: [4, 4, 4])
@@ -71,6 +126,8 @@ class DftHandoffSpecSummary(StrictSchema):
     ecutrho_rydberg: float = 480.0
     pseudopotentials_attestation: str = "SG15 ONCVPSP v1.0 standard"
     poscar_available: bool = True
+    # Automated DFT workflow engine (atomate2, AiiDA)
+    workflow_engine: str | None = None
 
 
 class RichMaterialCandidateReport(StrictSchema):
@@ -88,6 +145,9 @@ class RichMaterialCandidateReport(StrictSchema):
     reliability: MultiExpertReliabilitySummary
     novelty: DatabaseNoveltyCheckSummary
     literature: StageLiteratureEvidenceSummary
+    generator: GeneratorProvenanceSummary = Field(
+        default_factory=GeneratorProvenanceSummary
+    )
     dft_handoff: DftHandoffSpecSummary
 
 
@@ -104,6 +164,7 @@ def build_rich_candidate_report(
     reliability: MultiExpertReliabilitySummary | None = None,
     novelty: DatabaseNoveltyCheckSummary | None = None,
     literature: StageLiteratureEvidenceSummary | None = None,
+    generator: GeneratorProvenanceSummary | None = None,
     dft_handoff: DftHandoffSpecSummary | None = None,
 ) -> RichMaterialCandidateReport:
     """Constructs a complete, validated RichMaterialCandidateReport."""
@@ -120,6 +181,8 @@ def build_rich_candidate_report(
         novelty = DatabaseNoveltyCheckSummary()
     if literature is None:
         literature = StageLiteratureEvidenceSummary()
+    if generator is None:
+        generator = GeneratorProvenanceSummary()
     if dft_handoff is None:
         dft_handoff = DftHandoffSpecSummary()
 
@@ -135,6 +198,7 @@ def build_rich_candidate_report(
         reliability=reliability,
         novelty=novelty,
         literature=literature,
+        generator=generator,
         dft_handoff=dft_handoff,
     )
 
@@ -203,6 +267,11 @@ def format_material_candidate_markdown_report(report: RichMaterialCandidateRepor
     mattersim_str = f"{report.reliability.mattersim_energy_ev_per_atom:.4f} eV/atom" if report.reliability.mattersim_energy_ev_per_atom is not None else "N/A"
     lines.append(f"| **MatterSim 5M** | {mattersim_str} | MLIP Expert 2 |")
 
+    # Render additional MLIP foundation model experts (MACE-MP-0, SevenNet, ORB, UMA)
+    for idx, expert in enumerate(report.reliability.additional_experts, start=3):
+        e_str = f"{expert.energy_ev_per_atom:.4f} eV/atom" if expert.energy_ev_per_atom is not None else "N/A"
+        lines.append(f"| **{expert.expert_id}** | {e_str} | MLIP Expert {idx} (rev: {expert.weight_revision}) |")
+
     disag_str = f"{report.reliability.energy_disagreement_ev_per_atom:.4f} eV/atom" if report.reliability.energy_disagreement_ev_per_atom is not None else "N/A"
     lines.append(r"| **Expert Disagreement ($\sigma_{\text{expert}}$)** | " + f"{disag_str} | `{report.reliability.disagreement_status}` disagreement |")
 
@@ -220,6 +289,10 @@ def format_material_candidate_markdown_report(report: RichMaterialCandidateRepor
     lines.append(f"| **OPTIMADE API** | `{report.novelty.optimade_match_status}` | External Structure Lookup |")
     lines.append(f"| **COD (Crystallography Open DB)** | `{report.novelty.cod_match_status}` | External Structure Lookup |")
     lines.append(f"| **Materials Project API** | `{report.novelty.materials_project_match_status}` | External Structure Lookup |")
+    lines.append(f"| **Alexandria (5.8M structures)** | `{report.novelty.alexandria_match_status}` | Marques et al. PBE/PBEsol DB |")
+    lines.append(f"| **GNoME (DeepMind 380K)** | `{report.novelty.gnome_match_status}` | Graph Networks for Materials |")
+    lines.append(f"| **AFLOW** | `{report.novelty.aflow_match_status}` | Automatic FLOW DB |")
+    lines.append(f"| **NOMAD** | `{report.novelty.nomad_match_status}` | Novel Materials Discovery |")
     lines.append(f"| **Aggregate Novelty Status** | `{report.novelty.aggregate_novelty_status}` | Attestation Level |")
     lines.append("")
 
@@ -240,7 +313,21 @@ def format_material_candidate_markdown_report(report: RichMaterialCandidateRepor
             lines.append(f"- `https://arxiv.org/abs/{arxiv_id}`")
         lines.append("")
 
-    lines.append("## 6. Portable Downstream DFT Handoff Package")
+    lines.append("## 6. Generator Provenance")
+    lines.append("")
+    lines.append("| Property | Value |")
+    lines.append("| :--- | :--- |")
+    lines.append(f"| **Generator Model** | `{report.generator.generator_id}` |")
+    lines.append(f"| **Checkpoint** | `{report.generator.checkpoint_id}` |")
+    if report.generator.guidance_alpha is not None:
+        lines.append(f"| **Guidance Alpha** | `{report.generator.guidance_alpha:.2f}` |")
+    if report.generator.conditions_applied:
+        lines.append(f"| **Conditions Applied** | {', '.join(f'`{c}`' for c in report.generator.conditions_applied)} |")
+    if report.generator.conditions_ignored:
+        lines.append(f"| **Conditions Ignored** | {', '.join(f'`{c}`' for c in report.generator.conditions_ignored)} |")
+    lines.append("")
+
+    lines.append("## 7. Portable Downstream DFT Handoff Package")
     lines.append("")
     lines.append("| DFT Requirement | Parameter / Specification |")
     lines.append("| :--- | :--- |")
@@ -251,6 +338,8 @@ def format_material_candidate_markdown_report(report: RichMaterialCandidateRepor
     lines.append(f"| **Charge Density Cutoff ($E_{{\\text{{cutrho}}}}$)** | `{report.dft_handoff.ecutrho_rydberg:.1f} Ry` |")
     lines.append(f"| **Pseudopotential Set** | `{report.dft_handoff.pseudopotentials_attestation}` |")
     lines.append(f"| **POSCAR Package Ready** | `{'Yes' if report.dft_handoff.poscar_available else 'No'}` |")
+    if report.dft_handoff.workflow_engine:
+        lines.append(f"| **Workflow Engine** | `{report.dft_handoff.workflow_engine}` |")
     lines.append("")
 
     lines.append("> [!IMPORTANT]")

@@ -211,8 +211,81 @@ The `material-goal-run` execution pipeline implements an end-to-end framework tr
 2. **5-Stage Literature RAG & MCP Protocol**: Implements multi-stage scholarly retrieval (arXiv, CrossRef, OpenAlex APIs) and standardized tool execution contracts (Model Context Protocol). Literature context is restricted to generation prior and evidence citation; it never fabricates numerical physical properties.
 3. **Structured 7-Section Reporting Contract (`RichMaterialCandidateReport`)**:
    - **Identity**: Niggli identity hash, space group, cell dimensions, unscaled CIF (`StructureMatcher`).
-   - **MLIP Relaxation**: CHGNet 0.3.0 & MatterSim 5M geometry gate, stress gate validation, formation energy ($\Delta E_f$), hull distance ($\Delta E_{\text{hull}}$).
-   - **Reliability & Disagreement**: Energy disagreement ($\sigma_{\text{expert}}$), split-conformal coverage score, NSGA-II Pareto rank.
-   - **Database Novelty**: OPTIMADE, COD, and Materials Project unscaled structure prefiltering.
-   - **Downstream DFT Handoff**: Portable POSCAR / QE input skeletons with explicit k-point meshes and cutoffs ($E_{\text{cutwfc}}$, $E_{\text{cutrho}}$).
+   - **MLIP Relaxation**: CHGNet 0.3.0 & MatterSim 5M geometry gate, stress gate validation, formation energy, hull distance.
+   - **Reliability & Disagreement**: Energy disagreement, split-conformal coverage score, NSGA-II Pareto rank. Extensible to additional MLIP foundation models via `MlipExpertResult`.
+   - **Generator Provenance**: Records which crystal generator (MatterGen, DiffCSP++, FlowMM, CrystaLLM, CDVAE, SCIGEN) produced the candidate, with checkpoint, guidance, and condition metadata.
+   - **Database Novelty**: OPTIMADE, COD, Materials Project, Alexandria, GNoME, AFLOW, and NOMAD unscaled structure prefiltering.
+   - **Downstream DFT Handoff**: Portable POSCAR / QE input skeletons with explicit k-point meshes and cutoffs. Supports atomate2 and AiiDA workflow engine metadata.
+
+## 10. Extended Research Landscape (2024–2026 Survey)
+
+This section documents the broader research landscape surveyed to inform the pipeline design. These are research references and design-influence citations, not bundled or silently executed runtime backends.
+
+### 10.1 Crystal Structure Generation Models
+
+| Model | Reference | Key Contribution | Pipeline Relevance |
+| :--- | :--- | :--- | :--- |
+| **MatterGen** | Zeni et al., Nature 2025 | Conditional diffusion for inorganic crystals with adapter fine-tuning | Primary generator backend |
+| **DiffCSP++** | Jiao et al., NeurIPS 2024 | Diffusion with space-group constraints on lattice and coordinates | Supported alternative generator (`SUPPORTED_GENERATOR_IDS`) |
+| **FlowMM** | Miller et al., ICML 2024 | Riemannian flow matching; fewer integration steps, faster sampling | Supported alternative generator |
+| **CrystaLLM** | 2024 | Autoregressive LLM treating crystals as text; native space-group prompting | Supported alternative generator |
+| **CDVAE** | Xie et al., NeurIPS 2022 | Crystal diffusion variational autoencoder | Supported alternative generator |
+| **SCIGEN** | Nature Materials 2025 | Symmetry-constrained generation | Supported alternative generator |
+| **UniMat** | ICLR 2024 | Universal material generation across composition spaces | Design reference |
+| **CrystalFormer** | 2024 | Transformer-based crystal generation | Design reference |
+
+[LeMat-GenBench](https://arxiv.org/abs/2512.04562) confirms no single generator dominates stability, novelty, and diversity, supporting the pipeline's multi-generator provenance tracking.
+
+### 10.2 Universal MLIP Foundation Models
+
+| Model | Reference | Key Contribution | Pipeline Integration |
+| :--- | :--- | :--- | :--- |
+| **CHGNet 0.3.0** | Deng et al., Nat Mach Intell 2023 | Crystal Hamiltonian graph neural network | Primary expert (`chgnet_0.3.0`) |
+| **MatterSim 5M** | Microsoft 2024 | Large-scale atomistic simulation foundation model | Primary expert (`mattersim_5m`) |
+| **MACE-MP-0** | Batatia et al. 2024 | Universal equivariant MLIP trained on MPTrj; fine-tunable | Extended expert (`mace_mp_0`) |
+| **SevenNet** | Park et al. 2024 | Scalable equivariant GNN; high stability prediction accuracy | Extended expert (`sevennet_0`) |
+| **ORB v2** | Orbital Materials 2024 | Non-conservative invariant model; high computational efficiency | Extended expert (`orb_v2`) |
+| **UMA** | Meta FAIR 2025 | Mixture-of-linear-experts; trained on 0.5B structures | Extended expert (`uma_small`) |
+| **EquiformerV2** | 2024 | Equivariant transformer for atomistic modeling | Design reference |
+| **JMP** | 2024 | Joint multi-domain pre-trained MLIP | Design reference |
+| **ALIGNN** | 2022 | Atomistic line graph neural network | Design reference |
+| **M3GNet** | Chen & Ong 2022 | Universal graph neural network potential | Design reference |
+
+Matbench Discovery ([leaderboard](https://matbench-discovery.materialsproject.org/)) provides the benchmark context. The Combined Performance Score (CPS) aggregates F1, RMSD, and task-specific metrics. Rankings are task-dependent; universal "best" claims do not transfer across chemistries.
+
+### 10.3 Extended Database Novelty Providers
+
+| Database | Scale | API | Pipeline Integration |
+| :--- | :--- | :--- | :--- |
+| **Materials Project** | ~155K materials | mp-api (REST) | Primary novelty check |
+| **OPTIMADE** | Federated (multi-provider) | OPTIMADE v1.2+ | Primary novelty check |
+| **COD** | ~500K structures | REST/CIF | Primary novelty check |
+| **Alexandria** | ~5.8M structures, 175K on hull | OPTIMADE provider | Extended novelty check (`alexandria_match_status`) |
+| **GNoME** | ~380K stable materials | Materials Project Explorer | Extended novelty check (`gnome_match_status`) |
+| **AFLOW** | ~3.5M compounds | REST API | Extended novelty check (`aflow_match_status`) |
+| **NOMAD** | ~12M calculations | NOMAD API | Extended novelty check (`nomad_match_status`) |
+| **WBM Dataset** | ~257K compounds | Static dataset | Matbench Discovery evaluation reference |
+
+Critical note on GNoME novelty: Cheetham & Seshadri (Chem. Mater. 2024) argue many GNoME entries are metal-ion ordering variants rather than functionally new materials. The pipeline records GNoME match status as one signal, not as definitive novelty attestation.
+
+### 10.4 RAG and LLM Integration for Materials Science
+
+| Technique | Reference | Key Contribution | Pipeline Relevance |
+| :--- | :--- | :--- | :--- |
+| **Agentic RAG** | Various 2024–2025 | Multi-step reasoning with tool use; emulates expert workflows | Informs 5-stage RAG policy design |
+| **Graph RAG** | NeurIPS 2024 | Knowledge-graph augmented retrieval for structured entity relationships | Design reference for future KG integration |
+| **Multi-modal RAG** | arXiv 2024 | Text + images/spectra retrieval for defect analysis | Design reference |
+| **MolRAG** | ACL 2025 | Retrieves analogous molecules for chain-of-thought property reasoning | Design reference for analogical screening |
+| **Dual-Source RAG** | ACS 2024 | Combines structured data (CSV) with unstructured literature (PDF) | Informs multi-source retriever design |
+
+### 10.5 Automated DFT Workflow Integration
+
+| Framework | Reference | Key Contribution | Pipeline Relevance |
+| :--- | :--- | :--- | :--- |
+| **atomate2** | ChemRxiv 2024 | Modular DFT workflows on pymatgen + jobflow + custodian | DFT handoff `workflow_engine` field |
+| **AiiDA** | Nat. Rev. Phys. 2020 | Provenance-tracking workflow engine with graph database | DFT handoff `workflow_engine` field |
+| **jobflow** | 2023 | Workflow definition library for computational materials science | atomate2 dependency |
+| **custodian** | 2023 | Automated error handling and job recovery for DFT | atomate2 dependency |
+
+The `DftHandoffSpecSummary.workflow_engine` field records which automated workflow system (if any) should receive the generated POSCAR and input skeleton for execution.
 

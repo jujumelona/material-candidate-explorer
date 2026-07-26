@@ -11,8 +11,12 @@ from discovery_os.rich_report import (
     DatabaseNoveltyCheckSummary,
     DftHandoffSpecSummary,
     EvaluatedPropertiesSummary,
+    GeneratorProvenanceSummary,
+    MlipExpertResult,
     MultiExpertReliabilitySummary,
     RichMaterialCandidateReport,
+    SUPPORTED_GENERATOR_IDS,
+    SUPPORTED_MLIP_EXPERT_IDS,
     StageLiteratureEvidenceSummary,
     build_rich_candidate_report,
     format_material_candidate_markdown_report,
@@ -143,3 +147,138 @@ def test_cli_material_goal_run_command(tmp_path: Path) -> None:
     assert export_json.exists()
     md_text = export_md.read_text(encoding="utf-8")
     assert "Material Discovery Candidate Report" in md_text
+
+
+def test_supported_ids_lists() -> None:
+    """Verify supported MLIP and generator ID lists contain expected entries."""
+    assert "chgnet_0.3.0" in SUPPORTED_MLIP_EXPERT_IDS
+    assert "mattersim_5m" in SUPPORTED_MLIP_EXPERT_IDS
+    assert "mace_mp_0" in SUPPORTED_MLIP_EXPERT_IDS
+    assert "sevennet_0" in SUPPORTED_MLIP_EXPERT_IDS
+    assert "orb_v2" in SUPPORTED_MLIP_EXPERT_IDS
+    assert "uma_small" in SUPPORTED_MLIP_EXPERT_IDS
+    assert len(SUPPORTED_MLIP_EXPERT_IDS) == 6
+
+    assert "mattergen" in SUPPORTED_GENERATOR_IDS
+    assert "diffcsp_pp" in SUPPORTED_GENERATOR_IDS
+    assert "flowmm" in SUPPORTED_GENERATOR_IDS
+    assert "crystalllm" in SUPPORTED_GENERATOR_IDS
+    assert "cdvae" in SUPPORTED_GENERATOR_IDS
+    assert "scigen" in SUPPORTED_GENERATOR_IDS
+    assert len(SUPPORTED_GENERATOR_IDS) == 6
+
+
+def test_mlip_expert_result_schema() -> None:
+    """MlipExpertResult can be constructed and serialized."""
+    expert = MlipExpertResult(
+        expert_id="mace_mp_0",
+        energy_ev_per_atom=-0.45,
+        max_force_ev_per_angstrom=0.012,
+        stress_trace_gpa=0.5,
+        weight_revision="mace_mp_0_medium_2024",
+    )
+    assert expert.expert_id == "mace_mp_0"
+    data = expert.model_dump()
+    assert data["energy_ev_per_atom"] == pytest.approx(-0.45)
+
+
+def test_generator_provenance_schema() -> None:
+    """GeneratorProvenanceSummary records generator metadata."""
+    gen = GeneratorProvenanceSummary(
+        generator_id="diffcsp_pp",
+        checkpoint_id="diffcsp_pp_mp20",
+        guidance_alpha=0.7,
+        conditions_applied=["space_group"],
+        conditions_ignored=["dft_band_gap"],
+    )
+    assert gen.generator_id == "diffcsp_pp"
+    assert gen.guidance_alpha == pytest.approx(0.7)
+    assert "space_group" in gen.conditions_applied
+
+
+def test_extended_novelty_database_fields() -> None:
+    """DatabaseNoveltyCheckSummary includes Alexandria, GNoME, AFLOW, NOMAD."""
+    novelty = DatabaseNoveltyCheckSummary(
+        current_batch_unique=True,
+        project_history_unique=True,
+        optimade_match_status="no_match",
+        cod_match_status="no_match",
+        materials_project_match_status="no_match",
+        alexandria_match_status="no_match",
+        gnome_match_status="match",
+        aflow_match_status="unresolved",
+        nomad_match_status="no_match",
+        aggregate_novelty_status="scoped_no_match",
+    )
+    assert novelty.gnome_match_status == "match"
+    assert novelty.alexandria_match_status == "no_match"
+    assert novelty.aflow_match_status == "unresolved"
+    assert novelty.nomad_match_status == "no_match"
+
+
+def test_rich_report_with_extended_fields_and_markdown() -> None:
+    """Full report with additional experts, generator provenance, extended DBs renders correctly."""
+    report = build_rich_candidate_report(
+        report_id="RICH-EXT-001",
+        user_goal="Find perovskite photovoltaic absorber",
+        domain="semiconductor",
+        target_role="photovoltaic_absorber",
+        candidate_id="CAND-CSPBI3",
+        formula="CsPbI3",
+        reliability=MultiExpertReliabilitySummary(
+            chgnet_energy_ev_per_atom=-0.30,
+            mattersim_energy_ev_per_atom=-0.29,
+            energy_disagreement_ev_per_atom=0.01,
+            disagreement_status="low",
+            additional_experts=[
+                MlipExpertResult(
+                    expert_id="mace_mp_0",
+                    energy_ev_per_atom=-0.295,
+                    weight_revision="mace_mp_0_medium",
+                ),
+                MlipExpertResult(
+                    expert_id="sevennet_0",
+                    energy_ev_per_atom=-0.305,
+                    weight_revision="sevennet_0_11July2024",
+                ),
+            ],
+        ),
+        novelty=DatabaseNoveltyCheckSummary(
+            alexandria_match_status="no_match",
+            gnome_match_status="no_match",
+            aflow_match_status="no_match",
+            nomad_match_status="no_match",
+            aggregate_novelty_status="scoped_no_match",
+        ),
+        generator=GeneratorProvenanceSummary(
+            generator_id="diffcsp_pp",
+            checkpoint_id="diffcsp_pp_mp20",
+            guidance_alpha=0.5,
+            conditions_applied=["space_group", "chemical_system"],
+        ),
+        dft_handoff=DftHandoffSpecSummary(
+            workflow_engine="atomate2",
+        ),
+    )
+
+    assert report.generator.generator_id == "diffcsp_pp"
+    assert len(report.reliability.additional_experts) == 2
+    assert report.dft_handoff.workflow_engine == "atomate2"
+
+    md = format_material_candidate_markdown_report(report)
+    # Additional experts rendered
+    assert "mace_mp_0" in md
+    assert "sevennet_0" in md
+    # Extended DB novelty rendered
+    assert "Alexandria" in md
+    assert "GNoME" in md
+    assert "AFLOW" in md
+    assert "NOMAD" in md
+    # Generator provenance section rendered
+    assert "Generator Provenance" in md
+    assert "diffcsp_pp" in md
+    # DFT workflow engine rendered
+    assert "atomate2" in md
+    # Section numbering updated
+    assert "## 6. Generator Provenance" in md
+    assert "## 7. Portable Downstream DFT Handoff" in md
