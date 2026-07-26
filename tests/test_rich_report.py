@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from discovery_os.rich_report import (
+    AutonomousSelfDrivingLabSpec,
     CrystallographicIdentityDetails,
     DatabaseNoveltyCheckSummary,
     DftHandoffSpecSummary,
@@ -16,10 +17,13 @@ from discovery_os.rich_report import (
     MlipExpertResult,
     MolecularDrugCandidateDetails,
     MultiExpertReliabilitySummary,
+    PhononDynamicalStabilitySummary,
+    PorousFrameworkCandidateDetails,
     RichMaterialCandidateReport,
     SUPPORTED_GENERATOR_IDS,
     SUPPORTED_MCP_AGENT_FRAMEWORKS,
     SUPPORTED_MLIP_EXPERT_IDS,
+    SUPPORTED_SDL_ROBOTIC_PLATFORMS,
     StageLiteratureEvidenceSummary,
     build_rich_candidate_report,
     format_material_candidate_markdown_report,
@@ -168,12 +172,22 @@ def test_supported_ids_lists() -> None:
     assert "crystalllm" in SUPPORTED_GENERATOR_IDS
     assert "cdvae" in SUPPORTED_GENERATOR_IDS
     assert "scigen" in SUPPORTED_GENERATOR_IDS
+    assert "mofdiff" in SUPPORTED_GENERATOR_IDS
+    assert "mofasa" in SUPPORTED_GENERATOR_IDS
+    assert "molcrystalflow" in SUPPORTED_GENERATOR_IDS
     assert "rfdiffusion3" in SUPPORTED_GENERATOR_IDS
     assert "esm3" in SUPPORTED_GENERATOR_IDS
     assert "molmim" in SUPPORTED_GENERATOR_IDS
     assert "bionemo_gen" in SUPPORTED_GENERATOR_IDS
     assert "alphafold3_binder" in SUPPORTED_GENERATOR_IDS
-    assert len(SUPPORTED_GENERATOR_IDS) == 11
+    assert len(SUPPORTED_GENERATOR_IDS) == 14
+
+    assert "alab_solid_state" in SUPPORTED_SDL_ROBOTIC_PLATFORMS
+    assert "polybot_synthesizer" in SUPPORTED_SDL_ROBOTIC_PLATFORMS
+    assert "opentrons_flex" in SUPPORTED_SDL_ROBOTIC_PLATFORMS
+    assert "chemspeed_autoplatform" in SUPPORTED_SDL_ROBOTIC_PLATFORMS
+    assert "athena_cloud_lab" in SUPPORTED_SDL_ROBOTIC_PLATFORMS
+    assert len(SUPPORTED_SDL_ROBOTIC_PLATFORMS) == 5
 
     assert "mcp_v1_standard" in SUPPORTED_MCP_AGENT_FRAMEWORKS
     assert "chemcrow_agent" in SUPPORTED_MCP_AGENT_FRAMEWORKS
@@ -297,7 +311,7 @@ def test_rich_report_with_extended_fields_and_markdown() -> None:
     assert "atomate2" in md
     # Section numbering updated
     assert "## 6. Generator Provenance" in md
-    assert "## 9. Portable Downstream DFT" in md
+    assert "## 11. Portable Downstream DFT" in md
 
 
 def test_molecular_drug_and_mcp_agent_report_rendering() -> None:
@@ -347,3 +361,59 @@ def test_molecular_drug_and_mcp_agent_report_rendering() -> None:
     assert "chemcrow_agent" in md
     assert "opentrons_liquid_handler" in md
     assert "mcp://chem.lab.internal/v1" in md
+
+
+def test_phonon_mof_and_sdl_report_rendering() -> None:
+    """Verify phonon dynamical stability, MOF porous framework, and Self-Driving Lab handoffs render in markdown."""
+    report = build_rich_candidate_report(
+        report_id="MOF-SDL-001",
+        user_goal="Generate ultra-high surface area MOF for carbon capture in autonomous lab",
+        domain="energy_materials",
+        target_role="co2_adsorption_mof",
+        candidate_id="CAND-MOF-55",
+        formula="Zn4O(BDC)3",
+        generator=GeneratorProvenanceSummary(
+            generator_id="mofdiff",
+            checkpoint_id="mofdiff_cg_v1",
+        ),
+        phonon_stability=PhononDynamicalStabilitySummary(
+            min_phonon_frequency_thz=0.45,
+            imaginary_modes_count=0,
+            dynamical_stability_status="stable",
+            phonopy_supercell_dim=[2, 2, 2],
+        ),
+        porous_framework=PorousFrameworkCandidateDetails(
+            gravimetric_surface_area_m2_per_g=3450.0,
+            volumetric_surface_area_m2_per_cm3=2100.0,
+            pore_volume_cm3_per_g=1.45,
+            largest_cavity_diameter_angstrom=15.2,
+            pore_limiting_diameter_angstrom=8.4,
+            co2_adsorption_capacity_mmol_per_g=7.85,
+        ),
+        self_driving_lab=AutonomousSelfDrivingLabSpec(
+            target_platform="alab_solid_state",
+            precursor_compounds=["Zn(NO3)2·6H2O", "H2BDC", "DMF"],
+            synthesis_temperature_celsius=120.0,
+            synthesis_atmosphere="Ar",
+            characterization_methods=["XRD", "BET_surface_area", "TGA"],
+            closed_loop_active_learning_batch=3,
+        ),
+    )
+
+    assert report.phonon_stability.dynamical_stability_status == "stable"
+    assert report.porous_framework is not None
+    assert report.porous_framework.gravimetric_surface_area_m2_per_g == pytest.approx(3450.0)
+    assert report.self_driving_lab is not None
+    assert report.self_driving_lab.target_platform == "alab_solid_state"
+
+    md = format_material_candidate_markdown_report(report)
+    assert "0.450 THz" in md
+    assert "stable" in md
+    assert "Porous Framework & MOF Adsorption Identity" in md
+    assert "3450.0 m²/g" in md
+    assert "7.85 mmol/g" in md
+    assert "Self-Driving Lab (SDL) Autonomous Robotic Synthesis Handoff" in md
+    assert "alab_solid_state" in md
+    assert "Zn(NO3)2·6H2O" in md
+    assert "Batch #3" in md
+

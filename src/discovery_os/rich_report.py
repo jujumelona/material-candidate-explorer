@@ -51,10 +51,11 @@ SUPPORTED_MLIP_EXPERT_IDS: list[str] = [
     "uma_small",
 ]
 
-# Supported crystal & molecular generator IDs.
+# Supported crystal, MOF & molecular generator IDs.
 # MatterGen (Zeni et al., Nature 2025), DiffCSP++ (Jiao et al. 2024),
 # FlowMM (Miller et al., ICML 2024), CrystaLLM (LLM-based, 2024),
 # CDVAE (Xie et al., NeurIPS 2022), SCIGEN (Nat Mater 2025),
+# MOFDiff (ICLR 2024), Mofasa (2025), MolCrystalFlow (2026),
 # RFdiffusion3 (Baker Lab 2025/2026), ESM3 (Evolutionary Scale 2024),
 # MolMIM / BioNeMo (NVIDIA 2025), AlphaFold3 (DeepMind/Isomorphic 2024)
 SUPPORTED_GENERATOR_IDS: list[str] = [
@@ -64,11 +65,25 @@ SUPPORTED_GENERATOR_IDS: list[str] = [
     "crystalllm",
     "cdvae",
     "scigen",
+    "mofdiff",
+    "mofasa",
+    "molcrystalflow",
     "rfdiffusion3",
     "esm3",
     "molmim",
     "bionemo_gen",
     "alphafold3_binder",
+]
+
+# Supported Self-Driving Lab (SDL) robotic automation platforms.
+# A-Lab (Nature 2023/2024), Polybot (ANL 2024), Opentrons OT-2/Flex (2024-2026),
+# Chemspeed AutoPlatform (2025), ATHENA Hub (NSF 2025/2026)
+SUPPORTED_SDL_ROBOTIC_PLATFORMS: list[str] = [
+    "alab_solid_state",
+    "polybot_synthesizer",
+    "opentrons_flex",
+    "chemspeed_autoplatform",
+    "athena_cloud_lab",
 ]
 
 # Supported scientific MCP (Model Context Protocol) agent frameworks.
@@ -103,6 +118,14 @@ class MultiExpertReliabilitySummary(StrictSchema):
     pareto_rank: int | None = None
     # Extended expert results for additional MLIP foundation models
     additional_experts: list[MlipExpertResult] = Field(default_factory=list)
+
+
+class PhononDynamicalStabilitySummary(StrictSchema):
+    """Phonon dispersion & dynamical stability evaluation using MLIP finite displacements (Phonopy)."""
+    min_phonon_frequency_thz: float | None = None
+    imaginary_modes_count: int = 0
+    dynamical_stability_status: Literal["stable", "unstable_imaginary_modes", "not_evaluated"] = "not_evaluated"
+    phonopy_supercell_dim: list[int] = Field(default_factory=lambda: [2, 2, 2])
 
 
 _NOVELTY_STATUS = Literal["no_match", "match", "unresolved"]
@@ -140,6 +163,26 @@ class GeneratorProvenanceSummary(StrictSchema):
     guidance_alpha: float | None = None
     conditions_applied: list[str] = Field(default_factory=list)
     conditions_ignored: list[str] = Field(default_factory=list)
+
+
+class PorousFrameworkCandidateDetails(StrictSchema):
+    """Specific identity & adsorption metrics for MOFs, COFs, and porous frameworks."""
+    gravimetric_surface_area_m2_per_g: float | None = None
+    volumetric_surface_area_m2_per_cm3: float | None = None
+    pore_volume_cm3_per_g: float | None = None
+    largest_cavity_diameter_angstrom: float | None = None
+    pore_limiting_diameter_angstrom: float | None = None
+    co2_adsorption_capacity_mmol_per_g: float | None = None
+
+
+class AutonomousSelfDrivingLabSpec(StrictSchema):
+    """Specification for closed-loop Self-Driving Lab (SDL) robotic synthesis & characterization."""
+    target_platform: str = Field(default="alab_solid_state")
+    precursor_compounds: list[str] = Field(default_factory=list)
+    synthesis_temperature_celsius: float | None = None
+    synthesis_atmosphere: str = Field(default="Ar")
+    characterization_methods: list[str] = Field(default_factory=lambda: ["XRD", "SEM"])
+    closed_loop_active_learning_batch: int = 1
 
 
 class MolecularDrugCandidateDetails(StrictSchema):
@@ -188,13 +231,18 @@ class RichMaterialCandidateReport(StrictSchema):
     identity: CrystallographicIdentityDetails
     properties: EvaluatedPropertiesSummary
     reliability: MultiExpertReliabilitySummary
+    phonon_stability: PhononDynamicalStabilitySummary = Field(
+        default_factory=PhononDynamicalStabilitySummary
+    )
     novelty: DatabaseNoveltyCheckSummary
     literature: StageLiteratureEvidenceSummary
     generator: GeneratorProvenanceSummary = Field(
         default_factory=GeneratorProvenanceSummary
     )
+    porous_framework: PorousFrameworkCandidateDetails | None = None
     molecular_drug: MolecularDrugCandidateDetails | None = None
     mcp_agent: McpAgentExecutionProvenance | None = None
+    self_driving_lab: AutonomousSelfDrivingLabSpec | None = None
     dft_handoff: DftHandoffSpecSummary
 
 
@@ -209,11 +257,14 @@ def build_rich_candidate_report(
     identity: CrystallographicIdentityDetails | None = None,
     properties: EvaluatedPropertiesSummary | None = None,
     reliability: MultiExpertReliabilitySummary | None = None,
+    phonon_stability: PhononDynamicalStabilitySummary | None = None,
     novelty: DatabaseNoveltyCheckSummary | None = None,
     literature: StageLiteratureEvidenceSummary | None = None,
     generator: GeneratorProvenanceSummary | None = None,
+    porous_framework: PorousFrameworkCandidateDetails | None = None,
     molecular_drug: MolecularDrugCandidateDetails | None = None,
     mcp_agent: McpAgentExecutionProvenance | None = None,
+    self_driving_lab: AutonomousSelfDrivingLabSpec | None = None,
     dft_handoff: DftHandoffSpecSummary | None = None,
 ) -> RichMaterialCandidateReport:
     """Constructs a complete, validated RichMaterialCandidateReport."""
@@ -226,6 +277,8 @@ def build_rich_candidate_report(
         properties = EvaluatedPropertiesSummary()
     if reliability is None:
         reliability = MultiExpertReliabilitySummary()
+    if phonon_stability is None:
+        phonon_stability = PhononDynamicalStabilitySummary()
     if novelty is None:
         novelty = DatabaseNoveltyCheckSummary()
     if literature is None:
@@ -245,11 +298,14 @@ def build_rich_candidate_report(
         identity=identity,
         properties=properties,
         reliability=reliability,
+        phonon_stability=phonon_stability,
         novelty=novelty,
         literature=literature,
         generator=generator,
+        porous_framework=porous_framework,
         molecular_drug=molecular_drug,
         mcp_agent=mcp_agent,
+        self_driving_lab=self_driving_lab,
         dft_handoff=dft_handoff,
     )
 
@@ -329,6 +385,12 @@ def format_material_candidate_markdown_report(report: RichMaterialCandidateRepor
     cov_str = f"{report.reliability.conformal_coverage_score:.2f}" if report.reliability.conformal_coverage_score is not None else "N/A"
     lines.append(f"| **Conformal Reliability Score** | {cov_str} | Split-Conformal Calibration |")
     lines.append(f"| **Pareto Rank** | `{report.reliability.pareto_rank or 'N/A'}` | NSGA-II Multi-Objective Rank |")
+    
+    # Render Phonon Dynamical Stability ($\omega^2 > 0$)
+    min_freq_str = f"{report.phonon_stability.min_phonon_frequency_thz:.3f} THz" if report.phonon_stability.min_phonon_frequency_thz is not None else "N/A"
+    supercell_str = " × ".join(str(x) for x in report.phonon_stability.phonopy_supercell_dim)
+    lines.append(f"| **Phonon Min Frequency** | `{min_freq_str}` | Phonopy + MLIP Finite Displacements (`{supercell_str}`) |")
+    lines.append(r"| **Phonon Imaginary Modes** | " + f"`{report.phonon_stability.imaginary_modes_count}` | `{report.phonon_stability.dynamical_stability_status}` " + r"($\omega^2 > 0$ gate) |")
     lines.append("")
 
     lines.append("## 4. Structural Novelty & Database Cross-Check")
@@ -406,8 +468,27 @@ def format_material_candidate_markdown_report(report: RichMaterialCandidateRepor
         lines.append(f"| **ADMET Gate Status** | `{report.molecular_drug.admet_gate_status}` | Toxicity & Pharmacokinetics |")
         lines.append("")
 
+    if report.porous_framework is not None:
+        lines.append("## 8. Porous Framework & MOF Adsorption Identity")
+        lines.append("")
+        lines.append("| Metric | Evaluated Value | Description |")
+        lines.append("| :--- | :--- | :--- |")
+        if report.porous_framework.gravimetric_surface_area_m2_per_g is not None:
+            lines.append(f"| **Gravimetric Surface Area** | `{report.porous_framework.gravimetric_surface_area_m2_per_g:.1f} m²/g` | BET Surface Area |")
+        if report.porous_framework.volumetric_surface_area_m2_per_cm3 is not None:
+            lines.append(f"| **Volumetric Surface Area** | `{report.porous_framework.volumetric_surface_area_m2_per_cm3:.1f} m²/cm³` | Volumetric Capacity |")
+        if report.porous_framework.pore_volume_cm3_per_g is not None:
+            lines.append(f"| **Pore Volume** | `{report.porous_framework.pore_volume_cm3_per_g:.3f} cm³/g` | Total Void Space |")
+        if report.porous_framework.largest_cavity_diameter_angstrom is not None:
+            lines.append(f"| **Largest Cavity Diameter (LCD)** | `{report.porous_framework.largest_cavity_diameter_angstrom:.2f} Å` | Pore Architecture |")
+        if report.porous_framework.pore_limiting_diameter_angstrom is not None:
+            lines.append(f"| **Pore Limiting Diameter (PLD)** | `{report.porous_framework.pore_limiting_diameter_angstrom:.2f} Å` | Aperture Gate |")
+        if report.porous_framework.co2_adsorption_capacity_mmol_per_g is not None:
+            lines.append(f"| **CO₂ Adsorption Capacity** | `{report.porous_framework.co2_adsorption_capacity_mmol_per_g:.2f} mmol/g` | Gas Storage / Capture |")
+        lines.append("")
+
     if report.mcp_agent is not None:
-        lines.append("## 8. Model Context Protocol (MCP) Scientific Agent Session")
+        lines.append("## 9. Model Context Protocol (MCP) Scientific Agent Session")
         lines.append("")
         lines.append("| Audit Metric | Details |")
         lines.append("| :--- | :--- |")
@@ -420,7 +501,23 @@ def format_material_candidate_markdown_report(report: RichMaterialCandidateRepor
         lines.append(f"| **Robotic Lab Handoff Ready** | `{'Yes' if report.mcp_agent.robotic_lab_handoff_ready else 'No'}` |")
         lines.append("")
 
-    lines.append("## 9. Portable Downstream DFT / Simulation Handoff Package")
+    if report.self_driving_lab is not None:
+        lines.append("## 10. Self-Driving Lab (SDL) Autonomous Robotic Synthesis Handoff")
+        lines.append("")
+        lines.append("| Execution Parameter | Specification |")
+        lines.append("| :--- | :--- |")
+        lines.append(f"| **Robotic Platform** | `{report.self_driving_lab.target_platform}` |")
+        if report.self_driving_lab.precursor_compounds:
+            lines.append(f"| **Precursor Compounds** | {', '.join(f'`{p}`' for p in report.self_driving_lab.precursor_compounds)} |")
+        if report.self_driving_lab.synthesis_temperature_celsius is not None:
+            lines.append(f"| **Synthesis Temperature** | `{report.self_driving_lab.synthesis_temperature_celsius:.1f} °C` |")
+        lines.append(f"| **Atmosphere** | `{report.self_driving_lab.synthesis_atmosphere}` |")
+        if report.self_driving_lab.characterization_methods:
+            lines.append(f"| **Autonomous Characterization** | {', '.join(f'`{m}`' for m in report.self_driving_lab.characterization_methods)} |")
+        lines.append(f"| **Active Learning Iteration Batch** | `Batch #{report.self_driving_lab.closed_loop_active_learning_batch}` |")
+        lines.append("")
+
+    lines.append("## 11. Portable Downstream DFT / Simulation Handoff Package")
     lines.append("")
     lines.append("| DFT Requirement | Parameter / Specification |")
     lines.append("| :--- | :--- |")
