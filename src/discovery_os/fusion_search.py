@@ -50,10 +50,17 @@ from .fusion_schemas import (
 )
 from .hashing import bytes_hash, candidate_content_hash, canonical_json, stable_hash
 from .literature_rag import EvidenceBranchAssignment, LiteratureEvidencePolicy
+from .materials_screening import select_dft_handoff_refs
+from .screening_validation import (
+    CandidateMaterialScreeningReceipt,
+    MaterialScreeningValidationRunner,
+    build_http_material_screening_runner,
+)
 from .schemas import (
     Candidate,
     CandidateRef,
     CandidateRepresentation,
+    CandidateType,
     DiscoveryGoal,
     Identifier,
     NonEmptyText,
@@ -192,6 +199,8 @@ class SearchCandidateRecord(StrictSchema):
     selection_eligible: bool = True
     exclusion_reasons: list[str] = Field(default_factory=list)
     structural_collapse_reasons: list[NonEmptyText] = Field(default_factory=list)
+    material_screening: CandidateMaterialScreeningReceipt | None = None
+    material_screening_artifact: ContentArtifactRef | None = None
 
     @model_validator(mode="after")
     def _record_is_consistent(self) -> SearchCandidateRecord:
@@ -229,6 +238,27 @@ class SearchCandidateRecord(StrictSchema):
             if not set(self.structural_collapse_reasons).issubset(self.exclusion_reasons):
                 raise ValueError(
                     "structural collapse reasons must be preserved as exclusion reasons"
+                )
+        if (self.material_screening is None) != (
+            self.material_screening_artifact is None
+        ):
+            raise ValueError(
+                "material screening receipt and artifact must be present together"
+            )
+        if self.material_screening is not None:
+            if self.material_screening.candidate_ref != candidate_ref:
+                raise ValueError("material screening belongs to another candidate")
+            if (
+                self.material_screening_artifact.media_type
+                != "application/vnd.discovery-os.material-screening-batch+json"
+            ):
+                raise ValueError("material screening artifact has the wrong media type")
+            if (
+                self.material_screening.status == "invalid_geometry"
+                and self.selection_eligible
+            ):
+                raise ValueError(
+                    "invalid relaxed geometry cannot remain selection eligible"
                 )
         return self
 
@@ -672,6 +702,7 @@ class FusionSearchRunner:
         scheduler_factory: Callable[
             [GenerationControls], AdaptiveGenerationScheduler
         ] | None = None,
+        material_screening_validator: MaterialScreeningValidationRunner | None = None,
     ) -> None:
         if (
             loop_runner.runtime.artifact_store.root
@@ -684,6 +715,13 @@ class FusionSearchRunner:
         self.evidence_store = evidence_store
         self.selector = selector or DeterministicExplorationSelector(evidence_store)
         self.scheduler_factory = scheduler_factory
+        self.material_screening_validator = (
+            material_screening_validator
+            or build_http_material_screening_runner(
+                registry=loop_runner.runtime.registry,
+                evidence_store=evidence_store,
+            )
+        )
 
     def run(
         self,
@@ -1152,6 +1190,17 @@ class FusionSearchRunner:
                 current_by_ref.values(),
                 key=lambda item: _candidate_ref_key(item.candidate.candidate_ref),
             )
+            if self.material_screening_validator is not None:
+                unique_current = self._screen_material_candidates(
+                    search_id=search_id,
+                    round_index=round_index,
+                    records=unique_current,
+                    seed=base_run_config.seed,
+                    current_by_ref=current_by_ref,
+                    candidate_records=candidate_records,
+                    branch_records_by_ref=branch_records_by_ref,
+                    branch_pool_records=branch_pool_records,
+                )
             preeligible = [item for item in unique_current if item.selection_eligible]
             if preeligible:
                 pool = CandidatePool(
@@ -1291,6 +1340,19 @@ class FusionSearchRunner:
                 if str(result.branch) == ExplorationBranch.EXPERT_DISAGREEMENT.value
                 for item in result.candidates
             ]
+            disagreement_refs = _unique_candidate_refs(
+                [
+                    *disagreement_refs,
+                    *[
+                        item.candidate.candidate_ref
+                        for item in unique_current
+                        if item.material_screening is not None
+                        and item.material_screening.screening_vector is not None
+                        and item.material_screening.screening_vector.disagreement.risk
+                        == "high"
+                    ],
+                ]
+            )
             for branch in branch_order:
                 automatic = self._automatic_observation(
                     branch=branch,
@@ -1848,6 +1910,108 @@ class FusionSearchRunner:
         )
         return cycle, parent_record, children
 
+    def _screen_material_candidates(
+        self,
+        *,
+        search_id: str,
+        round_index: int,
+        records: list[SearchCandidateRecord],
+        seed: int,
+        current_by_ref: dict[str, SearchCandidateRecord],
+        candidate_records: dict[str, SearchCandidateRecord],
+        branch_records_by_ref: dict[
+            ExplorationBranch, dict[str, SearchCandidateRecord]
+        ],
+        branch_pool_records: dict[
+            ExplorationBranch, dict[str, SearchCandidateRecord]
+        ],
+    ) -> list[SearchCandidateRecord]:
+        """Execute the two-MLIP validation path before branch selection."""
+
+        validator = self.material_screening_validator
+        if validator is None:
+            return records
+        screenable = [
+            item
+            for item in records
+            if item.selection_eligible and _is_periodic_screening_candidate(item.candidate)
+        ]
+        if not screenable:
+            return records
+        evidence = {
+            _candidate_ref_key(item.candidate.candidate_ref): list(item.evidence_ids)
+            for item in screenable
+        }
+        try:
+            batch = validator.evaluate(
+                [item.candidate for item in screenable],
+                evidence,
+                seed=seed + round_index,
+            )
+        except Exception as exc:
+            raise FusionSearchError(
+                "material screening validator failed before branch selection: "
+                f"{type(exc).__name__}: {_safe_failure_cause(exc)}"
+            ) from exc
+        artifact = self._persist_object(
+            search_id,
+            "material-screening",
+            batch,
+            artifact_prefix="MSCREEN",
+            media_type="application/vnd.discovery-os.material-screening-batch+json",
+        )
+        receipts = {
+            _candidate_ref_key(item.candidate_ref): item for item in batch.receipts
+        }
+        output: list[SearchCandidateRecord] = []
+        for record in records:
+            key = _candidate_ref_key(record.candidate.candidate_ref)
+            receipt = receipts.get(key)
+            if receipt is None:
+                output.append(record)
+                continue
+            exclusion_reasons = list(record.exclusion_reasons)
+            if receipt.status == "invalid_geometry":
+                exclusion_reasons.append(
+                    "material_screening:invalid_relaxed_geometry"
+                )
+                for attempt in (
+                    receipt.mattersim_relaxation,
+                    receipt.chgnet_relaxation,
+                ):
+                    if attempt.payload is None:
+                        continue
+                    exclusion_reasons.extend(
+                        "material_screening:geometry:" + reason
+                        for reason in attempt.payload.geometry_gate.errors
+                    )
+            updated = SearchCandidateRecord.model_validate_json(
+                record.model_copy(
+                    update={
+                        "material_screening": receipt,
+                        "material_screening_artifact": artifact,
+                        "selection_eligible": (
+                            record.selection_eligible
+                            and receipt.status != "invalid_geometry"
+                        ),
+                        "exclusion_reasons": sorted(set(exclusion_reasons)),
+                    }
+                ).model_dump_json(),
+                strict=True,
+            )
+            output.append(updated)
+            current_by_ref[key] = updated
+            candidate_records[updated.record_id] = updated
+            for branch in ExplorationBranch:
+                if key in branch_records_by_ref[branch]:
+                    branch_records_by_ref[branch][key] = updated
+                if key in branch_pool_records[branch]:
+                    branch_pool_records[branch][key] = updated
+        return sorted(
+            output,
+            key=lambda item: _candidate_ref_key(item.candidate.candidate_ref),
+        )
+
     def _ingest_primary(
         self,
         report,
@@ -2377,6 +2541,25 @@ def _ranked_candidate_results(
             rationale.append(
                 "Cross-expert disagreement is preserved as a follow-up signal, not a quality bonus."
             )
+        screening = record.material_screening
+        if screening is not None:
+            if screening.pareto_rank is not None:
+                rationale.append(
+                    "Executed MatterSim/CHGNet relaxation screening placed the "
+                    f"candidate on composition Pareto front "
+                    f"{screening.pareto_rank.composition_pareto_front} "
+                    f"(validation priority {screening.pareto_rank.global_priority_rank})."
+                )
+            if screening.screening_vector is not None:
+                rationale.append(
+                    "Typed cross-MLIP disagreement risk is "
+                    f"{screening.screening_vector.disagreement.risk}; "
+                    "raw absolute energy offset was audit-only."
+                )
+            if screening.dft_escalation:
+                rationale.append(
+                    "Screening or calibration evidence requires a reference-consistent DFT handoff."
+                )
         output.append(
             RankedSearchCandidate(
                 rank=rank,
@@ -2421,8 +2604,10 @@ def _validation_handoff_refs(
     the responsibility of a structure-standardization connector.
     """
 
+    record_rows = list(records)
     by_ref: dict[str, Candidate] = {}
-    for record in records:
+    screened_by_ref: dict[str, CandidateMaterialScreeningReceipt] = {}
+    for record in record_rows:
         key = _candidate_ref_key(record.candidate.candidate_ref)
         prior = by_ref.get(key)
         if prior is not None and prior != record.candidate:
@@ -2430,6 +2615,51 @@ def _validation_handoff_refs(
                 "one handoff candidate reference resolved to different candidates"
             )
         by_ref[key] = record.candidate
+        screening = record.material_screening
+        if screening is not None and screening.pareto_rank is not None:
+            prior_screening = screened_by_ref.get(key)
+            if (
+                prior_screening is None
+                or prior_screening.pareto_rank is None
+                or screening.pareto_rank.global_priority_rank
+                < prior_screening.pareto_rank.global_priority_rank
+            ):
+                screened_by_ref[key] = screening
+
+    if screened_by_ref:
+        ranked = sorted(
+            (item.pareto_rank for item in screened_by_ref.values()),
+            key=lambda item: item.global_priority_rank,  # type: ignore[union-attr]
+        )
+        vectors = [
+            item.screening_vector
+            for item in screened_by_ref.values()
+            if item.screening_vector is not None
+        ]
+        typed_refs = select_dft_handoff_refs(
+            ranked,  # type: ignore[arg-type]
+            vectors,
+            top_k=min(5, len(vectors)),
+        )
+        refs: list[CandidateRef] = []
+        seen_scientific_content: set[str] = set()
+        for reference in typed_refs:
+            candidate = by_ref[_candidate_ref_key(reference)]
+            scientific_content = stable_hash(
+                {
+                    "candidate_type": candidate.candidate_type,
+                    "domain": candidate.domain,
+                    "representations": [
+                        _scientific_representation(item)
+                        for item in candidate.representations
+                    ],
+                }
+            )
+            if scientific_content in seen_scientific_content:
+                continue
+            seen_scientific_content.add(scientific_content)
+            refs.append(reference)
+        return refs
 
     selected_by_branch = {
         ExplorationBranch(str(result.branch)): result for result in selection.branches
@@ -2623,6 +2853,18 @@ _RAW_ENERGY_PROPERTY_NAMES = frozenset(
 
 def _is_raw_energy_property(name: str) -> bool:
     return name.strip().casefold().replace("-", "_") in _RAW_ENERGY_PROPERTY_NAMES
+
+
+def _is_periodic_screening_candidate(candidate: Candidate) -> bool:
+    return candidate.candidate_type in {
+        CandidateType.CRYSTAL,
+        CandidateType.ALLOY,
+        CandidateType.BATTERY_MATERIAL,
+        CandidateType.CATALYST,
+    } and any(
+        item.kind in {RepresentationKind.CIF, RepresentationKind.POSCAR}
+        for item in candidate.representations
+    )
 
 
 def _candidate_composition_scope(candidate: Candidate) -> str | None:

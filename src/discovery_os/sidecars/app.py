@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,7 @@ from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
+from discovery_os.crystal_identity import validate_crystal_geometry
 from discovery_os.fusion_schemas import (
     DiagnosticProperty,
     ExpertFeaturePayload,
@@ -27,9 +29,11 @@ from discovery_os.fusion_schemas import (
 )
 from discovery_os.hashing import candidate_content_hash, stable_hash
 from discovery_os.relaxation import (
+    PeriodicGeometryGateReport,
     PeriodicRelaxationPayload,
     PeriodicRelaxationRequest,
     PeriodicRelaxationResult,
+    PeriodicStressTensor,
 )
 from discovery_os.schemas import (
     Candidate,
@@ -339,6 +343,41 @@ def _relaxation_payload(
         failures.append("minimum_distance_below_safety_threshold")
     if abs(result.volume_change_fraction) > settings.max_abs_volume_change_fraction:
         failures.append("volume_change_above_allowed_limit")
+    initial_stress = _periodic_stress_tensor(result.initial_stress_eV_A3)
+    final_stress = _periodic_stress_tensor(result.final_stress_eV_A3)
+    if settings.require_final_stress and final_stress is None:
+        failures.append("final_stress_unavailable")
+    elif (
+        final_stress is not None
+        and final_stress.frobenius_norm_GPa > settings.max_final_stress_norm_GPa
+    ):
+        failures.append("final_stress_above_allowed_limit")
+    try:
+        geometry = validate_crystal_geometry(
+            result.relaxed_cif,
+            fmt="cif",
+            minimum_distance_angstrom=settings.minimum_distance_safety_A,
+            raise_on_error=False,
+        )
+    except Exception as exc:
+        raise ModelOutputError(
+            "relaxed CIF could not be checked by validate_crystal_geometry: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    geometry_gate = PeriodicGeometryGateReport(
+        atom_count=geometry.atom_count,
+        volume_A3=geometry.volume_angstrom3,
+        volume_per_atom_A3=geometry.volume_per_atom_angstrom3,
+        minimum_distance_A=geometry.minimum_distance_angstrom,
+        minimum_distance_threshold_A=geometry.minimum_distance_threshold_angstrom,
+        is_valid=geometry.is_valid,
+        errors=list(geometry.errors),
+        warnings=list(geometry.warnings),
+    )
+    if geometry.atom_count != result.atom_count:
+        failures.append("relaxed_atom_count_changed")
+    if not geometry.is_valid:
+        failures.append("invalid_relaxed_geometry")
     representation = CandidateRepresentation(
         kind=RepresentationKind.CIF,
         value=result.relaxed_cif,
@@ -356,14 +395,18 @@ def _relaxation_payload(
         completed_steps=result.completed_steps,
         converged=result.converged,
         target_fmax_eV_A=settings.target_fmax_eV_A,
+        atom_count=result.atom_count,
         initial_max_force_eV_A=result.initial_max_force_eV_A,
         final_max_force_eV_A=result.final_max_force_eV_A,
         initial_energy_eV=result.initial_energy_eV,
         final_energy_eV=result.final_energy_eV,
+        initial_stress=initial_stress,
+        final_stress=final_stress,
         volume_change_fraction=result.volume_change_fraction,
         minimum_distance_before_A=result.minimum_distance_before_A,
         minimum_distance_after_A=result.minimum_distance_after_A,
         relaxed_structure=representation,
+        geometry_gate=geometry_gate,
         strict_gate_passed=not failures,
         gate_failures=failures,
         warnings=list(result.warnings),
@@ -381,6 +424,30 @@ def _relaxation_payload(
         },
     )
     return _strict_roundtrip(payload)
+
+
+def _periodic_stress_tensor(
+    values: tuple[float, ...] | None,
+) -> PeriodicStressTensor | None:
+    if values is None:
+        return None
+    components = [float(item) for item in values]
+    if len(components) != 6 or any(not math.isfinite(item) for item in components):
+        raise ModelOutputError(
+            "periodic stress must contain six finite ASE-Voigt components"
+        )
+    xx, yy, zz, yz, xz, xy = components
+    norm = math.sqrt(
+        xx * xx
+        + yy * yy
+        + zz * zz
+        + 2.0 * (yz * yz + xz * xz + xy * xy)
+    )
+    return PeriodicStressTensor(
+        components_eV_A3=components,
+        frobenius_norm_eV_A3=norm,
+        frobenius_norm_GPa=norm * 160.2176634,
+    )
 
 
 def _generation_response(

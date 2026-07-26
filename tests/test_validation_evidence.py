@@ -14,11 +14,13 @@ from discovery_os.literature_rag import (
     LiteratureQuery,
     LiteratureRecord,
     LiteratureSource,
+    QueryIntentCoverage,
     RagEvidenceBundle,
     RagSearchPlan,
     SourceRetrievalStatus,
     SourceRunStatus,
 )
+from discovery_os.material_stage_research import stage_research_policy
 from discovery_os.mcp_client import McpClientError
 from discovery_os.validation_evidence import (
     McpContractVerificationStatus,
@@ -35,26 +37,51 @@ from discovery_os.validation_evidence import (
 )
 
 
-def _bundle() -> RagEvidenceBundle:
+def _bundle(
+    stage: ValidationEvidenceStage = ValidationEvidenceStage.GENERATION_PRIOR,
+) -> RagEvidenceBundle:
     now = datetime.now(timezone.utc)
+    policy = stage_research_policy(str(stage))
+    queries = [
+        LiteratureQuery(
+            query_id=f"query-li-o-{intent.intent_id}",
+            source=LiteratureSource.CROSSREF,
+            query=f"Li-O {intent.intent_id}",
+            rationale="fixture",
+            intent_id=intent.intent_id,
+            expected_record_types=list(intent.expected_record_types),
+            mcp_arguments={
+                "stage": str(stage),
+                "intent_id": intent.intent_id,
+            },
+        )
+        for intent in policy.query_intents
+    ]
     record = LiteratureRecord(
         record_id="LIT-li-o",
         title="Reported Li-O phase stability and synthesis conditions",
-        abstract="Li-O phases were characterized under bounded synthesis conditions.",
+        abstract="Li2O was synthesized at 800 K under argon and characterized by XRD.",
         source_ids={"crossref": "10.1000/li-o"},
-        source_queries=["query-li-o"],
+        source_queries=[item.query_id for item in queries],
         retrieved_at=now,
     )
     claim = EvidenceClaim(
         claim_id="CLAIM-li-o",
         source_record_id=record.record_id,
         subject="Li-O",
-        predicate="has reported phases under",
-        object="bounded synthesis conditions",
+        predicate="was explicitly synthesized under",
+        object="800 K under argon",
         polarity=EvidencePolarity.SUPPORTS,
-        stage=EvidenceStage.MATERIAL_CHARACTERIZATION,
+        stage=EvidenceStage.MATERIAL_SYNTHESIS,
         support_text=record.abstract,
         confidence=0.8,
+        qualifiers={
+            "composition": "Li2O",
+            "chemical_system": "Li-O",
+            "synthesis_outcome": "successful_target",
+            "conditions": {"temperature": "800 K", "atmosphere": "argon"},
+            "source_grounded_generation_steering": True,
+        },
     )
     plan = RagSearchPlan(
         plan_id="RPLAN-li-o",
@@ -62,14 +89,10 @@ def _bundle() -> RagEvidenceBundle:
         generated_at=now,
         planner_id="fixture",
         planner_version="1",
-        queries=[
-            LiteratureQuery(
-                query_id="query-li-o",
-                source=LiteratureSource.CROSSREF,
-                query="Li-O phase stability",
-                rationale="fixture",
-            )
-        ],
+        query_policy_id=policy.policy_id,
+        query_policy_version=policy.policy_version,
+        required_intent_ids=[item.intent_id for item in policy.query_intents],
+        queries=queries,
     )
     return RagEvidenceBundle(
         bundle_id="RBUNDLE-li-o",
@@ -79,7 +102,7 @@ def _bundle() -> RagEvidenceBundle:
             SourceRetrievalStatus(
                 source=LiteratureSource.CROSSREF,
                 status=SourceRunStatus.SUCCESS,
-                query_ids=["query-li-o"],
+                query_ids=[item.query_id for item in queries],
                 result_count=1,
             )
         ],
@@ -96,6 +119,20 @@ def _bundle() -> RagEvidenceBundle:
                 generator_hints={"chemical_system": "Li-O"},
                 priority=0.8,
             )
+        ],
+        intent_coverage=[
+            QueryIntentCoverage(
+                intent_id=intent.intent_id,
+                query_ids=[
+                    item.query_id
+                    for item in queries
+                    if item.intent_id == intent.intent_id
+                ],
+                record_ids=[record.record_id],
+                sources_with_records=[LiteratureSource.CROSSREF],
+                status="covered",
+            )
+            for intent in policy.query_intents
         ],
     )
 
@@ -120,10 +157,39 @@ class _Pipeline:
 
 
 class _ContractClient:
-    def require_tool_contract(self, name, *, accepted_arguments, result_collection):
+    def require_tool_contract(
+        self,
+        name,
+        *,
+        accepted_arguments,
+        result_collection,
+        required_record_fields,
+    ):
         assert name == "search_materials"
-        assert accepted_arguments == ("query", "max_results", "from_date", "to_date")
+        assert accepted_arguments[:12] == (
+            "query",
+            "max_results",
+            "from_date",
+            "to_date",
+            "stage",
+            "intent_id",
+            "chemical_system",
+            "material_field",
+            "application_subtype",
+            "composition_keys",
+            "candidate_refs",
+            "record_types",
+        )
+        assert accepted_arguments[12].endswith("_scope")
         assert result_collection == "records"
+        assert required_record_fields == (
+            "source_id",
+            "title",
+            "record_type",
+            "support_text",
+            "provenance",
+            "stage_metadata",
+        )
         return {"tool_name": name}
 
 
@@ -354,7 +420,18 @@ def test_all_stage_routes_are_closed_typed_and_fail_closed() -> None:
             f"MATERIAL_RAG_MCP_TOOL_{stage.value.upper()}"
         )
         assert route.mcp_contract.selection_policy == "administrator-configured-allowlist-only"
-        assert route.mcp_contract.required_record_fields == ["source_id", "title"]
+        assert route.mcp_contract.required_record_fields == [
+            "source_id",
+            "title",
+            "record_type",
+            "support_text",
+            "provenance",
+            "stage_metadata",
+        ]
+        assert route.research_policy_id
+        assert len(route.required_query_intent_ids) >= 5
+        assert route.mcp_contract.required_provenance_fields
+        assert route.mcp_contract.required_stage_metadata_fields
         assert route.handoff_contract.kind == kind
         assert route.handoff_contract.payload_schema == payload_schema
         assert route.handoff_contract.can_steer_generation is can_steer
@@ -362,7 +439,7 @@ def test_all_stage_routes_are_closed_typed_and_fail_closed() -> None:
 
 
 def test_non_allowlisted_bundle_source_fails_closed(tmp_path) -> None:
-    bundle = _bundle()
+    bundle = _bundle(ValidationEvidenceStage.MLIP_DISAGREEMENT)
     bad_query = bundle.search_plan.queries[0].model_copy(
         update={"source": LiteratureSource.PUBMED}
     )

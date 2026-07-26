@@ -25,13 +25,19 @@ from .hashing import stable_hash
 from .literature_rag import (
     EvidenceBranchAssignment,
     LiteratureEvidencePolicy,
+    QueryIntentCoverage,
     LiteratureRagPipeline,
     LiteratureSource,
     RagEvidenceBundle,
     SourceRetrievalStatus,
     SourceRunStatus,
     build_literature_rag_from_environment,
+    close_material_generation_branches,
     save_evidence_bundle,
+)
+from .material_stage_research import (
+    build_stage_query_blueprints,
+    stage_research_policy,
 )
 from .mcp_client import McpClientError
 from .material_domains import (
@@ -129,14 +135,12 @@ class McpEvidenceContract(StrictSchema):
     fallback_tool_environment_variable: Literal["MATERIAL_RAG_MCP_TOOL"] = (
         "MATERIAL_RAG_MCP_TOOL"
     )
-    accepted_arguments: list[Literal["query", "max_results", "from_date", "to_date"]] = (
-        Field(min_length=4, max_length=4)
-    )
+    accepted_arguments: list[Identifier] = Field(min_length=5, max_length=32)
     result_collection: Literal["records"] = "records"
-    required_record_fields: list[Literal["source_id", "title"]] = Field(
-        min_length=2,
-        max_length=2,
-    )
+    allowed_record_types: list[Identifier] = Field(min_length=1)
+    required_record_fields: list[Identifier] = Field(min_length=6)
+    required_provenance_fields: list[Identifier] = Field(min_length=1)
+    required_stage_metadata_fields: list[Identifier] = Field(min_length=1)
     selection_policy: Literal["administrator-configured-allowlist-only"] = (
         "administrator-configured-allowlist-only"
     )
@@ -146,10 +150,38 @@ class McpEvidenceContract(StrictSchema):
 
     @model_validator(mode="after")
     def _fixed_adapter_contract(self) -> "McpEvidenceContract":
-        if self.accepted_arguments != ["query", "max_results", "from_date", "to_date"]:
-            raise ValueError("MCP evidence arguments must match the bounded adapter contract")
-        if self.required_record_fields != ["source_id", "title"]:
-            raise ValueError("MCP evidence records require source_id and title")
+        if len(self.accepted_arguments) != len(set(self.accepted_arguments)):
+            raise ValueError("MCP evidence arguments must be unique")
+        if not {
+            "query",
+            "max_results",
+            "from_date",
+            "to_date",
+            "stage",
+            "intent_id",
+            "chemical_system",
+            "record_types",
+        }.issubset(self.accepted_arguments):
+            raise ValueError(
+                "MCP stage tools must accept the bounded query and typed stage scope"
+            )
+        for label, values in (
+            ("record types", self.allowed_record_types),
+            ("record fields", self.required_record_fields),
+            ("provenance fields", self.required_provenance_fields),
+            ("stage metadata fields", self.required_stage_metadata_fields),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"MCP evidence {label} must be unique")
+        if not {
+            "source_id",
+            "title",
+            "record_type",
+            "support_text",
+            "provenance",
+            "stage_metadata",
+        }.issubset(self.required_record_fields):
+            raise ValueError("MCP stage evidence records require typed provenance")
         return self
 
 
@@ -236,6 +268,11 @@ class ValidationEvidenceHandoff(StrictSchema):
 
 class ValidationEvidenceRoute(StrictSchema):
     stage: ValidationEvidenceStage
+    research_policy_id: Identifier
+    research_policy_version: Identifier
+    required_query_intent_ids: list[Identifier] = Field(min_length=1)
+    research_basis_ids: list[NonEmptyText] = Field(min_length=1)
+    runtime_escalations: list[NonEmptyText] = Field(min_length=1)
     literature_sources: list[LiteratureSource] = Field(min_length=1)
     official_validators: list[Identifier] = Field(min_length=1)
     validator_authorities: list[ValidatorAuthority] = Field(min_length=1)
@@ -251,6 +288,12 @@ class ValidationEvidenceRoute(StrictSchema):
     def _route_is_closed(self) -> "ValidationEvidenceRoute":
         if len(self.literature_sources) != len(set(self.literature_sources)):
             raise ValueError("validation evidence sources must be unique")
+        if len(self.required_query_intent_ids) != len(
+            set(self.required_query_intent_ids)
+        ):
+            raise ValueError("validation evidence query intents must be unique")
+        if len(self.research_basis_ids) != len(set(self.research_basis_ids)):
+            raise ValueError("validation evidence research bases must be unique")
         authority_ids = [item.authority_id for item in self.validator_authorities]
         if len(authority_ids) != len(set(authority_ids)):
             raise ValueError("validator authority identifiers must be unique")
@@ -263,6 +306,17 @@ class ValidationEvidenceRoute(StrictSchema):
             self.stage == ValidationEvidenceStage.GENERATION_PRIOR
         ):
             raise ValueError("only generation-prior route may steer generation")
+        policy = stage_research_policy(str(self.stage))
+        if (
+            self.research_policy_id != policy.policy_id
+            or self.research_policy_version != policy.policy_version
+            or self.required_query_intent_ids
+            != [item.intent_id for item in policy.query_intents]
+            or self.research_basis_ids
+            != [item.basis_id for item in policy.research_bases]
+            or self.runtime_escalations != policy.runtime_escalations
+        ):
+            raise ValueError("validation route research policy does not match the registry")
         return self
 
 
@@ -318,6 +372,8 @@ class ValidationEvidenceReport(StrictSchema):
     bundle_id: Identifier | None = None
     bundle_relative_path: str | None = Field(default=None, max_length=2_000)
     source_statuses: list[SourceRetrievalStatus] = Field(default_factory=list)
+    intent_coverage: list[QueryIntentCoverage] = Field(default_factory=list)
+    missing_intent_ids: list[Identifier] = Field(default_factory=list)
     record_count: int = Field(default=0, ge=0)
     claim_count: int = Field(default=0, ge=0)
     branch_count: int = Field(default=0, ge=0)
@@ -407,6 +463,30 @@ class ValidationEvidenceReport(StrictSchema):
             raise ValueError("validation evidence source statuses must be unique")
         if not set(source_values).issubset(set(self.route.literature_sources)):
             raise ValueError("validation evidence report contains a non-allowlisted source")
+        coverage_ids = [item.intent_id for item in self.intent_coverage]
+        if len(coverage_ids) != len(set(coverage_ids)):
+            raise ValueError("validation evidence intent coverage must be unique")
+        if self.bundle_id is not None:
+            if coverage_ids != self.route.required_query_intent_ids:
+                raise ValueError(
+                    "validation evidence report must cover every policy intent"
+                )
+            expected_missing = [
+                item.intent_id
+                for item in self.intent_coverage
+                if item.status == "no_records"
+            ]
+            if self.missing_intent_ids != expected_missing:
+                raise ValueError(
+                    "validation evidence missing intents must match coverage"
+                )
+        elif self.intent_coverage or self.missing_intent_ids:
+            raise ValueError("evidence intent coverage requires a persisted bundle")
+        if (
+            self.status == ValidationEvidenceStatus.COMPLETED
+            and self.missing_intent_ids
+        ):
+            raise ValueError("completed validation evidence cannot miss policy intents")
         if self.mcp_contract_status == McpContractVerificationStatus.VERIFIED:
             if not self.mcp_tool_name:
                 raise ValueError("verified MCP contract requires the resolved tool name")
@@ -444,17 +524,39 @@ def _mcp_contract(
     stage: ValidationEvidenceStage,
     capability: McpEvidenceCapability,
 ) -> McpEvidenceContract:
+    policy = stage_research_policy(str(stage))
     return McpEvidenceContract(
         capability=capability,
         tool_environment_variable=f"MATERIAL_RAG_MCP_TOOL_{stage.value.upper()}",
-        accepted_arguments=["query", "max_results", "from_date", "to_date"],
-        required_record_fields=["source_id", "title"],
+        accepted_arguments=policy.mcp.accepted_arguments,
+        allowed_record_types=list(policy.mcp.allowed_record_types),
+        required_record_fields=list(policy.mcp.required_record_fields),
+        required_provenance_fields=list(policy.mcp.required_provenance_fields),
+        required_stage_metadata_fields=list(
+            policy.mcp.required_stage_metadata_fields
+        ),
     )
+
+
+def _research_route_fields(
+    stage: ValidationEvidenceStage,
+) -> dict[str, object]:
+    policy = stage_research_policy(str(stage))
+    return {
+        "research_policy_id": policy.policy_id,
+        "research_policy_version": policy.policy_version,
+        "required_query_intent_ids": [
+            item.intent_id for item in policy.query_intents
+        ],
+        "research_basis_ids": [item.basis_id for item in policy.research_bases],
+        "runtime_escalations": list(policy.runtime_escalations),
+    }
 
 
 _ROUTES: dict[ValidationEvidenceStage, ValidationEvidenceRoute] = {
     ValidationEvidenceStage.GENERATION_PRIOR: ValidationEvidenceRoute(
         stage=ValidationEvidenceStage.GENERATION_PRIOR,
+        **_research_route_fields(ValidationEvidenceStage.GENERATION_PRIOR),
         literature_sources=[
             LiteratureSource.CROSSREF,
             LiteratureSource.ARXIV,
@@ -495,6 +597,7 @@ _ROUTES: dict[ValidationEvidenceStage, ValidationEvidenceRoute] = {
     ),
     ValidationEvidenceStage.IDENTITY_NOVELTY: ValidationEvidenceRoute(
         stage=ValidationEvidenceStage.IDENTITY_NOVELTY,
+        **_research_route_fields(ValidationEvidenceStage.IDENTITY_NOVELTY),
         literature_sources=[
             LiteratureSource.CROSSREF,
             LiteratureSource.ARXIV,
@@ -534,6 +637,7 @@ _ROUTES: dict[ValidationEvidenceStage, ValidationEvidenceRoute] = {
     ),
     ValidationEvidenceStage.MLIP_DISAGREEMENT: ValidationEvidenceRoute(
         stage=ValidationEvidenceStage.MLIP_DISAGREEMENT,
+        **_research_route_fields(ValidationEvidenceStage.MLIP_DISAGREEMENT),
         literature_sources=[
             LiteratureSource.CROSSREF,
             LiteratureSource.ARXIV,
@@ -581,6 +685,9 @@ _ROUTES: dict[ValidationEvidenceStage, ValidationEvidenceRoute] = {
     ),
     ValidationEvidenceStage.RELAXATION_VALIDATION: ValidationEvidenceRoute(
         stage=ValidationEvidenceStage.RELAXATION_VALIDATION,
+        **_research_route_fields(
+            ValidationEvidenceStage.RELAXATION_VALIDATION
+        ),
         literature_sources=[
             LiteratureSource.CROSSREF,
             LiteratureSource.ARXIV,
@@ -628,6 +735,7 @@ _ROUTES: dict[ValidationEvidenceStage, ValidationEvidenceRoute] = {
     ),
     ValidationEvidenceStage.DFT_HANDOFF: ValidationEvidenceRoute(
         stage=ValidationEvidenceStage.DFT_HANDOFF,
+        **_research_route_fields(ValidationEvidenceStage.DFT_HANDOFF),
         literature_sources=[
             LiteratureSource.CROSSREF,
             LiteratureSource.ARXIV,
@@ -785,6 +893,34 @@ class ValidationEvidenceRouter:
             selected_sources = [
                 source for source in selected_sources if source != LiteratureSource.MCP
             ]
+        domain_route = (
+            material_stage_route(request.material_field, str(request.stage))
+            if request.material_field is not None
+            else None
+        )
+        query_blueprints = build_stage_query_blueprints(
+            stage=str(request.stage),
+            chemical_system=request.chemical_system,
+            material_field=request.material_field,
+            application_subtype=request.application_subtype,
+            problem_context=request.problem_context,
+            composition_keys=request.composition_keys,
+            candidate_refs=[
+                (
+                    f"{item.candidate_id}:{item.version}:"
+                    f"{item.content_hash}"
+                )
+                for item in request.candidate_refs
+            ],
+            focus_terms=[
+                *(
+                    list(domain_route.rag_questions)
+                    if domain_route is not None
+                    else []
+                ),
+                *([request.focus] if request.focus else []),
+            ],
+        )
         try:
             bundle = pipeline.run(
                 prompt,
@@ -797,6 +933,9 @@ class ValidationEvidenceRouter:
                 to_date=self.to_date,
                 max_results_per_query=self.max_results_per_query,
                 max_branches=self.max_branches,
+                query_blueprints=query_blueprints,
+                query_policy_id=route.research_policy_id,
+                query_policy_version=route.research_policy_version,
             )
         except Exception as exc:
             report = self._report(
@@ -811,6 +950,8 @@ class ValidationEvidenceRouter:
             )
             return self._persist(report, None)
 
+        if request.stage == ValidationEvidenceStage.GENERATION_PRIOR:
+            bundle = close_material_generation_branches(bundle)
         contract_violation = _bundle_contract_violation(
             bundle,
             route=route,
@@ -842,12 +983,21 @@ class ValidationEvidenceRouter:
             McpContractVerificationStatus.NOT_CONFIGURED,
             McpContractVerificationStatus.NOT_VERIFIABLE,
         }
+        missing_intents = [
+            item.intent_id
+            for item in bundle.intent_coverage
+            if item.status == "no_records"
+        ]
         if not bundle.records:
             status = ValidationEvidenceStatus.UNKNOWN
             reason = "no_source_grounded_records_retrieved"
-        elif degraded:
+        elif degraded or missing_intents:
             status = ValidationEvidenceStatus.PARTIAL
-            reason = "one_or_more_evidence_sources_were_unavailable"
+            reason = (
+                "one_or_more_required_query_intents_had_no_records"
+                if missing_intents and not degraded
+                else "one_or_more_evidence_sources_or_query_intents_were_unavailable"
+            )
         else:
             status = ValidationEvidenceStatus.COMPLETED
             reason = None
@@ -964,6 +1114,16 @@ class ValidationEvidenceRouter:
             bundle_id=bundle.bundle_id if bundle else None,
             bundle_relative_path=bundle_relative_path,
             source_statuses=list(bundle.source_statuses) if bundle else [],
+            intent_coverage=list(bundle.intent_coverage) if bundle else [],
+            missing_intent_ids=(
+                [
+                    item.intent_id
+                    for item in bundle.intent_coverage
+                    if item.status == "no_records"
+                ]
+                if bundle
+                else []
+            ),
             record_count=len(bundle.records) if bundle else 0,
             claim_count=len(bundle.claims) if bundle else 0,
             branch_count=len(bundle.branches) if bundle else 0,
@@ -1003,10 +1163,26 @@ def build_validation_evidence_prompt(request: ValidationEvidenceRequest) -> str:
     )
     if len(observations) > 12_000:
         raise ValueError("validation evidence observations exceed 12000 characters")
+    research_policy = stage_research_policy(str(request.stage))
     rows = [
         f"Validation stage: {request.stage}.",
         f"Chemical system: {request.chemical_system}.",
         _STAGE_INSTRUCTIONS[request.stage],
+        (
+            "Code-owned research query policy: "
+            f"{research_policy.policy_id}@{research_policy.policy_version}."
+        ),
+        "Required independent query intents: "
+        + " | ".join(
+            f"{item.intent_id}: {item.objective}"
+            for item in research_policy.query_intents
+        ),
+        (
+            "Configured MCP records for this stage must use one of: "
+            + ", ".join(research_policy.mcp.allowed_record_types)
+            + "; preserve typed provenance and stage metadata. Untyped title lists "
+            "are rejected."
+        ),
         "Retrieve source-grounded supporting, conflicting, null, and negative evidence. "
         "Do not invent material properties and do not treat absence of a record as novelty.",
     ]
@@ -1103,6 +1279,9 @@ def _verify_mcp_contract(
             tool_name,
             accepted_arguments=tuple(route.mcp_contract.accepted_arguments),
             result_collection=route.mcp_contract.result_collection,
+            required_record_fields=tuple(
+                route.mcp_contract.required_record_fields
+            ),
         )
     except (McpClientError, TypeError, ValueError) as exc:
         return (
@@ -1121,6 +1300,14 @@ def _bundle_contract_violation(
 ) -> str | None:
     """Reject provider/tool expansion outside the selected stage route."""
 
+    if (
+        bundle.search_plan.query_policy_id != route.research_policy_id
+        or bundle.search_plan.query_policy_version
+        != route.research_policy_version
+        or bundle.search_plan.required_intent_ids
+        != route.required_query_intent_ids
+    ):
+        return "search_plan_did_not_use_stage_research_policy"
     allowlisted = {LiteratureSource(str(item)) for item in route.literature_sources}
     selected = {LiteratureSource(str(item)) for item in selected_sources}
     if not selected.issubset(allowlisted):
@@ -1146,6 +1333,49 @@ def _bundle_contract_violation(
             return "record_used_nonselected_source"
         if not set(record.source_ids).issubset(queried_source_keys):
             return "record_source_was_not_queried"
+        if LiteratureSource.MCP.value in record.source_ids:
+            violation = _mcp_record_contract_violation(record, route)
+            if violation is not None:
+                return violation
+    return None
+
+
+def _mcp_record_contract_violation(
+    record: object,
+    route: ValidationEvidenceRoute,
+) -> str | None:
+    raw_metadata = getattr(record, "raw_metadata", None)
+    if not isinstance(raw_metadata, dict):
+        return "mcp_record_missing_typed_metadata"
+    metadata_rows: list[dict[str, object]] = []
+    if "mcp_stage" in raw_metadata:
+        metadata_rows.append(raw_metadata)
+    merged = raw_metadata.get("merged_record_metadata")
+    if isinstance(merged, list):
+        metadata_rows.extend(item for item in merged if isinstance(item, dict))
+    matching = [
+        item
+        for item in metadata_rows
+        if str(item.get("mcp_stage", "")) == str(route.stage)
+    ]
+    if not matching:
+        return "mcp_record_stage_mismatch"
+    contract = route.mcp_contract
+    for item in matching:
+        record_type = item.get("mcp_record_type")
+        provenance = item.get("mcp_provenance")
+        stage_metadata = item.get("mcp_stage_metadata")
+        if (
+            not isinstance(record_type, str)
+            or record_type not in contract.allowed_record_types
+            or not isinstance(provenance, dict)
+            or set(contract.required_provenance_fields).difference(provenance)
+            or not isinstance(stage_metadata, dict)
+            or set(contract.required_stage_metadata_fields).difference(
+                stage_metadata
+            )
+        ):
+            return "mcp_record_missing_stage_contract_fields"
     return None
 
 
@@ -1296,36 +1526,32 @@ def build_validation_evidence_router_from_environment(
             ).strip()
             for stage in ValidationEvidenceStage
         }
-        if any(stage_tool_values.values()):
-            mcp_url = str(values.get("MATERIAL_RAG_MCP_URL", "")).strip()
-            if not mcp_url:
-                raise ValueError(
-                    "stage-specific MATERIAL_RAG_MCP_TOOL_* configuration requires "
-                    "MATERIAL_RAG_MCP_URL"
-                )
-            fallback_tool = str(values.get("MATERIAL_RAG_MCP_TOOL", "")).strip()
-            for stage in ValidationEvidenceStage:
-                stage_values = dict(values)
-                selected_tool = stage_tool_values[stage] or fallback_tool
-                if selected_tool:
-                    stage_values["MATERIAL_RAG_MCP_TOOL"] = selected_tool
-                else:
-                    for key in (
-                        "MATERIAL_RAG_MCP_URL",
-                        "MATERIAL_RAG_MCP_TOOL",
-                        "MATERIAL_RAG_MCP_TOKEN",
-                        "MATERIAL_RAG_MCP_TIMEOUT_SECONDS",
-                        "MATERIAL_RAG_MCP_ALLOW_LOOPBACK_HTTP",
-                    ):
-                        stage_values.pop(key, None)
-                pipelines_by_stage[stage] = build_literature_rag_from_environment(
-                    environ=stage_values,
-                    require_model=require_model,
-                )
-        else:
-            pipeline = build_literature_rag_from_environment(
-                environ=values,
+        mcp_url = str(values.get("MATERIAL_RAG_MCP_URL", "")).strip()
+        if any(stage_tool_values.values()) and not mcp_url:
+            raise ValueError(
+                "stage-specific MATERIAL_RAG_MCP_TOOL_* configuration requires "
+                "MATERIAL_RAG_MCP_URL"
+            )
+        fallback_tool = str(values.get("MATERIAL_RAG_MCP_TOOL", "")).strip()
+        for stage in ValidationEvidenceStage:
+            stage_values = dict(values)
+            selected_tool = stage_tool_values[stage] or fallback_tool
+            if selected_tool:
+                stage_values["MATERIAL_RAG_MCP_TOOL"] = selected_tool
+            else:
+                for key in (
+                    "MATERIAL_RAG_MCP_URL",
+                    "MATERIAL_RAG_MCP_TOOL",
+                    "MATERIAL_RAG_MCP_TOKEN",
+                    "MATERIAL_RAG_MCP_TIMEOUT_SECONDS",
+                    "MATERIAL_RAG_MCP_ALLOW_LOOPBACK_HTTP",
+                ):
+                    stage_values.pop(key, None)
+            policy = stage_research_policy(str(stage))
+            pipelines_by_stage[stage] = build_literature_rag_from_environment(
+                environ=stage_values,
                 require_model=require_model,
+                mcp_record_contract=policy.mcp.runtime_contract(str(stage)),
             )
     return ValidationEvidenceRouter(
         pipeline,

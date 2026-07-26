@@ -2634,6 +2634,7 @@ def _relax_periodic_with_ase(
         initial_energy = _finite_float(atoms.get_potential_energy())
         initial_forces = _matrix(atoms.get_forces(), columns=3)
         initial_max_force = _max_row_norm(initial_forces)
+        initial_stress, initial_stress_warning = _optional_ase_stress(atoms)
         initial_volume = _finite_float(atoms.get_volume())
         if initial_volume <= 0.0:
             raise ModelOutputError("periodic relaxation requires positive cell volume")
@@ -2643,9 +2644,9 @@ def _relax_periodic_with_ase(
         if settings.relax_cell:
             filter_class = getattr(filters, "FrechetCellFilter", None)
             if filter_class is None:
-                filter_class = getattr(filters, "ExpCellFilter", None)
-            if filter_class is None:
-                raise ModelExecutionError("ASE exposes no reviewed periodic cell filter")
+                raise ModelExecutionError(
+                    "ASE FrechetCellFilter is required for reviewed cell relaxation"
+                )
             target = filter_class(atoms)
         optimizer_class = getattr(optimize, settings.optimizer, None)
         if optimizer_class is None:
@@ -2667,6 +2668,7 @@ def _relax_periodic_with_ase(
         final_energy = _finite_float(atoms.get_potential_energy())
         final_forces = _matrix(atoms.get_forces(), columns=3)
         final_max_force = _max_row_norm(final_forces)
+        final_stress, final_stress_warning = _optional_ase_stress(atoms)
         final_volume = _finite_float(atoms.get_volume())
         volume_change = _finite_float((final_volume - initial_volume) / initial_volume)
         minimum_after = _minimum_periodic_distance(atoms)
@@ -2678,7 +2680,13 @@ def _relax_periodic_with_ase(
             f"{source} relaxation failed: {type(exc).__name__}: {exc}"
         ) from exc
 
-    warnings = () if converged else ("optimizer exhausted its step budget",)
+    warnings = [
+        item
+        for item in (initial_stress_warning, final_stress_warning)
+        if item is not None
+    ]
+    if not converged:
+        warnings.append("optimizer exhausted its step budget")
     return PeriodicRelaxationResult(
         completed_steps=completed_steps,
         converged=converged,
@@ -2686,16 +2694,40 @@ def _relax_periodic_with_ase(
         final_max_force_eV_A=final_max_force,
         initial_energy_eV=initial_energy,
         final_energy_eV=final_energy,
+        atom_count=len(atoms),
         volume_change_fraction=volume_change,
         minimum_distance_before_A=minimum_before,
         minimum_distance_after_A=minimum_after,
         relaxed_cif=relaxed_cif,
-        warnings=warnings,
+        initial_stress_eV_A3=initial_stress,
+        final_stress_eV_A3=final_stress,
+        warnings=tuple(warnings),
         runtime_metadata={
             "relax_cell": settings.relax_cell,
             "optimizer_contract": "ase-periodic-relaxation-v1",
+            "cell_filter": (
+                "FrechetCellFilter" if settings.relax_cell else "fixed_cell"
+            ),
         },
     )
+
+
+def _optional_ase_stress(
+    atoms: Any,
+) -> tuple[tuple[float, ...] | None, str | None]:
+    """Read six ASE-Voigt components without turning absence into zero stress."""
+
+    try:
+        values = _vector(atoms.get_stress(voigt=True))
+        if len(values) != 6:
+            raise ModelOutputError("ASE stress did not contain six Voigt components")
+    except Exception as exc:
+        return (
+            None,
+            "stress unavailable from calculator: "
+            f"{type(exc).__name__}: {exc}",
+        )
+    return tuple(values), None
 
 
 def _minimum_periodic_distance(atoms: Any) -> float:

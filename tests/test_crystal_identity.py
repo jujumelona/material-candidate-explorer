@@ -14,6 +14,7 @@ from discovery_os.crystal_identity import (
     crystal_structure_fingerprint,
     exact_file_hash,
     group_crystal_structures,
+    inspect_crystal_occupancy,
     validate_crystal_geometry,
 )
 from discovery_os.hashing import canonical_structure_hash as hashing_structure_hash
@@ -140,3 +141,32 @@ def test_geometry_validation_rejects_collapsed_periodic_contacts() -> None:
     assert report.minimum_distance_angstrom == pytest.approx(0.04)
     with pytest.raises(InvalidCrystalGeometryError, match="minimum periodic atom distance"):
         canonicalize_crystal_structure(collapsed)
+
+
+def test_strict_external_identity_occupancy_receipt_separates_partial_and_disorder() -> None:
+    core = pytest.importorskip("pymatgen.core")
+    lattice = core.Lattice.cubic(4.0)
+    ordered = core.Structure(lattice, ["Li"], [[0.0, 0.0, 0.0]])
+    partial = core.Structure(
+        lattice,
+        [{"Li": 0.5}],
+        [[0.0, 0.0, 0.0]],
+    )
+    disordered = core.Structure(
+        lattice,
+        [{"Li": 0.5, "Na": 0.5}],
+        [[0.0, 0.0, 0.0]],
+    )
+
+    ordered_report = inspect_crystal_occupancy(ordered)
+    partial_report = inspect_crystal_occupancy(partial)
+    disordered_report = inspect_crystal_occupancy(disordered)
+
+    assert ordered_report.is_fully_occupied_ordered is True
+    assert ordered_report.reason_codes == ()
+    assert partial_report.is_fully_occupied_ordered is False
+    assert partial_report.partial_site_indices == (0,)
+    assert partial_report.reason_codes == ("partial_occupancy",)
+    assert disordered_report.is_fully_occupied_ordered is False
+    assert disordered_report.disordered_site_indices == (0,)
+    assert disordered_report.reason_codes == ("mixed_or_disordered_sites",)

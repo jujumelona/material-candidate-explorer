@@ -99,11 +99,82 @@ class EvidenceBranchKind(StrEnum):
     UNDEREXPLORED_RELATION = "underexplored_relation"
 
 
+class McpStructuredRecordContract(StrictSchema):
+    """Stage-bound schema enforced for structured MCP evidence records.
+
+    A generic literature MCP integration may leave this contract unset.  The
+    material validation routes always provide one so a stage tool cannot
+    return an untyped title list and have it treated as scientific evidence.
+    """
+
+    stage: Identifier
+    allowed_record_types: list[Identifier] = Field(min_length=1)
+    required_record_fields: list[Identifier] = Field(min_length=1)
+    required_provenance_fields: list[Identifier] = Field(min_length=1)
+    required_stage_metadata_fields: list[Identifier] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _contract_is_closed(self) -> "McpStructuredRecordContract":
+        for label, values in (
+            ("record types", self.allowed_record_types),
+            ("record fields", self.required_record_fields),
+            ("provenance fields", self.required_provenance_fields),
+            ("stage metadata fields", self.required_stage_metadata_fields),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"MCP structured {label} must be unique")
+        required = {
+            "source_id",
+            "title",
+            "record_type",
+            "support_text",
+            "provenance",
+            "stage_metadata",
+        }
+        if not required.issubset(set(self.required_record_fields)):
+            raise ValueError(
+                "MCP structured records require source/title/type/support/provenance/metadata"
+            )
+        return self
+
+
+class McpEvidenceProvenance(StrictSchema):
+    """Immutable lineage required from every stage-typed MCP record."""
+
+    provider: Identifier
+    provider_version: NonEmptyText
+    snapshot_id: NonEmptyText
+    source_locator: NonEmptyText
+    retrieved_at: AwareDatetime
+    request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class LiteratureQueryBlueprint(StrictSchema):
+    """One code-owned evidence intent expanded over every selected provider."""
+
+    intent_id: Identifier
+    query: NonEmptyText
+    rationale: NonEmptyText
+    expected_record_types: list[Identifier] = Field(min_length=1)
+    mcp_arguments: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _blueprint_is_bounded(self) -> "LiteratureQueryBlueprint":
+        if len(self.expected_record_types) != len(set(self.expected_record_types)):
+            raise ValueError("query blueprint record types must be unique")
+        _validate_mcp_argument_context(self.mcp_arguments)
+        return self
+
+
 class LiteratureQuery(StrictSchema):
     query_id: Identifier
     source: LiteratureSource
     query: NonEmptyText
     rationale: NonEmptyText
+    intent_id: Identifier | None = None
+    expected_record_types: list[Identifier] = Field(default_factory=list)
+    mcp_arguments: dict[str, JsonValue] = Field(default_factory=dict)
     max_results: int = Field(default=25, gt=0, le=200)
     from_date: date | None = None
     to_date: date | None = None
@@ -112,6 +183,15 @@ class LiteratureQuery(StrictSchema):
     def _dates_are_ordered(self) -> "LiteratureQuery":
         if self.from_date and self.to_date and self.from_date > self.to_date:
             raise ValueError("from_date must not be after to_date")
+        if len(self.expected_record_types) != len(set(self.expected_record_types)):
+            raise ValueError("literature query record types must be unique")
+        if self.intent_id is None and (
+            self.expected_record_types or self.mcp_arguments
+        ):
+            raise ValueError(
+                "typed query record expectations require a code-owned intent"
+            )
+        _validate_mcp_argument_context(self.mcp_arguments)
         return self
 
 
@@ -127,6 +207,9 @@ class RagSearchPlan(StrictSchema):
     target_entities: list[str] = Field(default_factory=list)
     mechanism_terms: list[str] = Field(default_factory=list)
     negative_terms: list[str] = Field(default_factory=list)
+    query_policy_id: Identifier | None = None
+    query_policy_version: Identifier | None = None
+    required_intent_ids: list[Identifier] = Field(default_factory=list)
     queries: list[LiteratureQuery] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -134,6 +217,36 @@ class RagSearchPlan(StrictSchema):
         ids = [item.query_id for item in self.queries]
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate literature query ids")
+        policy_values = (
+            self.query_policy_id,
+            self.query_policy_version,
+            bool(self.required_intent_ids),
+        )
+        if any(policy_values) and not all(policy_values):
+            raise ValueError(
+                "query policy id, version, and required intents must be present together"
+            )
+        if len(self.required_intent_ids) != len(set(self.required_intent_ids)):
+            raise ValueError("required query intents must be unique")
+        if self.required_intent_ids:
+            required = set(self.required_intent_ids)
+            if any(item.intent_id not in required for item in self.queries):
+                raise ValueError(
+                    "research-policy queries must cite an allowlisted required intent"
+                )
+            sources = {LiteratureSource(str(item.source)) for item in self.queries}
+            for source in sources:
+                covered = {
+                    item.intent_id
+                    for item in self.queries
+                    if LiteratureSource(str(item.source)) == source
+                }
+                if covered != required:
+                    raise ValueError(
+                        "every selected source must receive every required query intent"
+                    )
+        elif any(item.intent_id is not None for item in self.queries):
+            raise ValueError("intent-tagged queries require a query policy")
         return self
 
 
@@ -265,6 +378,30 @@ class EvidenceBranch(StrictSchema):
         return self
 
 
+class QueryIntentCoverage(StrictSchema):
+    intent_id: Identifier
+    query_ids: list[Identifier] = Field(min_length=1)
+    record_ids: list[Identifier] = Field(default_factory=list)
+    sources_with_records: list[LiteratureSource] = Field(default_factory=list)
+    status: Literal["covered", "no_records"] = "no_records"
+
+    @model_validator(mode="after")
+    def _coverage_is_consistent(self) -> "QueryIntentCoverage":
+        if len(self.query_ids) != len(set(self.query_ids)):
+            raise ValueError("intent coverage query identifiers must be unique")
+        if len(self.record_ids) != len(set(self.record_ids)):
+            raise ValueError("intent coverage record identifiers must be unique")
+        if len(self.sources_with_records) != len(set(self.sources_with_records)):
+            raise ValueError("intent coverage sources must be unique")
+        if self.status == "covered" and not self.record_ids:
+            raise ValueError("covered query intent requires at least one record")
+        if self.status == "no_records" and (
+            self.record_ids or self.sources_with_records
+        ):
+            raise ValueError("no-record query intent cannot cite records or sources")
+        return self
+
+
 class RagEvidenceBundle(StrictSchema):
     bundle_id: Identifier
     created_at: AwareDatetime
@@ -274,6 +411,7 @@ class RagEvidenceBundle(StrictSchema):
     claims: list[EvidenceClaim]
     graph: EvidenceGraph
     branches: list[EvidenceBranch]
+    intent_coverage: list[QueryIntentCoverage] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     scientific_role: Literal["search_prior_only"] = "search_prior_only"
 
@@ -293,6 +431,23 @@ class RagEvidenceBundle(StrictSchema):
             for claim_id in branch.source_claim_ids
         ):
             raise ValueError("evidence branch cites an unknown claim")
+        coverage_ids = [item.intent_id for item in self.intent_coverage]
+        if len(coverage_ids) != len(set(coverage_ids)):
+            raise ValueError("duplicate query intent coverage")
+        required_intents = set(self.search_plan.required_intent_ids)
+        if required_intents:
+            if set(coverage_ids) != required_intents:
+                raise ValueError(
+                    "research-policy bundle must report every required query intent"
+                )
+            query_ids = {item.query_id for item in self.search_plan.queries}
+            for item in self.intent_coverage:
+                if not set(item.query_ids).issubset(query_ids):
+                    raise ValueError("intent coverage cites an unknown query")
+                if not set(item.record_ids).issubset(record_ids):
+                    raise ValueError("intent coverage cites an unknown record")
+        elif self.intent_coverage:
+            raise ValueError("generic evidence bundle cannot add policy intent coverage")
         return self
 
 
@@ -382,11 +537,32 @@ class PromptSearchPlanner:
         from_date: date | None = None,
         to_date: date | None = None,
         max_results_per_query: int = 25,
+        query_blueprints: Sequence[LiteratureQueryBlueprint] | None = None,
+        query_policy_id: str | None = None,
+        query_policy_version: str | None = None,
     ) -> RagSearchPlan:
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("literature RAG prompt cannot be empty")
         selected_sources = list(sources or LiteratureSource)
+        if query_blueprints:
+            if not query_policy_id or not query_policy_version:
+                raise ValueError(
+                    "query blueprints require a policy identifier and version"
+                )
+            return self._blueprint_plan(
+                prompt,
+                goal=goal,
+                sources=selected_sources,
+                from_date=from_date,
+                to_date=to_date,
+                max_results_per_query=max_results_per_query,
+                query_blueprints=query_blueprints,
+                query_policy_id=query_policy_id,
+                query_policy_version=query_policy_version,
+            )
+        if query_policy_id or query_policy_version:
+            raise ValueError("query policy metadata requires query blueprints")
         if self.model is None:
             return self._deterministic_plan(
                 prompt,
@@ -471,6 +647,92 @@ class PromptSearchPlanner:
             plan_id=f"RPLAN-{stable_hash(plan_payload)[:24]}",
             generated_at=datetime.now(timezone.utc),
             **plan_payload,
+        )
+
+    def _blueprint_plan(
+        self,
+        prompt: str,
+        *,
+        goal: DiscoveryGoal | None,
+        sources: Sequence[LiteratureSource],
+        from_date: date | None,
+        to_date: date | None,
+        max_results_per_query: int,
+        query_blueprints: Sequence[LiteratureQueryBlueprint],
+        query_policy_id: str,
+        query_policy_version: str,
+    ) -> RagSearchPlan:
+        selected_sources = list(
+            dict.fromkeys(LiteratureSource(str(item)) for item in sources)
+        )
+        if not selected_sources:
+            raise ValueError("research-policy search requires at least one source")
+        blueprints = [
+            LiteratureQueryBlueprint.model_validate_json(
+                item.model_dump_json(), strict=True
+            )
+            for item in query_blueprints
+        ]
+        intent_ids = [item.intent_id for item in blueprints]
+        if len(intent_ids) != len(set(intent_ids)):
+            raise ValueError("research-policy query intents must be unique")
+        rows: list[LiteratureQuery] = []
+        for source in selected_sources:
+            for index, blueprint in enumerate(blueprints):
+                rows.append(
+                    LiteratureQuery(
+                        query_id=(
+                            "LQ-"
+                            + stable_hash(
+                                [
+                                    query_policy_id,
+                                    query_policy_version,
+                                    source.value,
+                                    blueprint.intent_id,
+                                    blueprint.query,
+                                    index,
+                                ]
+                            )[:24]
+                        ),
+                        source=source,
+                        query=blueprint.query,
+                        rationale=blueprint.rationale,
+                        intent_id=blueprint.intent_id,
+                        expected_record_types=list(
+                            blueprint.expected_record_types
+                        ),
+                        mcp_arguments=dict(blueprint.mcp_arguments),
+                        max_results=max_results_per_query,
+                        from_date=from_date,
+                        to_date=to_date,
+                    )
+                )
+        domain = DiscoveryDomain(str(goal.domain)) if goal else _infer_domain(prompt)
+        payload = {
+            "user_prompt": prompt,
+            "goal_hash": stable_hash(goal) if goal else None,
+            "domain": domain,
+            "planner_id": "research-policy-query-planner",
+            "planner_version": "1.0.0",
+            "concepts": list(intent_ids),
+            "target_entities": [],
+            "mechanism_terms": list(
+                dict.fromkeys(
+                    record_type
+                    for item in blueprints
+                    for record_type in item.expected_record_types
+                )
+            ),
+            "negative_terms": [],
+            "query_policy_id": query_policy_id,
+            "query_policy_version": query_policy_version,
+            "required_intent_ids": intent_ids,
+            "queries": rows,
+        }
+        return RagSearchPlan(
+            plan_id=f"RPLAN-{stable_hash(payload)[:24]}",
+            generated_at=datetime.now(timezone.utc),
+            **payload,
         )
 
     def _deterministic_plan(
@@ -561,6 +823,7 @@ class MultiSourceLiteratureRetriever:
         openalex_api_key: str | None = None,
         mcp_client: StreamableHttpMcpClient | None = None,
         mcp_tool: str | None = None,
+        mcp_record_contract: McpStructuredRecordContract | None = None,
         max_workers: int = 5,
         arxiv_min_interval_seconds: float = 3.0,
     ) -> None:
@@ -574,6 +837,13 @@ class MultiSourceLiteratureRetriever:
         self.openalex_api_key = openalex_api_key
         self.mcp_client = mcp_client
         self.mcp_tool = mcp_tool
+        self.mcp_record_contract = (
+            McpStructuredRecordContract.model_validate_json(
+                mcp_record_contract.model_dump_json(), strict=True
+            )
+            if mcp_record_contract is not None
+            else None
+        )
         self.max_workers = max(1, min(max_workers, 10))
         self.arxiv_min_interval_seconds = float(arxiv_min_interval_seconds)
         self._arxiv_rate_lock = threading.Lock()
@@ -674,14 +944,16 @@ class MultiSourceLiteratureRetriever:
     def _search_mcp(self, query: LiteratureQuery) -> list[LiteratureRecord]:
         if self.mcp_client is None or not self.mcp_tool:
             return []
+        arguments = {
+            "query": query.query,
+            "max_results": query.max_results,
+            "from_date": query.from_date.isoformat() if query.from_date else None,
+            "to_date": query.to_date.isoformat() if query.to_date else None,
+            **query.mcp_arguments,
+        }
         payload = self.mcp_client.call_tool(
             self.mcp_tool,
-            {
-                "query": query.query,
-                "max_results": query.max_results,
-                "from_date": query.from_date.isoformat() if query.from_date else None,
-                "to_date": query.to_date.isoformat() if query.to_date else None,
-            },
+            arguments,
         )
         rows = payload.get("records")
         if not isinstance(rows, list):
@@ -692,6 +964,79 @@ class MultiSourceLiteratureRetriever:
             if not isinstance(item, dict):
                 invalid_rows += 1
                 continue
+            contract = self.mcp_record_contract
+            record_type: str | None = None
+            provenance: dict[str, JsonValue] | None = None
+            stage_metadata: dict[str, JsonValue] | None = None
+            if contract is not None:
+                missing = sorted(
+                    set(contract.required_record_fields).difference(item)
+                )
+                if missing:
+                    invalid_rows += 1
+                    continue
+                raw_record_type = item.get("record_type")
+                raw_provenance = item.get("provenance")
+                raw_stage_metadata = item.get("stage_metadata")
+                if (
+                    not isinstance(raw_record_type, str)
+                    or raw_record_type not in contract.allowed_record_types
+                    or (
+                        query.expected_record_types
+                        and raw_record_type not in query.expected_record_types
+                    )
+                    or not isinstance(raw_provenance, dict)
+                    or not isinstance(raw_stage_metadata, dict)
+                    or set(contract.required_provenance_fields).difference(
+                        raw_provenance
+                    )
+                    or set(contract.required_stage_metadata_fields).difference(
+                        raw_stage_metadata
+                    )
+                ):
+                    invalid_rows += 1
+                    continue
+                try:
+                    validated_provenance = (
+                        McpEvidenceProvenance.model_validate_json(
+                            json.dumps(
+                                raw_provenance,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            strict=True,
+                        )
+                    )
+                    _validate_mcp_argument_context(raw_stage_metadata)
+                except (TypeError, ValueError):
+                    invalid_rows += 1
+                    continue
+                if not _mcp_stage_metadata_is_explicit(
+                    raw_stage_metadata,
+                    contract.required_stage_metadata_fields,
+                ):
+                    invalid_rows += 1
+                    continue
+                if validated_provenance.request_hash != stable_hash(arguments):
+                    invalid_rows += 1
+                    continue
+                record_hash_payload = dict(item)
+                record_hash_provenance = dict(raw_provenance)
+                record_hash_provenance.pop("record_hash", None)
+                record_hash_payload["provenance"] = record_hash_provenance
+                if validated_provenance.record_hash != stable_hash(
+                    record_hash_payload
+                ):
+                    invalid_rows += 1
+                    continue
+                raw_support = item.get("support_text")
+                if not isinstance(raw_support, str) or not raw_support.strip():
+                    invalid_rows += 1
+                    continue
+                record_type = raw_record_type
+                provenance = dict(raw_provenance)
+                stage_metadata = dict(raw_stage_metadata)
             raw_title = item.get("title")
             raw_source_id = item.get("source_id")
             if not isinstance(raw_title, str) or not isinstance(raw_source_id, str):
@@ -706,6 +1051,9 @@ class MultiSourceLiteratureRetriever:
             if raw_abstract is None:
                 raw_abstract = item.get("support_text", "")
             abstract = _clean_markup(raw_abstract) if isinstance(raw_abstract, str) else ""
+            if contract is not None and not abstract:
+                invalid_rows += 1
+                continue
             pub_date = _parse_date(item.get("publication_date"))
             url = _optional_text(item.get("url")) if isinstance(item.get("url"), str) else None
             if url and urlparse(url).scheme.lower() not in {"http", "https"}:
@@ -729,8 +1077,25 @@ class MultiSourceLiteratureRetriever:
                     citation_count=_int_or_none(item.get("citation_count")),
                     open_access=_bool_or_none(item.get("open_access")),
                     retrieved_at=datetime.now(timezone.utc),
-                    raw_metadata={"mcp_tool": self.mcp_tool},
+                    raw_metadata={
+                        "mcp_tool": self.mcp_tool,
+                        **(
+                            {
+                                "mcp_stage": contract.stage,
+                                "mcp_record_type": record_type,
+                                "mcp_provenance": provenance,
+                                "mcp_stage_metadata": stage_metadata,
+                            }
+                            if contract is not None
+                            else {}
+                        ),
+                    },
                 )
+            )
+        if contract is not None and invalid_rows:
+            raise LiteratureRagError(
+                "MCP stage evidence contained "
+                f"{invalid_rows} record(s) that violated the structured contract"
             )
         if invalid_rows and not records:
             raise LiteratureRagError(
@@ -912,7 +1277,12 @@ class EvidenceClaimExtractor:
         selected = list(records)[: self.max_records]
         if self.model is None:
             return self._deterministic_extract(selected, prompt=prompt, goal=goal)
-        claims: list[EvidenceClaim] = []
+        claims: list[EvidenceClaim] = [
+            claim
+            for record in selected
+            for claim in [_claim_from_structured_material_record(record)]
+            if claim is not None
+        ]
         warnings: list[str] = []
         for record in selected:
             if not record.evidence_text:
@@ -927,7 +1297,13 @@ class EvidenceClaimExtractor:
                         "For drugs capture compound, target, disease, mechanism, efficacy, toxicity, "
                         "trial stage, and failed combinations. For materials capture composition, "
                         "dopant, pressure, temperature, structure, property, synthesis, stability, "
-                        "and failed synthesis. Do not infer a relation absent from the text."
+                        "and failed synthesis. A material_synthesis claim that could steer generation "
+                        "must set qualifiers.synthesis_outcome to exactly successful_target, "
+                        "impurity_or_partial, failed_no_target, or condition_window; preserve an "
+                        "explicit composition/formula/chemical_system; and preserve explicitly "
+                        "reported temperature, pressure, time, atmosphere, precursor, or other "
+                        "conditions in qualifiers.conditions. Do not turn an absent search result, "
+                        "a title-only association, or an inferred relation into a synthesis claim."
                     ),
                     user=json.dumps(
                         {
@@ -965,7 +1341,7 @@ class EvidenceClaimExtractor:
                         f"{record.record_id}: rejected unsupported or malformed model claim"
                     )
                     continue
-                claims.append(claim)
+                claims.append(_bind_structured_material_evidence(record, claim))
         return _deduplicate_claims(claims), warnings
 
     def _deterministic_extract(
@@ -982,6 +1358,10 @@ class EvidenceClaimExtractor:
         ]
         domain = DiscoveryDomain(str(goal.domain)) if goal else _infer_domain(prompt)
         for record in records:
+            structured_claim = _claim_from_structured_material_record(record)
+            if structured_claim is not None:
+                claims.append(structured_claim)
+                continue
             sentence = record.title.strip()
             if not sentence:
                 continue
@@ -1067,6 +1447,11 @@ class EvidenceBranchPlanner:
         branches: list[EvidenceBranch] = []
         by_pair: dict[tuple[str, str], list[EvidenceClaim]] = {}
         for claim in claims:
+            if (
+                domain != DiscoveryDomain.MEDICINAL_CHEMISTRY
+                and not _material_claim_can_steer(claim)
+            ):
+                continue
             by_pair.setdefault((_normal_text(claim.subject), _normal_text(claim.object)), []).append(claim)
         for (_subject_key, _object_key), rows in sorted(by_pair.items()):
             positive = [item for item in rows if item.polarity == EvidencePolarity.SUPPORTS]
@@ -1171,11 +1556,19 @@ class EvidenceBranchPlanner:
         for edge in graph.edges:
             adjacency.setdefault(edge.subject_node_id, []).append(edge)
         nodes = {item.node_id: item for item in graph.nodes}
+        steering_claim_ids = {
+            item.claim_id for item in claims if _material_claim_can_steer(item)
+        }
         for first in graph.edges:
             for second in adjacency.get(first.object_node_id, []):
                 if first.subject_node_id == second.object_node_id:
                     continue
                 claim_ids = sorted(set(first.claim_ids + second.claim_ids))
+                if (
+                    domain != DiscoveryDomain.MEDICINAL_CHEMISTRY
+                    and not set(claim_ids).issubset(steering_claim_ids)
+                ):
+                    continue
                 subject = nodes[first.subject_node_id].canonical_name
                 middle = nodes[first.object_node_id].canonical_name
                 target = nodes[second.object_node_id].canonical_name
@@ -1263,6 +1656,9 @@ class LiteratureRagPipeline:
         max_results_per_query: int = 25,
         max_branches: int = 24,
         index: JsonEvidenceIndex | None = None,
+        query_blueprints: Sequence[LiteratureQueryBlueprint] | None = None,
+        query_policy_id: str | None = None,
+        query_policy_version: str | None = None,
     ) -> RagEvidenceBundle:
         plan = self.planner.plan(
             prompt,
@@ -1271,6 +1667,9 @@ class LiteratureRagPipeline:
             from_date=from_date,
             to_date=to_date,
             max_results_per_query=max_results_per_query,
+            query_blueprints=query_blueprints,
+            query_policy_id=query_policy_id,
+            query_policy_version=query_policy_version,
         )
         records, statuses = self.retriever.retrieve(plan)
         claims, warnings = self.extractor.extract(records, prompt=prompt, goal=goal)
@@ -1298,6 +1697,7 @@ class LiteratureRagPipeline:
             claims=claims,
             graph=graph,
             branches=branches,
+            intent_coverage=_query_intent_coverage(plan, records),
             warnings=warnings,
         )
         if index is not None:
@@ -1383,10 +1783,56 @@ class LiteratureEvidencePolicy:
         return dict(self._weights)
 
 
+def close_material_generation_branches(
+    bundle: RagEvidenceBundle,
+) -> RagEvidenceBundle:
+    """Keep only branches backed by explicit synthesis outcome and conditions.
+
+    Rejected claims remain citation context.  The closure changes the bundle
+    identity so persisted evidence cannot confuse the narrowed result with the
+    original unfiltered branch set.
+    """
+
+    claim_map = {item.claim_id: item for item in bundle.claims}
+    kept = [
+        branch
+        for branch in bundle.branches
+        if all(
+            claim_id in claim_map
+            and _material_claim_can_steer(claim_map[claim_id])
+            for claim_id in branch.source_claim_ids
+        )
+    ]
+    if len(kept) == len(bundle.branches):
+        return bundle
+    payload = {
+        "source_bundle_id": bundle.bundle_id,
+        "kept_branch_ids": [item.branch_id for item in kept],
+        "closure_policy": "source-grounded-material-synthesis-v1",
+    }
+    return bundle.model_copy(
+        update={
+            "bundle_id": f"RBUNDLE-{stable_hash(payload)[:24]}",
+            "branches": kept,
+            "warnings": [
+                *bundle.warnings,
+                (
+                    "Removed "
+                    f"{len(bundle.branches) - len(kept)} generation branch(es) "
+                    "because their claims lacked an explicit source-supported "
+                    "synthesis outcome, composition, and condition."
+                ),
+            ],
+        },
+        deep=True,
+    )
+
+
 def build_literature_rag_from_environment(
     *,
     environ: Mapping[str, str] | None = None,
     require_model: bool = False,
+    mcp_record_contract: McpStructuredRecordContract | None = None,
 ) -> LiteratureRagPipeline:
     values = environ if environ is not None else os.environ
     model: RagModel | None = None
@@ -1435,6 +1881,7 @@ def build_literature_rag_from_environment(
         openalex_api_key=values.get("OPENALEX_API_KEY"),
         mcp_client=mcp_client,
         mcp_tool=mcp_tool or None,
+        mcp_record_contract=mcp_record_contract,
         user_agent=values.get(
             "LITERATURE_USER_AGENT", "discovery-os-literature-rag/1.0"
         ),
@@ -1459,6 +1906,45 @@ def save_evidence_bundle(bundle: RagEvidenceBundle, path: Path | str) -> Path:
     return target
 
 
+def _query_intent_coverage(
+    plan: RagSearchPlan,
+    records: Sequence[LiteratureRecord],
+) -> list[QueryIntentCoverage]:
+    if not plan.required_intent_ids:
+        return []
+    query_by_id = {item.query_id: item for item in plan.queries}
+    rows: list[QueryIntentCoverage] = []
+    for intent_id in plan.required_intent_ids:
+        query_ids = [
+            item.query_id for item in plan.queries if item.intent_id == intent_id
+        ]
+        query_set = set(query_ids)
+        matching = [
+            item
+            for item in records
+            if query_set.intersection(item.source_queries)
+        ]
+        sources = sorted(
+            {
+                LiteratureSource(str(query_by_id[query_id].source))
+                for item in matching
+                for query_id in item.source_queries
+                if query_id in query_set
+            },
+            key=str,
+        )
+        rows.append(
+            QueryIntentCoverage(
+                intent_id=intent_id,
+                query_ids=query_ids,
+                record_ids=[item.record_id for item in matching],
+                sources_with_records=sources,
+                status="covered" if matching else "no_records",
+            )
+        )
+    return rows
+
+
 def deduplicate_records(records: Iterable[LiteratureRecord]) -> list[LiteratureRecord]:
     merged: dict[str, LiteratureRecord] = {}
     for original in records:
@@ -1475,6 +1961,11 @@ def deduplicate_records(records: Iterable[LiteratureRecord]) -> list[LiteratureR
         authors = prior.authors if len(prior.authors) >= len(record.authors) else record.authors
         abstract = prior.abstract if len(prior.abstract) >= len(record.abstract) else record.abstract
         title = prior.title if len(prior.title) >= len(record.title) else record.title
+        merged_metadata = [
+            item
+            for item in (prior.raw_metadata, record.raw_metadata)
+            if item
+        ]
         merged_record = LiteratureRecord(
             record_id=f"LIT-{stable_hash(key)[:24]}",
             title=title,
@@ -1500,7 +1991,10 @@ def deduplicate_records(records: Iterable[LiteratureRecord]) -> list[LiteratureR
             ) if any(item is not None for item in (prior.citation_count, record.citation_count)) else None,
             open_access=(prior.open_access if prior.open_access is not None else record.open_access),
             retrieved_at=max(prior.retrieved_at, record.retrieved_at),
-            raw_metadata={"merged_sources": sorted(identifiers)},
+            raw_metadata={
+                "merged_sources": sorted(identifiers),
+                "merged_record_metadata": merged_metadata,
+            },
         )
         merged[key] = merged_record
     return sorted(
@@ -1776,6 +2270,321 @@ def _validated_claim_from_model(
     )
 
 
+_SYNTHESIS_OUTCOMES = {
+    "successful_target",
+    "impurity_or_partial",
+    "failed_no_target",
+    "condition_window",
+}
+
+_SYNTHESIS_RECORD_OUTCOME: dict[str, str] = {
+    "reported_phase": "successful_target",
+    "synthesis_success": "successful_target",
+    "synthesis_partial": "impurity_or_partial",
+    "synthesis_failure": "failed_no_target",
+    "composition_window": "condition_window",
+    "synthesis_condition_window": "condition_window",
+}
+
+_SYNTHESIS_OUTCOME_TERMS: dict[str, tuple[str, ...]] = {
+    "successful_target": (
+        "synthes",
+        "prepared",
+        "obtained",
+        "formed",
+        "characterized",
+        "produced",
+    ),
+    "impurity_or_partial": (
+        "impurit",
+        "secondary phase",
+        "byproduct",
+        "partial",
+        "yield",
+        "phase purity",
+    ),
+    "failed_no_target": (
+        "failed",
+        "not obtained",
+        "no crystalline",
+        "amorphous",
+        "decompos",
+        "unsuccessful",
+        "no target",
+    ),
+    "condition_window": (
+        "temperature",
+        "pressure",
+        "anneal",
+        "atmosphere",
+        "precursor",
+        "time",
+        "solvent",
+        "ph",
+        "range",
+        "window",
+    ),
+}
+
+
+def _bind_structured_material_evidence(
+    record: LiteratureRecord,
+    claim: EvidenceClaim,
+) -> EvidenceClaim:
+    """Mark only explicitly source-grounded synthesis claims as steerable.
+
+    The extraction model is not allowed to self-assert this marker.  It is
+    recomputed from the exact support span or from a stage-typed MCP record.
+    """
+
+    qualifiers = dict(claim.qualifiers)
+    qualifiers.pop("source_grounded_generation_steering", None)
+    if claim.stage != EvidenceStage.MATERIAL_SYNTHESIS:
+        return claim.model_copy(update={"qualifiers": qualifiers})
+
+    metadata = record.raw_metadata.get("mcp_stage_metadata")
+    record_type = record.raw_metadata.get("mcp_record_type")
+    if (
+        record.raw_metadata.get("mcp_stage") == "generation_prior"
+        and isinstance(metadata, dict)
+        and isinstance(record_type, str)
+        and record_type in _SYNTHESIS_RECORD_OUTCOME
+    ):
+        normalized = _normalized_structured_synthesis_qualifiers(
+            record_type,
+            metadata,
+        )
+        if normalized is not None:
+            qualifiers.update(normalized)
+            qualifiers["source_grounded_generation_steering"] = True
+            return claim.model_copy(update={"qualifiers": qualifiers})
+
+    if _model_synthesis_claim_is_explicit(record, claim, qualifiers):
+        qualifiers["source_grounded_generation_steering"] = True
+    return claim.model_copy(update={"qualifiers": qualifiers})
+
+
+def _claim_from_structured_material_record(
+    record: LiteratureRecord,
+) -> EvidenceClaim | None:
+    """Create a conservative claim from a validated generation MCP record."""
+
+    if record.raw_metadata.get("mcp_stage") != "generation_prior":
+        return None
+    record_type = record.raw_metadata.get("mcp_record_type")
+    metadata = record.raw_metadata.get("mcp_stage_metadata")
+    if not isinstance(record_type, str) or not isinstance(metadata, dict):
+        return None
+    qualifiers = _normalized_structured_synthesis_qualifiers(
+        record_type,
+        metadata,
+    )
+    if qualifiers is None or not record.abstract.strip():
+        return None
+    outcome = str(qualifiers["synthesis_outcome"])
+    polarity = (
+        EvidencePolarity.CONTRADICTS
+        if outcome == "failed_no_target"
+        else EvidencePolarity.SUPPORTS
+    )
+    reported_polarity = str(metadata.get("evidence_polarity", "")).casefold()
+    if reported_polarity:
+        expected = (
+            {"contradicts", "null", "negative"}
+            if polarity == EvidencePolarity.CONTRADICTS
+            else {"supports", "positive"}
+        )
+        if reported_polarity not in expected:
+            return None
+    composition = str(
+        qualifiers.get("composition")
+        or qualifiers.get("chemical_system")
+        or ""
+    ).strip()
+    if not composition:
+        return None
+    predicate = {
+        "successful_target": "was_explicitly_synthesized_under",
+        "impurity_or_partial": "was_partially_obtained_under",
+        "failed_no_target": "was_not_obtained_under",
+        "condition_window": "has_reported_synthesis_window",
+    }[outcome]
+    payload = [
+        record.record_id,
+        composition,
+        predicate,
+        record.title,
+        record.abstract,
+        outcome,
+    ]
+    return EvidenceClaim(
+        claim_id=f"ECL-{stable_hash(payload)[:24]}",
+        source_record_id=record.record_id,
+        subject=composition,
+        predicate=predicate,
+        object=record.title,
+        polarity=polarity,
+        stage=EvidenceStage.MATERIAL_SYNTHESIS,
+        support_text=record.abstract,
+        confidence=0.9,
+        qualifiers={
+            **qualifiers,
+            "source_grounded_generation_steering": True,
+            "structured_mcp_record": True,
+        },
+    )
+
+
+def _normalized_structured_synthesis_qualifiers(
+    record_type: str,
+    metadata: Mapping[str, Any],
+) -> dict[str, JsonValue] | None:
+    expected_outcome = _SYNTHESIS_RECORD_OUTCOME.get(record_type)
+    if expected_outcome is None:
+        return None
+    raw_outcome = str(metadata.get("outcome", "")).strip().casefold()
+    aliases = {
+        "success": "successful_target",
+        "successful": "successful_target",
+        "target_obtained": "successful_target",
+        "partial": "impurity_or_partial",
+        "impurity": "impurity_or_partial",
+        "failure": "failed_no_target",
+        "failed": "failed_no_target",
+        "no_target": "failed_no_target",
+        "window": "condition_window",
+    }
+    outcome = aliases.get(raw_outcome, raw_outcome)
+    if outcome != expected_outcome:
+        return None
+    composition = str(metadata.get("composition", "")).strip()
+    chemical_system = str(metadata.get("chemical_system", "")).strip()
+    if not composition and not chemical_system:
+        return None
+    conditions = metadata.get("conditions")
+    if not _nonempty_conditions(conditions):
+        return None
+    result: dict[str, JsonValue] = {
+        "synthesis_outcome": outcome,
+        "conditions": conditions,
+    }
+    if composition:
+        result["composition"] = composition
+    if chemical_system:
+        result["chemical_system"] = chemical_system
+    return result
+
+
+def _model_synthesis_claim_is_explicit(
+    record: LiteratureRecord,
+    claim: EvidenceClaim,
+    qualifiers: Mapping[str, JsonValue],
+) -> bool:
+    if claim.polarity == EvidencePolarity.UNCERTAIN or not record.abstract:
+        return False
+    support = _normal_text(claim.support_text)
+    if support not in _normal_text(record.abstract):
+        return False
+    outcome = str(qualifiers.get("synthesis_outcome", "")).strip().casefold()
+    if outcome not in _SYNTHESIS_OUTCOMES:
+        return False
+    if not any(term in support for term in _SYNTHESIS_OUTCOME_TERMS[outcome]):
+        return False
+    composition_values = [
+        str(qualifiers.get(key, "")).strip()
+        for key in ("composition", "formula", "chemical_system")
+        if str(qualifiers.get(key, "")).strip()
+    ]
+    if not composition_values:
+        return False
+    support_elements = set(_chemical_system(claim.support_text)[1])
+    if not any(
+        _normal_text(value) in support
+        or (
+            bool(_chemical_system(value)[1])
+            and set(_chemical_system(value)[1]).issubset(support_elements)
+        )
+        for value in composition_values
+    ):
+        return False
+    conditions = qualifiers.get("conditions")
+    if not _nonempty_conditions(conditions):
+        conditions = {
+            key: qualifiers[key]
+            for key in (
+                "temperature_k",
+                "pressure_gpa",
+                "time",
+                "atmosphere",
+                "precursor",
+                "solvent",
+                "ph",
+            )
+            if key in qualifiers
+        }
+    return _conditions_have_literal_support(conditions, claim.support_text)
+
+
+def _nonempty_conditions(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        return bool(value) and any(
+            item is not None and (not isinstance(item, str) or item.strip())
+            for item in value.values()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return bool(value)
+    return False
+
+
+def _conditions_have_literal_support(
+    conditions: Any,
+    support_text: str,
+) -> bool:
+    support = _normal_text(support_text)
+    values: list[Any]
+    if isinstance(conditions, Mapping):
+        values = list(conditions.values())
+    elif isinstance(conditions, Sequence) and not isinstance(
+        conditions, (str, bytes)
+    ):
+        values = list(conditions)
+    else:
+        values = [conditions]
+    scalar_tokens: list[str] = []
+    for value in values:
+        if isinstance(value, Mapping):
+            scalar_tokens.extend(
+                str(item).strip() for item in value.values() if item is not None
+            )
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            scalar_tokens.extend(
+                str(item).strip() for item in value if item is not None
+            )
+        elif value is not None:
+            scalar_tokens.append(str(value).strip())
+    return any(
+        token and _normal_text(token) in support for token in scalar_tokens
+    )
+
+
+def _material_claim_can_steer(claim: EvidenceClaim) -> bool:
+    qualifiers = claim.qualifiers
+    return bool(
+        claim.stage == EvidenceStage.MATERIAL_SYNTHESIS
+        and claim.polarity != EvidencePolarity.UNCERTAIN
+        and qualifiers.get("source_grounded_generation_steering") is True
+        and str(qualifiers.get("synthesis_outcome", "")) in _SYNTHESIS_OUTCOMES
+        and any(
+            isinstance(qualifiers.get(key), str)
+            and bool(str(qualifiers.get(key)).strip())
+            for key in ("composition", "formula", "chemical_system")
+        )
+        and _nonempty_conditions(qualifiers.get("conditions"))
+    )
+
+
 def _deduplicate_claims(claims: Iterable[EvidenceClaim]) -> list[EvidenceClaim]:
     by_key: dict[str, EvidenceClaim] = {}
     for claim in claims:
@@ -1968,6 +2777,75 @@ def _normal_text(value: str) -> str:
     value = unicodedata.normalize("NFKC", value)
     value = html.unescape(value)
     return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _validate_mcp_argument_context(arguments: Mapping[str, JsonValue]) -> None:
+    if len(arguments) > 32:
+        raise ValueError("MCP query context exceeds 32 arguments")
+    reserved = {"query", "max_results", "from_date", "to_date"}
+    if reserved.intersection(arguments):
+        raise ValueError("MCP query context cannot override bounded adapter arguments")
+    serialized = json.dumps(
+        dict(arguments),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(serialized) > 20_000:
+        raise ValueError("MCP query context exceeds 20000 characters")
+
+    def contains_secret(value: object) -> bool:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                normalized = re.sub(
+                    r"[^a-z0-9]+", "_", str(key).casefold()
+                ).strip("_")
+                if any(
+                    marker in normalized
+                    for marker in (
+                        "api_key",
+                        "access_key",
+                        "private_key",
+                        "client_secret",
+                        "token",
+                        "secret",
+                        "password",
+                        "credential",
+                        "authorization",
+                        "bearer",
+                    )
+                ):
+                    return True
+                if contains_secret(child):
+                    return True
+        elif isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            return any(contains_secret(item) for item in value)
+        return False
+
+    if contains_secret(arguments):
+        raise ValueError("MCP query context cannot contain secrets")
+
+
+def _mcp_stage_metadata_is_explicit(
+    metadata: Mapping[str, JsonValue],
+    required_fields: Sequence[str],
+) -> bool:
+    for name in required_fields:
+        value = metadata.get(name)
+        if value is None:
+            return False
+        if isinstance(value, str) and not value.strip():
+            return False
+        if isinstance(value, Mapping) and not value:
+            return False
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            if not value:
+                return False
+        if isinstance(value, float) and not math.isfinite(value):
+            return False
+    return True
 
 
 def _compact(value: str) -> str:
@@ -2186,17 +3064,22 @@ __all__ = [
     "JsonEvidenceIndex",
     "LiteratureEvidencePolicy",
     "LiteratureQuery",
+    "LiteratureQueryBlueprint",
     "LiteratureRagError",
     "LiteratureRagPipeline",
     "LiteratureRecord",
     "LiteratureSource",
+    "McpEvidenceProvenance",
+    "McpStructuredRecordContract",
     "MultiSourceLiteratureRetriever",
     "OpenAICompatibleRagModel",
     "PromptSearchPlanner",
+    "QueryIntentCoverage",
     "RagEvidenceBundle",
     "RagSearchPlan",
     "SourceRetrievalStatus",
     "build_literature_rag_from_environment",
+    "close_material_generation_branches",
     "deduplicate_records",
     "load_evidence_bundle",
     "save_evidence_bundle",

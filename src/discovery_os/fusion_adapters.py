@@ -23,6 +23,7 @@ from .fusion_schemas import (
     FusionRevisionRequest,
 )
 from .hashing import stable_hash
+from .relaxation import PeriodicRelaxationPayload, PeriodicRelaxationRequest
 from .schemas import StrictSchema
 
 
@@ -128,6 +129,120 @@ class HttpExpertEncoder:
                 raise FusionAdapterError(
                     "features", f"response provenance {provenance_name} is inconsistent"
                 )
+        return result
+
+    def periodic_relaxation_client(self) -> HttpPeriodicRelaxationClient:
+        """Reuse this expert's reviewed transport for its separate relax route."""
+
+        return HttpPeriodicRelaxationClient(
+            self.descriptor,
+            self.base_url,
+            timeout=self.timeout,
+            headers=self.headers,
+            session=self._http,
+            max_response_bytes=self.max_response_bytes,
+            # ``base_url`` already passed the encoder's security policy.
+            allow_insecure_http=True,
+        )
+
+
+class HttpPeriodicRelaxationClient:
+    """Strict client for the sidecar's independent ``/v1/relax`` operation."""
+
+    ENDPOINT = "/v1/relax"
+
+    def __init__(
+        self,
+        descriptor: ExpertDescriptor,
+        base_url: str,
+        *,
+        timeout: float | tuple[float, float] = (10.0, 900.0),
+        headers: Mapping[str, str] | None = None,
+        session: Any | None = None,
+        max_response_bytes: int = 16 * 1024 * 1024,
+        allow_insecure_http: bool = False,
+    ) -> None:
+        self._descriptor = ExpertDescriptor.model_validate_json(
+            descriptor.model_dump_json(),
+            strict=True,
+        )
+        self.headers = _validate_headers(headers or {})
+        self.base_url = _normalize_base_url(
+            base_url,
+            allow_insecure_http=allow_insecure_http,
+            authenticated=_has_authorization(self.headers),
+        )
+        self.timeout = _validate_timeout(timeout)
+        self.max_response_bytes = _positive_size(max_response_bytes)
+        self._http = session if session is not None else requests
+
+    @property
+    def descriptor(self) -> ExpertDescriptor:
+        return self._descriptor
+
+    @property
+    def expert_id(self) -> str:
+        return self._descriptor.expert_id
+
+    def relax(self, request: PeriodicRelaxationRequest) -> PeriodicRelaxationPayload:
+        if not self.descriptor.available:
+            raise FusionAdapterError(
+                "relax",
+                f"expert {self.descriptor.expert_id!r} unavailable",
+            )
+        result = _post_json(
+            self._http,
+            f"{self.base_url}{self.ENDPOINT}",
+            operation="relax",
+            request=request,
+            response_type=PeriodicRelaxationPayload,
+            timeout=self.timeout,
+            headers=self.headers,
+            max_response_bytes=self.max_response_bytes,
+        )
+        if result.candidate_ref != request.candidate.candidate_ref:
+            raise FusionAdapterError(
+                "relax",
+                "response candidate_ref does not match request",
+            )
+        if result.expert_id != self.descriptor.expert_id:
+            raise FusionAdapterError(
+                "relax",
+                "response expert_id does not match descriptor",
+            )
+        settings = request.settings
+        for label, actual, expected in (
+            ("optimizer", result.optimizer, settings.optimizer),
+            ("requested_steps", result.requested_steps, settings.requested_steps),
+            (
+                "target_fmax_eV_A",
+                result.target_fmax_eV_A,
+                settings.target_fmax_eV_A,
+            ),
+        ):
+            if actual != expected:
+                raise FusionAdapterError(
+                    "relax",
+                    f"response {label} differs from request",
+                )
+        expected_provenance = {
+            "adapter_version": self.descriptor.adapter_version,
+            "model_version": self.descriptor.metadata.get("model_version"),
+            "code_revision": self.descriptor.metadata.get("code_revision"),
+            "weight_revision": self.descriptor.metadata.get("weight_revision"),
+            "runtime_parameters_hash": self.descriptor.metadata.get("parameters_hash"),
+        }
+        for name, expected in expected_provenance.items():
+            if expected is not None and result.provenance.get(name) != expected:
+                raise FusionAdapterError(
+                    "relax",
+                    f"response provenance {name} is inconsistent",
+                )
+        if result.provenance.get("seed") != request.seed:
+            raise FusionAdapterError(
+                "relax",
+                "response provenance seed is inconsistent",
+            )
         return result
 
 
@@ -565,6 +680,7 @@ def _positive_size(value: int) -> int:
 __all__ = [
     "FusionAdapterError",
     "HttpExpertEncoder",
+    "HttpPeriodicRelaxationClient",
     "HttpFusionCandidateGenerator",
     "RemoteFusionBackend",
 ]

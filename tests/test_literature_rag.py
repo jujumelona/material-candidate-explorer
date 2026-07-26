@@ -172,6 +172,90 @@ def test_graph_and_branch_planner_create_recheck_analog_and_mechanism_branches()
     assert all(item.scientific_role if hasattr(item, "scientific_role") else True for item in [])
 
 
+def test_material_title_only_claim_cannot_create_generation_branch() -> None:
+    record = LiteratureRecord(
+        record_id="LIT-title-only",
+        title="Li2O synthesis at 800 K",
+        abstract="",
+        source_ids={"crossref": "10.1000/title-only"},
+        source_queries=["query-1"],
+        retrieved_at=datetime.now(timezone.utc),
+    )
+    claims, _warnings = EvidenceClaimExtractor().extract(
+        [record],
+        prompt="Find Li-O crystal candidates",
+    )
+    graph = EvidenceGraphBuilder().build(claims)
+    branches = EvidenceBranchPlanner().plan(
+        claims,
+        graph,
+        prompt="Find Li-O crystal candidates",
+    )
+    assert claims
+    assert branches == []
+
+
+def test_explicit_source_supported_synthesis_claim_can_steer_material_branch() -> None:
+    class MaterialClaimModel:
+        model_id = "material-claim-fixture"
+        model_version = "1"
+
+        def complete_json(self, *, operation: str, system: str, user: str):
+            assert operation == "claim-extraction"
+            return {
+                "claims": [
+                    {
+                        "subject": "Li2O",
+                        "predicate": "was synthesized under",
+                        "object": "800 K under argon",
+                        "polarity": "supports",
+                        "stage": "material_synthesis",
+                        "support_text": (
+                            "Li2O was synthesized at 800 K under argon and "
+                            "characterized by XRD."
+                        ),
+                        "confidence": 0.9,
+                        "qualifiers": {
+                            "composition": "Li2O",
+                            "chemical_system": "Li-O",
+                            "synthesis_outcome": "successful_target",
+                            "conditions": {
+                                "temperature": "800 K",
+                                "atmosphere": "argon",
+                            },
+                        },
+                        "entity_aliases": {},
+                    }
+                ]
+            }
+
+    record = LiteratureRecord(
+        record_id="LIT-explicit-synthesis",
+        title="Bounded Li2O synthesis",
+        abstract=(
+            "Li2O was synthesized at 800 K under argon and characterized by XRD."
+        ),
+        source_ids={"crossref": "10.1000/explicit"},
+        source_queries=["query-1"],
+        retrieved_at=datetime.now(timezone.utc),
+    )
+    claims, warnings = EvidenceClaimExtractor(MaterialClaimModel()).extract(
+        [record],
+        prompt="Find Li-O crystal candidates",
+    )
+    assert not warnings
+    assert claims[0].qualifiers["source_grounded_generation_steering"] is True
+    graph = EvidenceGraphBuilder().build(claims)
+    branches = EvidenceBranchPlanner().plan(
+        claims,
+        graph,
+        prompt="Find Li-O crystal candidates",
+    )
+    assert EvidenceBranchKind.MATERIAL_COMPOSITION in {
+        item.kind for item in branches
+    }
+
+
 def test_evidence_policy_changes_branch_weight_from_real_search_observation() -> None:
     record = _record("pubmed", "123")
     claim = EvidenceClaim(

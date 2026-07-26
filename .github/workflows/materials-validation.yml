@@ -44,6 +44,7 @@ jobs:
             tests/test_crystal_identity.py \
             tests/test_crystal_identity_relations.py \
             tests/test_materials_screening.py \
+            tests/test_screening_validation.py \
             tests/test_mattergen_contract.py \
             tests/test_evidence_fusion.py \
             tests/test_fusion_exploration.py \
@@ -56,7 +57,10 @@ jobs:
             tests/test_sidecar_launch_scripts.py \
             tests/test_generator_sidecar_contract.py \
             tests/test_validation_evidence.py \
+            tests/test_material_stage_research.py \
             tests/test_mcp_client.py \
+            tests/test_material_domains.py \
+            tests/test_specialist_workflows.py \
             tests/test_material_application_decision.py \
             tests/test_material_application_multidomain_routing.py \
             tests/test_material_application_stage_rag.py \
@@ -65,6 +69,7 @@ jobs:
             tests/test_role_specific_application_criteria.py \
             tests/test_application_notebook_contract.py \
             tests/test_material_application_docs_contract.py \
+            tests/test_stage_rag_docs_contract.py \
             tests/test_t4_notebook_contract.py
 
       - name: Confirm notebooks are clean JSON with compilable code cells

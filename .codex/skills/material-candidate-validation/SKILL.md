@@ -23,7 +23,7 @@ Use literature RAG and the administrator-configured MCP tool for each stage as b
 | Stage | Stage MCP tool variable | Retrieve with RAG and configured MCP | Runtime authority |
 |---|---|---|---|
 | `generation_prior` | `MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR` | Reported phases, failed synthesis, composition ranges, stability constraints | Fixed official MatterGen checkpoint allowlist plus deterministic Evidence Fusion controller; a custom allowlist is operator attestation, not training-config verification |
-| `identity_novelty` | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` | Reported phases, crystallographic aliases, scoped database context | Non-symmetrized source-Niggli identity plus strict unscaled pymatgen `StructureMatcher`; Materials Project `find_structure` is only a prefilter whose returned structures require local strict recheck |
+| `identity_novelty` | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` | Reported phases, crystallographic aliases, scoped database context | Non-symmetrized source-Niggli identity plus strict unscaled pymatgen `StructureMatcher`; Materials Project, versioned OPTIMADE, and revision-pinned COD searches are prefilters whose returned structures require local strict recheck |
 | `mlip_disagreement` | `MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT` | Model-domain limits, magnetic/charge-state caveats, relevant published calculations | Separate MatterSim and CHGNet sidecar results with explicit units; cross-model energy evidence requires aligned same-composition relative energies, while raw absolute differences are audit-only |
 | `relaxation_validation` | `MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION` | Phase transformations, instability, pressure/temperature, relaxation and phonon context | Separate MatterSim and CHGNet `/v1/relax` payloads, optimizer convergence, and strict periodic geometry gates |
 | `dft_handoff` | `MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF` | Reference phases, magnetic order, functional/U, pseudopotential and convergence considerations | Actual executing `PeriodicDFTBackend`; completed results require input-manifest, method-policy, immutable output and convergence evidence, with reference-set/phonon fields when applicable |
@@ -32,13 +32,23 @@ OpenAlex is appropriate for `generation_prior` and `identity_novelty`; use Cross
 
 RAG retrieves and closes scholarly evidence to records. The configured MCP tool is an evidence-provider interface, not an action validator. Do not use this evidence route to mutate a candidate, run a sidecar, relax a structure, submit DFT, or write an external database; invoke and attest the named runtime validator separately.
 
+Each selected source receives every code-owned intent for the current stage:
+
+- `generation_prior`: successful target, impurity or partial success, explicit failed/no-target experiment, bounded condition window, and released generator condition limits.
+- `identity_novelty`: exact formula/alias, polymorph and conditions, disorder/occupancy, federated structure records, and identity-method scope.
+- `mlip_disagreement`: training domain, same-composition energy alignment, force/stress errors, electronic-state caveats, and calibrated uncertainty/extrapolation.
+- `relaxation_validation`: optimizer convergence, phase transformation, geometry failure, phonon instability, and finite-temperature context.
+- `dft_handoff`: reference phases, electronic method policy, pseudopotential verification, numerical convergence, and field-specific workflow/provenance.
+
+If any required intent has no grounded record, preserve that intent as missing and mark the route partial or unknown. Do not let a model delete negative/null intents or replace these intent sets with one generic query.
+
 ## Enforce MCP boundaries
 
 - Read the endpoint from `MATERIAL_RAG_MCP_URL`. Select the stage-specific tool variable in the table first, then use `MATERIAL_RAG_MCP_TOOL` only as its administrator-configured fallback. Read the token only from the runtime environment.
 - Treat every field-profile MCP capability as an evidence requirement, not the name of an official upstream server or tool. This repository ships a client contract only. Use a separately deployed, administrator-controlled read-only MCP server or leave the integration unconfigured.
 - Never let a discovery prompt, planner, model output, observation, or MCP response select or replace the endpoint or tool.
-- Require the server's bounded `tools/list` catalog to advertise the selected tool exactly once. Verify its object `inputSchema` declares `query`, `max_results`, `from_date`, and `to_date`; when `outputSchema` is published, require a `records` array. Validate structured output and record fields at runtime even when `outputSchema` is absent.
-- Require structured records with stable source identifiers and titles. Reject unstructured prose as evidence.
+- Require the server's bounded `tools/list` catalog to advertise the selected tool exactly once. Verify its object `inputSchema` declares the bounded adapter arguments plus `stage`, `intent_id`, material/application context, requested record types, and the one stage-specific scope argument. When `outputSchema` is published, require a `records` array whose object items require every stage record field. Validate the same shape at runtime even when `outputSchema` is absent.
+- Require every structured record to contain `source_id`, `title`, `record_type`, exact `support_text`, `provenance`, and `stage_metadata`. Provenance must include provider/version/snapshot/source locator/retrieval time plus request and record SHA-256 bindings. Reject blank required metadata, mismatched hashes, unsupported record types, unstructured prose, and records that belong to another stage or intent.
 - Preserve `configured-tool-only`; require HTTPS except for explicitly opted-in loopback development.
 - Record missing MCP configuration as skipped and continue other providers. Record retrieval failure or no grounded records as unknown.
 
@@ -50,6 +60,7 @@ RAG retrieves and closes scholarly evidence to records. The configured MCP tool 
 - Resolve a code-owned material-field profile before stage routing. Treat `auto-default` as general screening only and `auto-ambiguous` as requiring an operator choice before any specialized claim.
 - Require the profile's problem context, property units, specialized validators, and claim boundary. Missing required field properties remain in `unexecuted_required_properties` and are unknown, never inferred from a generic MLIP or literature.
 - Supply one complete target-condition set before field-specific computational ranking. Treat results from different temperatures, pressures, compositions, charge states, surfaces, or other required conditions as incomparable; only differing values at the same complete condition set are a preserved conflict.
+- Require a `SpecialistExecutionReceipt` before any external numerical or experimental observation becomes available. Bind candidate input, exact conditions, method policy, input manifest, workflow/code version, immutable primary output, parser result, convergence or experimental QC artifact, and provenance. A validator name plus an arbitrary output hash is not execution evidence.
 - Keep `property_score_created` fixed to `false` and `scientific_role` fixed to `search_and_validation_context_only`.
 - Treat absence from literature or Materials Project as unknown, not novel.
 - Keep the selector branch named `novelty` separate from scientific novelty: it is property-space diversity only. Structural/database novelty comes only from the staged assessor and remains scoped to recorded providers and snapshots.

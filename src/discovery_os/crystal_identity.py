@@ -117,6 +117,34 @@ class CrystalGeometryReport:
 
 
 @dataclass(frozen=True, slots=True)
+class CrystalOccupancyReport:
+    """Whether strict species-preserving identity has an ordered full-occupancy input.
+
+    ``StructureMatcher`` can compare disordered structures, but silently deciding
+    how vacancies or mixed sites map would broaden this repository's hard
+    duplicate policy.  External novelty providers therefore use this receipt to
+    fail closed until an explicit disorder-aware policy is implemented.
+    """
+
+    atom_count: int
+    is_fully_occupied_ordered: bool
+    partial_site_indices: tuple[int, ...] = ()
+    disordered_site_indices: tuple[int, ...] = ()
+    invalid_site_indices: tuple[int, ...] = ()
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        reasons: list[str] = []
+        if self.partial_site_indices:
+            reasons.append("partial_occupancy")
+        if self.disordered_site_indices:
+            reasons.append("mixed_or_disordered_sites")
+        if self.invalid_site_indices:
+            reasons.append("invalid_occupancy")
+        return tuple(reasons)
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalCrystalStructure:
     """Separate symmetry-standardized context from deletion-safe identity.
 
@@ -328,6 +356,55 @@ def validate_crystal_geometry(
     if errors and raise_on_error:
         raise InvalidCrystalGeometryError("; ".join(errors))
     return report
+
+
+def inspect_crystal_occupancy(
+    value: Any,
+    *,
+    fmt: str | None = None,
+    max_atoms: int = 20_000,
+    occupancy_tolerance: float = 1e-8,
+) -> CrystalOccupancyReport:
+    """Return an explicit strict-identity occupancy support receipt.
+
+    A site is supported only when it contains exactly one species with total
+    occupancy one.  Vacancies, sub-unit occupancy, and mixed-species sites are
+    deliberately reported rather than normalized or guessed.
+    """
+
+    if (
+        not math.isfinite(occupancy_tolerance)
+        or occupancy_tolerance <= 0
+        or occupancy_tolerance >= 0.5
+    ):
+        raise ValueError("occupancy_tolerance must be finite and between zero and 0.5")
+    structure = parse_crystal_structure(value, fmt=fmt, max_atoms=max_atoms)
+    partial: list[int] = []
+    disordered: list[int] = []
+    invalid: list[int] = []
+    for index, site in enumerate(structure):
+        occupancies = [float(amount) for amount in site.species.values()]
+        if (
+            not occupancies
+            or any(not math.isfinite(item) or item <= 0 for item in occupancies)
+        ):
+            invalid.append(index)
+            continue
+        total = sum(occupancies)
+        if total > 1.0 + occupancy_tolerance:
+            invalid.append(index)
+        elif total < 1.0 - occupancy_tolerance:
+            partial.append(index)
+        if len(occupancies) != 1:
+            disordered.append(index)
+    supported = not partial and not disordered and not invalid
+    return CrystalOccupancyReport(
+        atom_count=len(structure),
+        is_fully_occupied_ordered=supported,
+        partial_site_indices=tuple(partial),
+        disordered_site_indices=tuple(disordered),
+        invalid_site_indices=tuple(invalid),
+    )
 
 
 def canonicalize_crystal_structure(
@@ -1008,6 +1085,7 @@ __all__ = [
     "CrystalAmbiguousComparison",
     "CanonicalCrystalStructure",
     "CrystalGeometryReport",
+    "CrystalOccupancyReport",
     "CrystalGroupingResult",
     "CrystalIdentityError",
     "CrystalMatchAssessment",
@@ -1023,6 +1101,7 @@ __all__ = [
     "deduplicate_crystal_structures",
     "exact_file_hash",
     "group_crystal_structures",
+    "inspect_crystal_occupancy",
     "parse_crystal_structure",
     "validate_crystal_geometry",
 ]

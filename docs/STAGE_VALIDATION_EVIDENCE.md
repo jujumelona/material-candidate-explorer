@@ -11,12 +11,36 @@ RAG and MCP are separate boundaries. RAG retrieves scholarly metadata and closes
 | Stage value | Runtime authority | Scholarly sources | Stage MCP variable | Context retrieved |
 |---|---|---|---|---|
 | `generation_prior` | fixed allowlist for a named official MatterGen checkpoint and deterministic Fusion controller; a custom allowlist is recorded as operator attestation, not automatically verified training metadata | Crossref, arXiv, OpenAlex, optional MCP | `MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR` | phases, negative synthesis evidence, composition ranges, stability constraints |
-| `identity_novelty` | source-Niggli non-symmetrized identity plus strict unscaled pymatgen `StructureMatcher`; optional Materials Project `find_structure` is a similarity prefilter followed by local strict recheck | Crossref, arXiv, OpenAlex, optional MCP | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` | reported phases, crystallographic aliases, scoped database context |
+| `identity_novelty` | source-Niggli non-symmetrized identity plus strict unscaled pymatgen `StructureMatcher`; optional Materials Project, versioned OPTIMADE, and revision-pinned COD searches are prefilters followed by ordered/full-occupancy local strict rechecks | Crossref, arXiv, OpenAlex, optional MCP | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` | reported phases, crystallographic aliases, scoped database context |
 | `mlip_disagreement` | separately executed MatterSim and CHGNet properties with explicit units and launcher-verified exact weight SHA-256 values; aligned same-composition relative energy for cross-model energy evidence | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT` | applicability limits, out-of-domain chemistry, magnetic and charge-state caveats |
 | `relaxation_validation` | separate `/v1/relax` payloads, optimizer convergence, and strict geometry gates | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION` | transformations, mechanical/dynamical instability, pressure/temperature, phonons |
 | `dft_handoff` | actual executing `PeriodicDFTBackend`; completed results require input-manifest, method-policy, immutable output/convergence evidence, and applicable reference-set or phonon provenance | Crossref, arXiv, optional MCP | `MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF` | reference phases, magnetic order, functional/U, pseudopotential and convergence review |
 
 The route stores its official-validator identifiers as provenance. Actual candidate values still come from the corresponding structure matcher, database lookup, expert sidecar, relaxation endpoint, or DFT backend.
+
+## Executed query policy
+
+Each route resolves one versioned, code-owned research policy before it calls a
+scholarly provider or MCP. The deterministic planner expands five distinct
+required intents for every source allowed by that route:
+
+| Stage | Policy | Required intents |
+|---|---|---|
+| `generation_prior` | `material-generation-evidence-v2@2.0.0` | successful target; impurity or partial result; explicit failed/no-target result; condition window; generator condition limit |
+| `identity_novelty` | `material-identity-evidence-v2@2.0.0` | exact-formula alias; polymorph and conditions; disorder and occupancy; federated structure records; identity method scope |
+| `mlip_disagreement` | `material-mlip-evidence-v2@2.0.0` | model training domain; energy alignment; force/stress error; electronic-state caveat; uncertainty and extrapolation |
+| `relaxation_validation` | `material-relaxation-evidence-v2@2.0.0` | optimizer convergence; phase transformation; geometry failure; phonon instability; finite-temperature phase |
+| `dft_handoff` | `material-dft-evidence-v2@2.0.0` | reference-phase policy; electronic-method policy; pseudopotential verification; numerical convergence; specialized workflow |
+
+The model does not choose or remove these intents. It may extract claims from
+returned source text only. The report and bundle retain the policy ID/version,
+every `QueryIntentCoverage` row, and `missing_intent_ids`.
+
+`covered` means at least one record was returned through that exact intent.
+`no_records` means only that the configured sources returned no grounded record
+for the intent. It does not mean the event, phase, structure, failure mode, or
+method does not exist. A report with usable records but at least one uncovered
+intent is `partial`; a route with no usable grounded record is `unknown`.
 
 ## Configuration
 
@@ -49,7 +73,18 @@ export MATERIAL_RAG_MCP_TOKEN=""              # runtime secret when required
 
 The MCP endpoint and tool names are administrator configuration. They are not accepted from the discovery prompt, RAG-model output, stage observations, or an MCP response. Each route selects its dedicated tool first and `MATERIAL_RAG_MCP_TOOL` second. If any dedicated variable is set, the URL is required; a stage with neither a dedicated tool nor the fallback records MCP as unconfigured and continues its other sources. HTTPS is required outside an explicitly opted-in loopback development endpoint.
 
-Before retrieval, the MCP client performs bounded `tools/list` discovery and requires the selected tool to be advertised exactly once. Its object `inputSchema` must declare `query`, `max_results`, `from_date`, and `to_date`. A published `outputSchema` must declare a `records` array; output is still runtime-validated when that optional schema is absent. Contract failure omits MCP for that stage and never falls back to model memory. See [MCP evidence sources for material RAG](MCP_RAG.md).
+Before retrieval, the MCP client performs bounded `tools/list` discovery and
+requires the selected tool to be advertised exactly once. Its object
+`inputSchema` must declare the common bounded arguments (`query`,
+`max_results`, dates, stage/intent identity, material context, candidate and
+composition scopes, and expected record types) plus exactly the current
+stage's `generation_scope`, `identity_scope`, `mlip_scope`,
+`relaxation_scope`, or `dft_scope` argument. A published `outputSchema` must
+declare a `records` array whose item schema requires the complete typed record
+contract. Output is still runtime-validated when that optional schema is
+absent. Contract failure omits MCP for that stage and never falls back to model
+memory. See [MCP evidence sources for material RAG](MCP_RAG.md) for the exact
+arguments, record fields, provenance fields, and per-stage metadata fields.
 
 The evidence route accepts records only. A same-named MCP tool that claims to mutate candidates, run relaxation, submit DFT, write a database, or replace a validator is outside this contract and must not be invoked through this path.
 
@@ -82,7 +117,13 @@ discovery-os validation-evidence \
   --artifacts runs/material-run-001
 ~~~
 
-The command prints a strict `ValidationEvidenceReport` and persists both the report and any source-grounded bundle under `validation-evidence/<stage>/`. The report records MCP contract verification, the selected tool name, validator authorities, and a typed evidence handoff. `validator_execution_state="not_executed"` is intentional: the evidence router describes the required validator but does not pretend to have run it.
+The command prints a strict `ValidationEvidenceReport` and persists both the
+report and any source-grounded bundle under `validation-evidence/<stage>/`.
+The report records research policy identity, intent coverage and missing
+intents, MCP contract verification, the selected tool name, validator
+authorities, and a typed evidence handoff.
+`validator_execution_state="not_executed"` is intentional: the evidence router
+describes the required validator but does not pretend to have run it.
 
 ## Typed handoffs
 
@@ -100,7 +141,15 @@ All handoffs require a validator result, fix `evidence_can_replace_validator` to
 
 ## Generation binding
 
-Only `generation_prior` evidence can be converted to `FusionDecisionContext`. Source claim identifiers, branch identifiers, rationale, and generator hints remain closed together. `fusion_decision_contexts_from_stage_evidence()` shares one deterministic branch policy across several profile workers so available evidence branches are not reset for every worker.
+Only `generation_prior` evidence can be converted to
+`FusionDecisionContext`. Source claim identifiers, branch identifiers,
+rationale, and generator hints remain closed together. A branch must be tied
+to literal support text from a returned source and carry explicit,
+non-uncertain synthesis outcome and condition evidence. Title-only evidence,
+record absence, uncertain claims, and all post-generation stages are excluded
+from steering. `fusion_decision_contexts_from_stage_evidence()` shares one
+deterministic branch policy across several profile workers so available
+evidence branches are not reset for every worker.
 
 Pass the resulting JSON to a normal iteration:
 
@@ -124,7 +173,9 @@ Non-generation evidence cannot steer a generator. The Evidence Fusion backend al
 - no source-grounded records: `unknown`
 - failed or incompatible stage MCP tool contract: omit MCP, preserve a failed contract status, and do not use model memory
 - one or more unavailable sources with some records: `partial`
-- every requested source successful with records: `completed`
+- any required query intent with no grounded record and some usable records: `partial`
+- every required query intent uncovered and no usable grounded records: `unknown`
+- every requested source successful and every required intent covered: `completed`
 - validator unavailable or failed: `unknown-not-pass`, regardless of retrieved literature
 - absence from literature or a structure database: not proof of novelty or validity
 - the selector branch ID `novelty`: property-space diversity only; external structural novelty requires the staged assessor and scoped provider provenance

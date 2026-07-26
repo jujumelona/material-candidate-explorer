@@ -56,7 +56,11 @@ from .integration_manifest import load_integration_manifest
 from .literature_rag import (
     JsonEvidenceIndex,
     LiteratureEvidencePolicy,
+    LiteratureQueryBlueprint,
     LiteratureSource,
+    McpEvidenceProvenance,
+    McpStructuredRecordContract,
+    QueryIntentCoverage,
     RagEvidenceBundle,
     RagSearchPlan,
     build_literature_rag_from_environment,
@@ -114,7 +118,32 @@ from .mock_model import MockDiscoveryModel
 from .dft_handoff import DFTInputHandoffReport, DFTInputManifest
 from .novelty import ScientificNoveltyAssessment
 from .profiles import VALIDATION_PROFILES
-from .relaxation import PeriodicRelaxationPayload, PeriodicRelaxationRequest
+from .relaxation import (
+    PeriodicGeometryGateReport,
+    PeriodicRelaxationPayload,
+    PeriodicRelaxationRequest,
+    PeriodicStressTensor,
+)
+from .screening_validation import (
+    CandidateMaterialScreeningReceipt,
+    MaterialScreeningBatchReceipt,
+    RelaxationAttemptReceipt,
+)
+from .material_stage_research import (
+    StageMcpPolicy,
+    StageQueryIntent,
+    StageResearchBasis,
+    StageResearchPolicy,
+)
+from .specialist_validation import (
+    ScientificGateReceipt,
+    SpecialistExecutionReceipt,
+    SpecialistOutputEvidence,
+)
+from .specialist_workflows import (
+    SpecialistMethodSpec,
+    SpecialistWorkflowPolicy,
+)
 from .validation_evidence import (
     McpEvidenceContract,
     ValidationEvidenceHandoff,
@@ -146,6 +175,10 @@ SCHEMA_TYPES = {
         DFTInputHandoffReport,
         DFTInputManifest,
         DiscoveryGoal,
+        McpEvidenceProvenance,
+        McpStructuredRecordContract,
+        LiteratureQueryBlueprint,
+        QueryIntentCoverage,
         RagSearchPlan,
         RagEvidenceBundle,
         ExpertDescriptor,
@@ -166,6 +199,11 @@ SCHEMA_TYPES = {
         PersistedFusionSearchReport,
         PeriodicRelaxationPayload,
         PeriodicRelaxationRequest,
+        PeriodicGeometryGateReport,
+        PeriodicStressTensor,
+        CandidateMaterialScreeningReceipt,
+        MaterialScreeningBatchReceipt,
+        RelaxationAttemptReceipt,
         SearchControlPoint,
         SearchControlSweep,
         ScientificNoveltyAssessment,
@@ -179,6 +217,15 @@ SCHEMA_TYPES = {
         ValidationHandoffContract,
         ValidatorAuthority,
         McpEvidenceContract,
+        StageMcpPolicy,
+        StageQueryIntent,
+        StageResearchBasis,
+        StageResearchPolicy,
+        SpecialistExecutionReceipt,
+        ScientificGateReceipt,
+        SpecialistOutputEvidence,
+        SpecialistMethodSpec,
+        SpecialistWorkflowPolicy,
         DomainValidatorSpec,
         MaterialFieldModelDecision,
         MaterialFieldModelRun,

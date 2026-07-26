@@ -52,7 +52,7 @@ The scientific choices and claim boundaries are mapped to primary sources in [Re
 - MatterGen retains the direct generated CIF as the candidate. Hard identity uses a source-derived Niggli representation without symmetry refinement; the symmetry-standardized structure is retained only as prototype context. Only a strict, unscaled crystallographic match is hard-deduplicated, so a volume-scaled same-prototype candidate is retained. The sidecar removes strict duplicates within a call and, when `search_session_id` is present, across calls before expert evaluation while requesting replacements. The coordinator keeps a post-evaluation exact attested-identity-hash fallback for adapters that emit the compatible raw-identity receipt but do not perform session-aware replacement. Exact-file hashes remain separate from both identity receipts.
 - MatterSim and CHGNet expose a separate `/v1/relax` operation, so model execution, optimizer convergence, and the strict geometry gate are recorded independently.
 - The trusted manifest downloads the default MatterSim 5M and CHGNet 0.3.0 files from immutable upstream source revisions, checks their declared byte sizes and project-pinned SHA-256 digests, and writes an attestation marker. The launchers rehash the files before binding them; the defaults are no longer upstream-managed or `managed-unattested`.
-- Staged structural novelty assessment is separate from the property-diversity branch. It distinguishes current-batch matches, project-history matches, external strict structure matches, scoped no-match, and `unknown`. A Materials Project `find_structure` result is only a similarity prefilter until the returned structure passes the local strict unscaled matcher. With several configured providers, external `no_match` requires all of them to return scoped no-match; one unresolved provider keeps the aggregate `unknown`.
+- Staged structural novelty assessment is separate from the property-diversity branch. It distinguishes current-batch matches, project-history matches, external strict structure matches, scoped no-match, and `unknown`. Materials Project `find_structure`, a versioned OPTIMADE formula query, and a revision-pinned COD formula query are only prefilters: every returned ordered, full-occupancy structure must pass the same local strict unscaled matcher. With several configured providers, external `no_match` requires every provider to prove a complete, versioned scoped search; one unresolved provider keeps the aggregate `unknown`.
 - Composition-scoped Pareto fronts use NSGA-II crowding to preserve objective boundaries. The top-1-to-5 DFT portfolio covers distinct reduced compositions before filling remaining slots and may reserve at most one slot for an eligible strict external scoped-no-match candidate. `unknown` receives no such credit, and even scoped no-match is not proof of novelty.
 - Optional split-conformal reliability applies only to an exact model/DFT/chemistry calibration scope. Missing or out-of-domain calibration returns unknown, exposes no coverage claim, and escalates to DFT.
 - The portable DFT handoff writes reviewable CIF/POSCAR/Quantum ESPRESSO input packages with an auditable reciprocal-space starting grid and unresolved pseudopotential-specific cutoffs; it does not bundle pseudopotentials or claim a calculation ran. A separately executing backend can return `completed` only with the input-manifest hash, immutable output and convergence artifacts, a method-policy hash, and explicit convergence. Formation or hull values additionally require a reference-set hash, and phonon conclusions require the recorded q mesh, minimum frequency, tolerance, and consistent imaginary-mode classification.
@@ -233,6 +233,7 @@ deterministic routing. The notebook applies the stricter
 `MAIN_AI_FIELD_ROUTING` policy above.
 
 The selected profile specializes all five evidence boundaries: `generation_prior`, `identity_novelty`, `mlip_disagreement`, `relaxation_validation`, and `dft_handoff`. Every stage request carries the code-validated application subtype and declared operating context, so retrieval is conditioned on the actual task instead of only a broad field label. RAG and the administrator-configured MCP tool remain read-only evidence context at every boundary; only source-closed generation-prior evidence may steer generation. Generic MatterGen + MatterSim + CHGNet output is candidate triage, not proof of battery, superconducting, catalytic, electronic, thermal, magnetic, mechanical, or adsorption performance. A field property remains `unknown`, never passing or zero, until the profile's named numerical or experimental validator actually runs and its provenance is preserved.
+Every score-producing specialist route is also bound to a closed code-owned workflow policy. A receipt must match the exact field, property, validator, unit, allowed method family/ID, required operating conditions, semantic output roles, immutable artifacts, and scientific gates. A generic `completed` flag cannot authorize a property. In particular, the policies reject shortcuts such as band gap standing in for SLME, uncalibrated constant relaxation time standing in for absolute power factor, a 0 K ordering-energy difference standing in for ordering temperature, polar symmetry standing in for spontaneous polarization, elasticity standing in for service degradation, or pore geometry standing in for adsorption selectivity.
 Field-specific computational ranking additionally requires one complete target-condition set; results from different operating conditions are incomparable and are never averaged.
 
 See [Domain-specific material workflows](docs/DOMAIN_MATERIAL_WORKFLOWS.md) for the property/validator matrix, stage-specific retrieval questions, MCP capability contracts, and scientific claim boundaries.
@@ -251,12 +252,23 @@ At five intermediate boundaries the notebook also runs source-grounded validatio
 | Stage ID | Numerical or structural authority | RAG/MCP role | Dedicated MCP tool variable |
 |---|---|---|---|
 | `generation_prior` | MatterGen-supported conditions only | reported phases, failed synthesis, and bounded condition priors | `MATERIAL_RAG_MCP_TOOL_GENERATION_PRIOR` |
-| `identity_novelty` | pymatgen `StructureMatcher` plus optional Materials Project structure lookup | crystallographic reports and aliases | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` |
+| `identity_novelty` | pymatgen `StructureMatcher` plus optional Materials Project, versioned OPTIMADE, and revision-pinned COD lookups with local strict rechecks | crystallographic reports and aliases | `MATERIAL_RAG_MCP_TOOL_IDENTITY_NOVELTY` |
 | `mlip_disagreement` | separate MatterSim and CHGNet outputs with unit normalization | applicability limits and possible disagreement causes | `MATERIAL_RAG_MCP_TOOL_MLIP_DISAGREEMENT` |
 | `relaxation_validation` | separate MatterSim and CHGNet `/v1/relax` results and strict geometry gates | phase transformations, instability, pressure/temperature, and phonon context | `MATERIAL_RAG_MCP_TOOL_RELAXATION_VALIDATION` |
 | `dft_handoff` | selected periodic DFT backend; a prepared input package is not an executed calculation | reference phases, magnetism, functional/U, pseudopotential, convergence, and phonon review | `MATERIAL_RAG_MCP_TOOL_DFT_HANDOFF` |
 
 Crossref, arXiv, and OpenAlex are bounded scholarly metadata sources. Optional MCP Streamable HTTP tools may be selected only from the stage variables above, with `MATERIAL_RAG_MCP_TOOL` as the administrator-configured generic fallback. The client verifies the selected tool through bounded `tools/list`, checks its input/output contract, and rejects unstructured evidence. A prompt or model output cannot select an endpoint or tool. Missing providers, missing credentials, empty retrieval, schema mismatch, or errors are recorded as `partial`, `skipped`, or `unknown`; they never become a candidate property score or a validator pass.
+
+The five routes execute five different, versioned query-intent sets. Generation
+separately searches successful targets, partial/impure outcomes, explicit
+failures, processing windows, and generator limits. Identity searches aliases,
+condition-dependent polymorphs, disorder, federated structure records, and
+matcher scope. MLIP, relaxation, and DFT routes likewise use their own
+domain/error, stability, and method/convergence intents. Every intent is
+expanded for every allowed source and its coverage is persisted. A missing
+required intent makes available evidence `partial`; no usable grounded records
+make it `unknown`. A no-result search is never interpreted as novelty,
+stability, or a failed experiment.
 
 RAG and MCP have distinct jobs here. RAG retrieves and closes scholarly evidence into citable records. The optional MCP route is only a configured structured evidence-provider interface; it is not permission to execute a model, database write, relaxation, or DFT job. Runtime sidecars, the strict structure matcher, external structure clients, and an explicitly configured periodic DFT backend remain the action validators.
 
@@ -268,13 +280,21 @@ matches the contract, or leave MCP unset. A capability ID such as
 `materials-project-structure-search` is a required evidence function, not a
 claim that the upstream project publishes a same-named MCP tool.
 
-Each route persists a typed evidence handoff naming its consumer, payload schema, and still-required runtime validator. Only a source-grounded `generation_prior` handoff may guide a Fusion decision; identity, MLIP, relaxation, and DFT handoffs cannot steer generation. The evidence router never marks its listed validators as executed.
+Each route persists its research-policy ID/version, intent coverage, selected
+tool contract, typed evidence handoff, and still-required runtime validator.
+MCP records must include typed record and stage metadata plus versioned
+provider/snapshot/request/record provenance. Only a source-grounded
+`generation_prior` handoff with literal support text and explicit,
+non-uncertain synthesis outcome/conditions may guide a Fusion decision;
+title-only evidence, record absence, and identity, MLIP, relaxation, or DFT
+handoffs cannot steer generation. The evidence router never marks its listed
+validators as executed.
 
 The search selector's legacy branch ID `novelty` means nearest-neighbor diversity in normalized expert-property space only. It neither queries a structure database nor emits a novelty claim. Structural/database novelty is produced only by `StagedNoveltyAssessor`, with its batch, project-history, external-provider, query, matcher, timestamp, and database-version provenance.
 
 The notebook form exposes the non-secret RAG/MCP settings. OpenAlex requires its free API key when that source is used; pressing Enter skips OpenAlex while the other sources continue. OpenAlex, optional RAG-model, and optional MCP credentials appear as hidden `getpass` prompts in the Setup cell and are scanned out of the archive. Leave the paired RAG or MCP endpoint fields blank to skip that integration.
 
-The notebook never merges official CIF output with an EXTXYZ conversion path. It reports `requested_samples`, `raw_model_structures`, `parsed_structures`, `exact_file_unique`, `crystallographically_unique`, `geometry_valid`, `mlip_evaluated`, `relaxation_converged`, and `ranked_candidates` separately. A blank Materials Project API key is allowed; external novelty then remains `unknown`, never `novel=true`.
+The notebook never merges official CIF output with an EXTXYZ conversion path. It reports `requested_samples`, `raw_model_structures`, `parsed_structures`, `exact_file_unique`, `crystallographically_unique`, `geometry_valid`, `mlip_evaluated`, `relaxation_converged`, and `ranked_candidates` separately. Materials Project, OPTIMADE, and COD are independently optional in the Colab form. If none is configured, external novelty remains `unknown`, never `novel=true`; a live unpinned or incomplete provider receipt also remains `unknown`.
 
 The legacy V11 notebook remains available for the older adaptive-loop interface. Blank optional API fields are skipped.
 

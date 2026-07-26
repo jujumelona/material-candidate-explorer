@@ -189,6 +189,7 @@ class StreamableHttpMcpClient:
         *,
         accepted_arguments: tuple[str, ...],
         result_collection: str,
+        required_record_fields: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """Resolve an allow-listed tool and verify the input/output shape we use.
 
@@ -230,11 +231,40 @@ class StreamableHttpMcpClient:
                 raise McpClientError(
                     f"MCP tool {name!r} output {result_collection!r} must be an array"
                 )
+            if required_record_fields:
+                item_schema = collection_schema.get("items")
+                if (
+                    not isinstance(item_schema, dict)
+                    or item_schema.get("type") != "object"
+                ):
+                    raise McpClientError(
+                        f"MCP tool {name!r} output records must declare object items"
+                    )
+                item_properties = item_schema.get("properties")
+                item_required = item_schema.get("required")
+                if not isinstance(item_properties, dict) or not isinstance(
+                    item_required, list
+                ):
+                    raise McpClientError(
+                        f"MCP tool {name!r} output record schema is incomplete"
+                    )
+                missing_properties = sorted(
+                    set(required_record_fields).difference(item_properties)
+                )
+                missing_required = sorted(
+                    set(required_record_fields).difference(item_required)
+                )
+                if missing_properties or missing_required:
+                    raise McpClientError(
+                        f"MCP tool {name!r} output record schema does not require "
+                        f"the stage fields: {sorted(set(missing_properties + missing_required))}"
+                    )
             output_contract = "schema-and-runtime-validated"
         return {
             "tool_name": name,
             "input_contract": "schema-validated",
             "output_contract": output_contract,
+            "required_record_fields": list(required_record_fields),
         }
 
     def list_tools(

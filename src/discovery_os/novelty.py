@@ -9,15 +9,20 @@ provider failures remain ``unknown`` instead of being promoted to novelty.
 
 from __future__ import annotations
 
+import ipaddress
+import json
 import os
+import re
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
+from urllib.parse import urljoin, urlsplit
 
+import requests
 from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
 from ._compat import StrEnum
@@ -31,6 +36,9 @@ from .crystal_identity import (
     canonicalize_crystal_structure,
     classify_crystal_structure_relation,
     group_crystal_structures,
+    inspect_crystal_occupancy,
+    parse_crystal_structure,
+    validate_crystal_geometry,
 )
 from .hashing import stable_hash
 from .schemas import (
@@ -879,6 +887,15 @@ class MaterialsProjectStructureLookup:
                 query_count=0,
                 retrieved_at=retrieved_at,
             )
+        _context, candidate_issue = _external_candidate_query_context(candidate)
+        if candidate_issue is not None:
+            return self._unknown(
+                candidate_issue,
+                candidate=candidate,
+                cif=cif,
+                query_count=0,
+                retrieved_at=retrieved_at,
+            )
         try:
             factory = self._rester_factory or _materials_project_rester_factory()
         except (ImportError, ModuleNotFoundError):
@@ -1079,6 +1096,25 @@ class MaterialsProjectStructureLookup:
                 continue
             try:
                 remote_structure = fetch_structure(material_id)
+                validate_crystal_geometry(remote_structure)
+                occupancy = inspect_crystal_occupancy(remote_structure)
+                if not occupancy.is_fully_occupied_ordered:
+                    unresolved = True
+                    similarities.append(
+                        NoveltyMatch(
+                            source_id=self.provider_id,
+                            record_id=material_id,
+                            match_kind="provider-scaled-similarity-unverified",
+                            metadata={
+                                "strict_recheck": (
+                                    "remote_disorder_or_partial_occupancy_unsupported:"
+                                    + ",".join(occupancy.reason_codes)
+                                ),
+                                "hard_identity": "false",
+                            },
+                        )
+                    )
+                    continue
                 assessment = classify_crystal_structure_relation(
                     candidate_cif,
                     remote_structure,
@@ -1146,6 +1182,1087 @@ class MaterialsProjectStructureLookup:
             return _external_identifiers(get_material_ids(reduced_formula))
         except Exception:
             return None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExternalCandidateQueryContext:
+    representation: CandidateRepresentation
+    fmt: str
+    structure: Any
+    structure_sha256: str
+    optimade_reduced_formula: str
+    cod_hill_formula: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderRetrieval:
+    records: tuple[Mapping[str, Any], ...]
+    query_count: int
+    database_version_or_release: str
+    complete: bool
+    issues: tuple[str, ...]
+    receipt: dict[str, JsonValue]
+
+
+class _ExternalRetrievalFailure(RuntimeError):
+    def __init__(self, code: str, *, query_count: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.query_count = query_count
+
+
+class OptimadeStructureLookup:
+    """Read-only OPTIMADE structure lookup followed by local strict identity.
+
+    OPTIMADE filtering supplies bounded formula candidates; it never supplies a
+    novelty Boolean.  Every ordered, complete structure payload is reconstructed
+    locally and passed to :func:`classify_crystal_structure_relation`.  Missing
+    provider/version/pagination metadata, truncated pages, disorder, and absent
+    structure payloads prevent a provider ``no_match`` result.
+    """
+
+    matcher_policy = "optimade-formula-prefilter-local-strict-recheck-v1"
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        provider_id: str | None = None,
+        database_version_or_release: str = LIVE_MOVING_SNAPSHOT_UNPINNED,
+        page_limit: int = 100,
+        max_pages: int = 20,
+        max_records: int = 500,
+        timeout_seconds: float = 30.0,
+        max_response_bytes: int = 4 * 1024 * 1024,
+        client_version: str | None = None,
+        session: object | None = None,
+        allow_loopback_http: bool = False,
+    ) -> None:
+        if not 1 <= page_limit <= 1_000:
+            raise ValueError("page_limit must be between 1 and 1000")
+        if not 1 <= max_pages <= 100:
+            raise ValueError("max_pages must be between 1 and 100")
+        if not 1 <= max_records <= 10_000:
+            raise ValueError("max_records must be between 1 and 10000")
+        if not 0 < timeout_seconds <= 120:
+            raise ValueError("timeout_seconds must be between zero and 120")
+        if not 1_024 <= max_response_bytes <= 64 * 1024 * 1024:
+            raise ValueError("max_response_bytes must be between 1 KiB and 64 MiB")
+        self.base_url = _validated_readonly_base_url(
+            base_url,
+            allow_loopback_http=allow_loopback_http,
+            require_optimade_version=True,
+        )
+        self.provider_id = (
+            provider_id.strip()
+            if provider_id and provider_id.strip()
+            else _provider_id_from_url("optimade", self.base_url)
+        )
+        release = database_version_or_release.strip()
+        if not release:
+            raise ValueError("database_version_or_release must not be blank")
+        self.database_version_or_release = release
+        self.page_limit = int(page_limit)
+        self.max_pages = int(max_pages)
+        self.max_records = int(max_records)
+        self.timeout_seconds = float(timeout_seconds)
+        self.max_response_bytes = int(max_response_bytes)
+        self.client_version = (
+            client_version.strip()
+            if client_version and client_version.strip()
+            else f"requests-{_installed_package_version('requests')}"
+        )
+        self._http = session if session is not None else requests.Session()
+        self.matcher_settings: dict[str, JsonValue] = {
+            "remote_prefilter": {
+                "endpoint": f"{self.base_url}/structures",
+                "filter_field": "chemical_formula_reduced",
+                "response_fields": list(_OPTIMADE_STRUCTURE_FIELDS),
+                "page_limit": self.page_limit,
+                "max_pages": self.max_pages,
+                "max_records": self.max_records,
+                "prefilter_only": True,
+            },
+            "local_strict_recheck": _local_strict_matcher_settings(),
+            "unsupported_structure_features": [
+                "disorder",
+                "implicit_atoms",
+                "assemblies",
+                "partial_occupancy",
+            ],
+            "no_match_requires": [
+                "provider_metadata",
+                "api_version",
+                "database_version_or_release",
+                "complete_pagination",
+                "all_structure_payloads_locally_resolved",
+            ],
+        }
+
+    @classmethod
+    def from_environment(
+        cls,
+        environ: Mapping[str, str] | None = None,
+        **kwargs: object,
+    ) -> "OptimadeStructureLookup":
+        values = os.environ if environ is None else environ
+        kwargs.setdefault(
+            "provider_id",
+            values.get("OPTIMADE_PROVIDER_ID") or None,
+        )
+        kwargs.setdefault(
+            "database_version_or_release",
+            values.get(
+                "OPTIMADE_DATABASE_VERSION_OR_RELEASE",
+                LIVE_MOVING_SNAPSHOT_UNPINNED,
+            ),
+        )
+        return cls(values.get("OPTIMADE_API_URL", ""), **kwargs)
+
+    def lookup(self, candidate: Candidate) -> ExternalNoveltyOutcome:
+        retrieved_at = datetime.now(timezone.utc)
+        context, candidate_issue = _external_candidate_query_context(candidate)
+        if candidate_issue is not None or context is None:
+            return self._unknown(
+                candidate_issue or "candidate_structure_context_unavailable",
+                candidate=candidate,
+                context=context,
+                retrieved_at=retrieved_at,
+                query_count=0,
+            )
+        try:
+            retrieval = self._retrieve(context)
+        except _ExternalRetrievalFailure as exc:
+            return self._unknown(
+                exc.code,
+                candidate=candidate,
+                context=context,
+                retrieved_at=retrieved_at,
+                query_count=exc.query_count,
+            )
+
+        matches: list[NoveltyMatch] = []
+        similarities: list[NoveltyMatch] = []
+        unresolved = False
+        for resource in retrieval.records:
+            finding, is_unresolved = _optimade_local_recheck(
+                provider_id=self.provider_id,
+                candidate_structure=context.representation.value,
+                resource=resource,
+            )
+            if finding is None:
+                unresolved = True
+                continue
+            if finding.match_kind == CrystalMatchRelation.STRICT_MATERIAL_DUPLICATE.value:
+                matches.append(finding)
+            else:
+                similarities.append(finding)
+            unresolved = unresolved or is_unresolved
+
+        global_issues = list(retrieval.issues)
+        if (
+            retrieval.database_version_or_release
+            == LIVE_MOVING_SNAPSHOT_UNPINNED
+        ):
+            global_issues.append("optimade_database_snapshot_unavailable")
+        if not retrieval.complete:
+            global_issues.append("optimade_pagination_incomplete")
+        global_issues = sorted(set(global_issues))
+        if global_issues:
+            similarities.extend(
+                _downgrade_untrusted_matches(
+                    matches,
+                    reason="optimade_provider_receipt_incomplete",
+                )
+            )
+            matches = []
+            status = NoveltyStatus.UNKNOWN
+            reason = "optimade_provider_receipt_incomplete:" + ",".join(global_issues)
+        elif matches:
+            status = NoveltyStatus.MATCH
+            reason = None
+        elif unresolved:
+            status = NoveltyStatus.UNKNOWN
+            reason = "optimade_structure_payloads_not_all_strictly_resolved"
+        else:
+            status = NoveltyStatus.NO_MATCH
+            reason = _scoped_no_match_reason(
+                retrieval.database_version_or_release
+            )
+
+        provenance = self._provenance(
+            candidate,
+            context,
+            retrieved_at=retrieved_at,
+            retrieval=retrieval,
+        )
+        return ExternalNoveltyOutcome(
+            **provenance,
+            status=status,
+            method="optimade-structures-local-strict-v1",
+            query_count=retrieval.query_count,
+            matches=matches,
+            reason=reason,
+            composition_match_count=len(retrieval.records),
+            structure_match_count=len(matches),
+            closest_match_id=matches[0].record_id if matches else None,
+            similarity_findings=_unique_findings(similarities),
+        )
+
+    def _retrieve(
+        self,
+        context: _ExternalCandidateQueryContext,
+    ) -> _ProviderRetrieval:
+        endpoint = f"{self.base_url}/structures"
+        query_filter = (
+            'chemical_formula_reduced="'
+            + context.optimade_reduced_formula
+            + '"'
+        )
+        params: Mapping[str, object] | None = {
+            "filter": query_filter,
+            "response_fields": ",".join(_OPTIMADE_STRUCTURE_FIELDS),
+            "page_limit": self.page_limit,
+        }
+        current_url = endpoint
+        seen_urls: set[str] = set()
+        records: list[Mapping[str, Any]] = []
+        record_ids: set[str] = set()
+        issues: list[str] = []
+        page_receipts: list[dict[str, JsonValue]] = []
+        api_version: str | None = None
+        provider_prefix: str | None = None
+        response_database_release: str | None = None
+        complete = False
+        query_count = 0
+
+        for _page_index in range(self.max_pages):
+            if current_url in seen_urls:
+                issues.append("optimade_pagination_cycle")
+                break
+            seen_urls.add(current_url)
+            query_count += 1
+            try:
+                response = self._http.get(
+                    current_url,
+                    params=params,
+                    headers={"Accept": "application/vnd.api+json"},
+                    timeout=self.timeout_seconds,
+                    allow_redirects=False,
+                    stream=True,
+                )
+                payload = _bounded_json_response(
+                    response,
+                    max_bytes=self.max_response_bytes,
+                )
+            except Exception as exc:
+                issues.append(
+                    f"optimade_page_lookup_failed:{type(exc).__name__}"
+                )
+                break
+            params = None
+            if not isinstance(payload, Mapping):
+                issues.append("optimade_response_not_an_object")
+                break
+            if payload.get("errors"):
+                issues.append("optimade_response_contains_errors")
+                break
+            data = payload.get("data")
+            meta = payload.get("meta")
+            links = payload.get("links", {})
+            if not isinstance(data, list):
+                issues.append("optimade_data_not_an_array")
+                break
+            if not isinstance(meta, Mapping):
+                issues.append("optimade_meta_missing")
+                break
+            if not isinstance(links, Mapping):
+                issues.append("optimade_links_not_an_object")
+                break
+
+            page_api_version = _bounded_text(meta.get("api_version"))
+            query_meta = meta.get("query")
+            query_representation = (
+                _bounded_text(query_meta.get("representation"))
+                if isinstance(query_meta, Mapping)
+                else None
+            )
+            provider_meta = meta.get("provider")
+            page_provider_prefix = (
+                _bounded_text(provider_meta.get("prefix"))
+                if isinstance(provider_meta, Mapping)
+                else None
+            )
+            database_meta = meta.get("database")
+            page_database_release = (
+                _bounded_text(database_meta.get("version"))
+                if isinstance(database_meta, Mapping)
+                else None
+            )
+            implementation_meta = meta.get("implementation")
+            implementation_version = (
+                _bounded_text(implementation_meta.get("version"))
+                if isinstance(implementation_meta, Mapping)
+                else None
+            )
+            more_data = meta.get("more_data_available")
+            data_returned = meta.get("data_returned")
+            if page_api_version is None:
+                issues.append("optimade_api_version_missing")
+            elif not re.fullmatch(r"1(?:\.\d+){1,2}", page_api_version):
+                issues.append("optimade_api_version_unsupported")
+            elif api_version is None:
+                api_version = page_api_version
+            elif api_version != page_api_version:
+                issues.append("optimade_api_version_changed_between_pages")
+            if query_representation is None:
+                issues.append("optimade_query_representation_missing")
+            if page_provider_prefix is None:
+                issues.append("optimade_provider_metadata_missing")
+            elif provider_prefix is None:
+                provider_prefix = page_provider_prefix
+            elif provider_prefix != page_provider_prefix:
+                issues.append("optimade_provider_changed_between_pages")
+            if page_database_release is not None:
+                if response_database_release is None:
+                    response_database_release = page_database_release
+                elif response_database_release != page_database_release:
+                    issues.append("optimade_database_version_changed_between_pages")
+                if (
+                    self.database_version_or_release
+                    != LIVE_MOVING_SNAPSHOT_UNPINNED
+                    and self.database_version_or_release != page_database_release
+                ):
+                    issues.append("optimade_database_version_mismatch")
+            if not isinstance(more_data, bool):
+                issues.append("optimade_more_data_available_missing")
+            if data_returned is not None and (
+                isinstance(data_returned, bool)
+                or not isinstance(data_returned, int)
+                or data_returned < len(data)
+            ):
+                issues.append("optimade_data_returned_invalid")
+
+            for resource in data:
+                if not isinstance(resource, Mapping):
+                    issues.append("optimade_structure_record_not_an_object")
+                    continue
+                record_id = _optimade_record_id(resource)
+                if record_id is None:
+                    issues.append("optimade_structure_record_id_missing")
+                    continue
+                if record_id in record_ids:
+                    issues.append("optimade_duplicate_structure_record_id")
+                    continue
+                if len(records) >= self.max_records:
+                    issues.append("optimade_record_limit_exceeded")
+                    break
+                record_ids.add(record_id)
+                records.append(resource)
+
+            next_url = _jsonapi_link_href(links.get("next"))
+            page_receipts.append(
+                {
+                    "api_version": page_api_version,
+                    "query_representation_sha256": (
+                        stable_hash(query_representation)
+                        if query_representation is not None
+                        else None
+                    ),
+                    "provider_prefix": page_provider_prefix,
+                    "database_version": page_database_release,
+                    "implementation_version": implementation_version,
+                    "time_stamp": _bounded_text(meta.get("time_stamp")),
+                    "data_returned": (
+                        data_returned
+                        if isinstance(data_returned, int)
+                        and not isinstance(data_returned, bool)
+                        else None
+                    ),
+                    "data_available": (
+                        meta.get("data_available")
+                        if isinstance(meta.get("data_available"), int)
+                        and not isinstance(meta.get("data_available"), bool)
+                        else None
+                    ),
+                    "more_data_available": (
+                        more_data if isinstance(more_data, bool) else None
+                    ),
+                    "next_present": next_url is not None,
+                }
+            )
+            if issues:
+                break
+            if more_data is False:
+                if next_url is not None:
+                    issues.append("optimade_final_page_has_next_link")
+                else:
+                    complete = True
+                break
+            if next_url is None:
+                issues.append("optimade_next_link_missing")
+                break
+            try:
+                current_url = _validated_provider_next_url(
+                    self.base_url,
+                    next_url,
+                )
+            except ValueError:
+                issues.append("optimade_next_link_outside_provider")
+                break
+        else:
+            issues.append("optimade_page_limit_exceeded")
+
+        database_release = (
+            response_database_release
+            or self.database_version_or_release
+        )
+        if (
+            response_database_release is None
+            and self.database_version_or_release
+            == LIVE_MOVING_SNAPSHOT_UNPINNED
+        ):
+            issues.append("optimade_database_version_missing")
+        receipt: dict[str, JsonValue] = {
+            "endpoint": endpoint,
+            "filter": query_filter,
+            "api_version": api_version,
+            "provider_prefix": provider_prefix,
+            "database_version": response_database_release,
+            "configured_database_version_or_release": (
+                self.database_version_or_release
+            ),
+            "pages_retrieved": query_count,
+            "records_returned": len(records),
+            "pagination_complete": complete,
+            "page_receipts": page_receipts,
+            "issues": sorted(set(issues)),
+        }
+        return _ProviderRetrieval(
+            records=tuple(records),
+            query_count=query_count,
+            database_version_or_release=database_release,
+            complete=complete and not issues,
+            issues=tuple(sorted(set(issues))),
+            receipt=receipt,
+        )
+
+    def _unknown(
+        self,
+        reason: str,
+        *,
+        candidate: Candidate,
+        context: _ExternalCandidateQueryContext | None,
+        retrieved_at: datetime,
+        query_count: int,
+    ) -> ExternalNoveltyOutcome:
+        receipt: dict[str, JsonValue] = {
+            "endpoint": f"{self.base_url}/structures",
+            "pagination_complete": False,
+            "issues": [reason],
+        }
+        retrieval = _ProviderRetrieval(
+            records=(),
+            query_count=query_count,
+            database_version_or_release=self.database_version_or_release,
+            complete=False,
+            issues=(reason,),
+            receipt=receipt,
+        )
+        return ExternalNoveltyOutcome(
+            **self._provenance(
+                candidate,
+                context,
+                retrieved_at=retrieved_at,
+                retrieval=retrieval,
+            ),
+            status=NoveltyStatus.UNKNOWN,
+            method="optimade-structures-local-strict-v1",
+            query_count=query_count,
+            reason=reason,
+        )
+
+    def _provenance(
+        self,
+        candidate: Candidate,
+        context: _ExternalCandidateQueryContext | None,
+        *,
+        retrieved_at: datetime,
+        retrieval: _ProviderRetrieval,
+    ) -> dict[str, object]:
+        settings = dict(self.matcher_settings)
+        settings["provider_receipt"] = retrieval.receipt
+        query = {
+            "provider_id": self.provider_id,
+            "method": "optimade-structures-local-strict-v1",
+            "endpoint": f"{self.base_url}/structures",
+            "candidate_ref": _required_candidate_ref(candidate),
+            "structure_sha256": context.structure_sha256 if context else None,
+            "formula": (
+                context.optimade_reduced_formula if context else None
+            ),
+            "database_version_or_release": retrieval.database_version_or_release,
+            "response_fields": list(_OPTIMADE_STRUCTURE_FIELDS),
+            "page_limit": self.page_limit,
+            "max_pages": self.max_pages,
+            "max_records": self.max_records,
+            "matcher_policy": self.matcher_policy,
+        }
+        return {
+            "provider_id": self.provider_id,
+            "client_version": self.client_version,
+            "database_version_or_release": (
+                retrieval.database_version_or_release
+            ),
+            "retrieved_at": retrieved_at,
+            "query_sha256": stable_hash(query),
+            "matcher_policy": self.matcher_policy,
+            "matcher_settings": settings,
+        }
+
+
+class CodStructureLookup:
+    """Read-only COD formula search with revision-pinned CIF strict rechecks.
+
+    The COD search endpoint has no documented paged-result contract.  A bounded
+    full JSON result is therefore required.  Each result must expose a COD ID
+    and revision so the exact ``.cif@REVISION`` artifact can be fetched.  A
+    configured database release is required before an all-clear ``no_match`` is
+    accepted; live unpinned searches remain ``unknown``.
+    """
+
+    provider_id = "cod"
+    matcher_policy = "cod-formula-prefilter-revision-cif-local-strict-v1"
+
+    def __init__(
+        self,
+        *,
+        base_url: str = "https://www.crystallography.net/cod",
+        database_version_or_release: str = LIVE_MOVING_SNAPSHOT_UNPINNED,
+        max_records: int = 500,
+        timeout_seconds: float = 30.0,
+        max_search_response_bytes: int = 8 * 1024 * 1024,
+        max_cif_bytes: int = 4 * 1024 * 1024,
+        include_theoretical: bool = True,
+        client_version: str | None = None,
+        session: object | None = None,
+        allow_loopback_http: bool = False,
+    ) -> None:
+        if not 1 <= max_records <= 10_000:
+            raise ValueError("max_records must be between 1 and 10000")
+        if not 0 < timeout_seconds <= 120:
+            raise ValueError("timeout_seconds must be between zero and 120")
+        if not 1_024 <= max_search_response_bytes <= 64 * 1024 * 1024:
+            raise ValueError(
+                "max_search_response_bytes must be between 1 KiB and 64 MiB"
+            )
+        if not 1_024 <= max_cif_bytes <= 16 * 1024 * 1024:
+            raise ValueError("max_cif_bytes must be between 1 KiB and 16 MiB")
+        self.base_url = _validated_readonly_base_url(
+            base_url,
+            allow_loopback_http=allow_loopback_http,
+            require_optimade_version=False,
+        )
+        release = database_version_or_release.strip()
+        if not release:
+            raise ValueError("database_version_or_release must not be blank")
+        self.database_version_or_release = release
+        self.max_records = int(max_records)
+        self.timeout_seconds = float(timeout_seconds)
+        self.max_search_response_bytes = int(max_search_response_bytes)
+        self.max_cif_bytes = int(max_cif_bytes)
+        self.include_theoretical = bool(include_theoretical)
+        self.client_version = (
+            client_version.strip()
+            if client_version and client_version.strip()
+            else f"requests-{_installed_package_version('requests')}"
+        )
+        self._http = session if session is not None else requests.Session()
+        self.matcher_settings: dict[str, JsonValue] = {
+            "remote_prefilter": {
+                "endpoint": f"{self.base_url}/result",
+                "filter_field": "formula",
+                "formula_notation": "Hill-separated",
+                "include_duplicates": True,
+                "include_errors": False,
+                "include_theoretical": self.include_theoretical,
+                "max_records": self.max_records,
+                "prefilter_only": True,
+            },
+            "structure_fetch": {
+                "format": "revision-pinned-cif",
+                "url_contract": f"{self.base_url}/COD_ID.cif@REVISION",
+            },
+            "local_strict_recheck": _local_strict_matcher_settings(),
+            "no_match_requires": [
+                "configured_database_version_or_release",
+                "complete_bounded_search_response",
+                "revision_for_every_record",
+                "all_cif_payloads_locally_resolved",
+            ],
+        }
+
+    @classmethod
+    def from_environment(
+        cls,
+        environ: Mapping[str, str] | None = None,
+        **kwargs: object,
+    ) -> "CodStructureLookup":
+        values = os.environ if environ is None else environ
+        kwargs.setdefault(
+            "base_url",
+            values.get(
+                "COD_API_URL",
+                "https://www.crystallography.net/cod",
+            ),
+        )
+        kwargs.setdefault(
+            "database_version_or_release",
+            values.get(
+                "COD_DATABASE_VERSION_OR_RELEASE",
+                LIVE_MOVING_SNAPSHOT_UNPINNED,
+            ),
+        )
+        return cls(**kwargs)
+
+    def lookup(self, candidate: Candidate) -> ExternalNoveltyOutcome:
+        retrieved_at = datetime.now(timezone.utc)
+        context, candidate_issue = _external_candidate_query_context(candidate)
+        if candidate_issue is not None or context is None:
+            return self._unknown(
+                candidate_issue or "candidate_structure_context_unavailable",
+                candidate=candidate,
+                context=context,
+                retrieved_at=retrieved_at,
+                query_count=0,
+            )
+        try:
+            retrieval = self._search(context)
+        except _ExternalRetrievalFailure as exc:
+            return self._unknown(
+                exc.code,
+                candidate=candidate,
+                context=context,
+                retrieved_at=retrieved_at,
+                query_count=exc.query_count,
+            )
+
+        matches: list[NoveltyMatch] = []
+        similarities: list[NoveltyMatch] = []
+        unresolved = False
+        query_count = retrieval.query_count
+        for row in retrieval.records:
+            record_id, revision = _cod_record_identity(row)
+            if record_id is None or revision is None:
+                unresolved = True
+                similarities.append(
+                    NoveltyMatch(
+                        source_id=self.provider_id,
+                        record_id=record_id or "cod-record-without-id",
+                        match_kind="cod-structure-unverified",
+                        metadata={
+                            "strict_recheck": (
+                                "record_id_missing"
+                                if record_id is None
+                                else "record_revision_missing"
+                            ),
+                            "hard_identity": "false",
+                        },
+                    )
+                )
+                continue
+            query_count += 1
+            cif_url = f"{self.base_url}/{record_id}.cif@{revision}"
+            try:
+                response = self._http.get(
+                    cif_url,
+                    headers={"Accept": "chemical/x-cif,text/plain"},
+                    timeout=self.timeout_seconds,
+                    allow_redirects=False,
+                    stream=True,
+                )
+                remote_cif = _bounded_text_response(
+                    response,
+                    max_bytes=self.max_cif_bytes,
+                )
+            except Exception as exc:
+                unresolved = True
+                similarities.append(
+                    NoveltyMatch(
+                        source_id=self.provider_id,
+                        record_id=f"{record_id}@{revision}",
+                        match_kind="cod-structure-unverified",
+                        metadata={
+                            "strict_recheck": f"cif_fetch_failed:{type(exc).__name__}",
+                            "hard_identity": "false",
+                            "revision": revision,
+                        },
+                    )
+                )
+                continue
+            finding, is_unresolved = _cod_local_recheck(
+                candidate_structure=context.representation.value,
+                record_id=record_id,
+                revision=revision,
+                row=row,
+                remote_cif=remote_cif,
+                cif_url=cif_url,
+            )
+            if finding is None:
+                unresolved = True
+                continue
+            if finding.match_kind == CrystalMatchRelation.STRICT_MATERIAL_DUPLICATE.value:
+                matches.append(finding)
+            else:
+                similarities.append(finding)
+            unresolved = unresolved or is_unresolved
+
+        global_issues = list(retrieval.issues)
+        if self.database_version_or_release == LIVE_MOVING_SNAPSHOT_UNPINNED:
+            global_issues.append("cod_database_snapshot_unavailable")
+        if not retrieval.complete:
+            global_issues.append("cod_search_completeness_unverified")
+        global_issues = sorted(set(global_issues))
+        if global_issues:
+            similarities.extend(
+                _downgrade_untrusted_matches(
+                    matches,
+                    reason="cod_provider_receipt_incomplete",
+                )
+            )
+            matches = []
+            status = NoveltyStatus.UNKNOWN
+            reason = "cod_provider_receipt_incomplete:" + ",".join(global_issues)
+        elif matches:
+            status = NoveltyStatus.MATCH
+            reason = None
+        elif unresolved:
+            status = NoveltyStatus.UNKNOWN
+            reason = "cod_records_not_all_revision_pinned_and_strictly_resolved"
+        else:
+            status = NoveltyStatus.NO_MATCH
+            reason = _scoped_no_match_reason(self.database_version_or_release)
+
+        dynamic_receipt = dict(retrieval.receipt)
+        dynamic_receipt["cif_fetch_count"] = query_count - retrieval.query_count
+        dynamic_receipt["all_structure_payloads_resolved"] = not unresolved
+        retrieval = _ProviderRetrieval(
+            records=retrieval.records,
+            query_count=query_count,
+            database_version_or_release=retrieval.database_version_or_release,
+            complete=retrieval.complete and not unresolved,
+            issues=tuple(sorted(set([*retrieval.issues]))),
+            receipt=dynamic_receipt,
+        )
+        return ExternalNoveltyOutcome(
+            **self._provenance(
+                candidate,
+                context,
+                retrieved_at=retrieved_at,
+                retrieval=retrieval,
+            ),
+            status=status,
+            method="cod-result-revision-cif-local-strict-v1",
+            query_count=query_count,
+            matches=matches,
+            reason=reason,
+            composition_match_count=len(retrieval.records),
+            structure_match_count=len(matches),
+            closest_match_id=matches[0].record_id if matches else None,
+            similarity_findings=_unique_findings(similarities),
+        )
+
+    def _search(
+        self,
+        context: _ExternalCandidateQueryContext,
+    ) -> _ProviderRetrieval:
+        endpoint = f"{self.base_url}/result"
+        params: dict[str, object] = {
+            "formula": context.cod_hill_formula,
+            "format": "json",
+            "include_duplicates": "1",
+        }
+        if self.include_theoretical:
+            params["include_theoretical"] = "1"
+        try:
+            response = self._http.get(
+                endpoint,
+                params=params,
+                headers={"Accept": "application/json"},
+                timeout=self.timeout_seconds,
+                allow_redirects=False,
+                stream=True,
+            )
+            payload = _bounded_json_response(
+                response,
+                max_bytes=self.max_search_response_bytes,
+            )
+        except Exception as exc:
+            raise _ExternalRetrievalFailure(
+                f"cod_lookup_failed:{type(exc).__name__}",
+                query_count=1,
+            ) from None
+        issues: list[str] = []
+        if isinstance(payload, list):
+            raw_records = payload
+        elif isinstance(payload, Mapping) and isinstance(payload.get("data"), list):
+            raw_records = payload["data"]
+        elif isinstance(payload, Mapping) and isinstance(payload.get("records"), list):
+            raw_records = payload["records"]
+        else:
+            raw_records = []
+            issues.append("cod_search_response_not_a_record_array")
+        records: list[Mapping[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw in raw_records:
+            if not isinstance(raw, Mapping):
+                issues.append("cod_search_record_not_an_object")
+                continue
+            record_id, revision = _cod_record_identity(raw)
+            key = (record_id or "", revision or "")
+            if key in seen:
+                issues.append("cod_duplicate_search_record")
+                continue
+            seen.add(key)
+            if len(records) >= self.max_records:
+                issues.append("cod_record_limit_exceeded")
+                break
+            records.append(raw)
+        headers = getattr(response, "headers", {})
+        receipt: dict[str, JsonValue] = {
+            "endpoint": endpoint,
+            "query": {
+                "formula": context.cod_hill_formula,
+                "format": "json",
+                "include_duplicates": True,
+                "include_theoretical": self.include_theoretical,
+                "include_errors": False,
+            },
+            "configured_database_version_or_release": (
+                self.database_version_or_release
+            ),
+            "pagination_mode": "single-complete-json-result",
+            "pagination_complete": not issues,
+            "records_returned": len(records),
+            "etag": (
+                _bounded_text(headers.get("ETag"))
+                if isinstance(headers, Mapping)
+                else None
+            ),
+            "last_modified": (
+                _bounded_text(headers.get("Last-Modified"))
+                if isinstance(headers, Mapping)
+                else None
+            ),
+            "issues": sorted(set(issues)),
+        }
+        return _ProviderRetrieval(
+            records=tuple(records),
+            query_count=1,
+            database_version_or_release=self.database_version_or_release,
+            complete=not issues,
+            issues=tuple(sorted(set(issues))),
+            receipt=receipt,
+        )
+
+    def _unknown(
+        self,
+        reason: str,
+        *,
+        candidate: Candidate,
+        context: _ExternalCandidateQueryContext | None,
+        retrieved_at: datetime,
+        query_count: int,
+    ) -> ExternalNoveltyOutcome:
+        retrieval = _ProviderRetrieval(
+            records=(),
+            query_count=query_count,
+            database_version_or_release=self.database_version_or_release,
+            complete=False,
+            issues=(reason,),
+            receipt={
+                "endpoint": f"{self.base_url}/result",
+                "pagination_complete": False,
+                "issues": [reason],
+            },
+        )
+        return ExternalNoveltyOutcome(
+            **self._provenance(
+                candidate,
+                context,
+                retrieved_at=retrieved_at,
+                retrieval=retrieval,
+            ),
+            status=NoveltyStatus.UNKNOWN,
+            method="cod-result-revision-cif-local-strict-v1",
+            query_count=query_count,
+            reason=reason,
+        )
+
+    def _provenance(
+        self,
+        candidate: Candidate,
+        context: _ExternalCandidateQueryContext | None,
+        *,
+        retrieved_at: datetime,
+        retrieval: _ProviderRetrieval,
+    ) -> dict[str, object]:
+        settings = dict(self.matcher_settings)
+        settings["provider_receipt"] = retrieval.receipt
+        query = {
+            "provider_id": self.provider_id,
+            "method": "cod-result-revision-cif-local-strict-v1",
+            "endpoint": f"{self.base_url}/result",
+            "candidate_ref": _required_candidate_ref(candidate),
+            "structure_sha256": context.structure_sha256 if context else None,
+            "formula": context.cod_hill_formula if context else None,
+            "database_version_or_release": retrieval.database_version_or_release,
+            "include_duplicates": True,
+            "include_errors": False,
+            "include_theoretical": self.include_theoretical,
+            "max_records": self.max_records,
+            "matcher_policy": self.matcher_policy,
+        }
+        return {
+            "provider_id": self.provider_id,
+            "client_version": self.client_version,
+            "database_version_or_release": (
+                retrieval.database_version_or_release
+            ),
+            "retrieved_at": retrieved_at,
+            "query_sha256": stable_hash(query),
+            "matcher_policy": self.matcher_policy,
+            "matcher_settings": settings,
+        }
+
+
+def build_external_novelty_lookups_from_environment(
+    environ: Mapping[str, str] | None = None,
+    *,
+    mp_rester_factory: Callable[[str], object] | None = None,
+    optimade_session: object | None = None,
+    cod_session: object | None = None,
+) -> list[ExternalNoveltyLookup]:
+    """Build the explicitly configured read-only external structure panel.
+
+    Providers are ordered deterministically as Materials Project, OPTIMADE, and
+    COD.  A blank provider credential/URL disables only that provider.  Once a
+    provider is configured, malformed URLs, numeric limits, or switches raise
+    immediately rather than silently weakening external novelty coverage.
+
+    Environment variables:
+
+    - ``MP_API_KEY`` and optional ``MP_DATABASE_VERSION_OR_RELEASE``;
+    - ``OPTIMADE_API_URL`` (explicit versioned v1 base), optional
+      ``OPTIMADE_PROVIDER_ID`` and ``OPTIMADE_DATABASE_VERSION_OR_RELEASE``;
+    - ``COD_API_URL`` and optional ``COD_DATABASE_VERSION_OR_RELEASE``;
+    - optional bounded controls ``OPTIMADE_PAGE_LIMIT``,
+      ``OPTIMADE_MAX_PAGES``, ``OPTIMADE_MAX_RECORDS``, ``COD_MAX_RECORDS``,
+      ``EXTERNAL_NOVELTY_TIMEOUT_SECONDS``, ``COD_INCLUDE_THEORETICAL``, and
+      ``EXTERNAL_NOVELTY_ALLOW_LOOPBACK_HTTP``.
+    """
+
+    values = os.environ if environ is None else environ
+    lookups: list[ExternalNoveltyLookup] = []
+    mp_api_key = str(values.get("MP_API_KEY", "")).strip()
+    optimade_url = str(values.get("OPTIMADE_API_URL", "")).strip()
+    cod_url = str(values.get("COD_API_URL", "")).strip()
+    if not any((mp_api_key, optimade_url, cod_url)):
+        return lookups
+    if optimade_url or cod_url:
+        allow_loopback_http = _environment_switch(
+            values,
+            "EXTERNAL_NOVELTY_ALLOW_LOOPBACK_HTTP",
+            default=False,
+        )
+        timeout_seconds = _environment_float(
+            values,
+            "EXTERNAL_NOVELTY_TIMEOUT_SECONDS",
+            default=30.0,
+        )
+    else:
+        allow_loopback_http = False
+        timeout_seconds = 30.0
+
+    if mp_api_key:
+        mp_kwargs: dict[str, object] = {
+            "database_version_or_release": _environment_optional_text(
+                values,
+                "MP_DATABASE_VERSION_OR_RELEASE",
+            )
+            or LIVE_MOVING_SNAPSHOT_UNPINNED,
+        }
+        if mp_rester_factory is not None:
+            mp_kwargs["rester_factory"] = mp_rester_factory
+        lookups.append(
+            MaterialsProjectStructureLookup(
+                mp_api_key,
+                **mp_kwargs,
+            )
+        )
+
+    if optimade_url:
+        lookups.append(
+            OptimadeStructureLookup(
+                optimade_url,
+                provider_id=(
+                    _environment_optional_text(values, "OPTIMADE_PROVIDER_ID")
+                ),
+                database_version_or_release=(
+                    _environment_optional_text(
+                        values,
+                        "OPTIMADE_DATABASE_VERSION_OR_RELEASE",
+                    )
+                    or LIVE_MOVING_SNAPSHOT_UNPINNED
+                ),
+                page_limit=_environment_int(
+                    values,
+                    "OPTIMADE_PAGE_LIMIT",
+                    default=100,
+                ),
+                max_pages=_environment_int(
+                    values,
+                    "OPTIMADE_MAX_PAGES",
+                    default=20,
+                ),
+                max_records=_environment_int(
+                    values,
+                    "OPTIMADE_MAX_RECORDS",
+                    default=500,
+                ),
+                timeout_seconds=timeout_seconds,
+                session=optimade_session,
+                allow_loopback_http=allow_loopback_http,
+            )
+        )
+
+    if cod_url:
+        lookups.append(
+            CodStructureLookup(
+                base_url=cod_url,
+                database_version_or_release=(
+                    _environment_optional_text(
+                        values,
+                        "COD_DATABASE_VERSION_OR_RELEASE",
+                    )
+                    or LIVE_MOVING_SNAPSHOT_UNPINNED
+                ),
+                max_records=_environment_int(
+                    values,
+                    "COD_MAX_RECORDS",
+                    default=500,
+                ),
+                timeout_seconds=timeout_seconds,
+                include_theoretical=_environment_switch(
+                    values,
+                    "COD_INCLUDE_THEORETICAL",
+                    default=True,
+                ),
+                session=cod_session,
+                allow_loopback_http=allow_loopback_http,
+            )
+        )
+    return lookups
 
 
 def scientific_fingerprint(candidate: Candidate) -> str:
@@ -1434,7 +2551,784 @@ def _materials_project_rester_factory() -> Callable[[str], object]:
     return lambda api_key: MPRester(api_key, mute_progress_bars=True)
 
 
+_OPTIMADE_STRUCTURE_FIELDS = (
+    "immutable_id",
+    "last_modified",
+    "chemical_formula_reduced",
+    "elements",
+    "nelements",
+    "nsites",
+    "lattice_vectors",
+    "cartesian_site_positions",
+    "species_at_sites",
+    "species",
+    "dimension_types",
+    "nperiodic_dimensions",
+    "structure_features",
+    "assemblies",
+)
+
+
+def _local_strict_matcher_settings() -> dict[str, JsonValue]:
+    return {
+        "implementation": "classify_crystal_structure_relation",
+        "canonicalization": CRYSTAL_IDENTITY_CANONICALIZATION,
+        "ltol": 0.02,
+        "stol": 0.05,
+        "angle_tol": 1.0,
+        "primitive_cell": True,
+        "scale": False,
+        "attempt_supercell": True,
+        "allow_subset": False,
+        "comparator": "StructureMatcher-default-species-comparator",
+        "symmetric_fit": "native-symmetric-or-required-bidirectional-fallback",
+        "max_relative_volume_difference": 0.03,
+        "hard_identity_relation": (
+            CrystalMatchRelation.STRICT_MATERIAL_DUPLICATE.value
+        ),
+    }
+
+
+def _validated_readonly_base_url(
+    value: str,
+    *,
+    allow_loopback_http: bool,
+    require_optimade_version: bool,
+) -> str:
+    text = str(value).strip().rstrip("/")
+    if not text or len(text) > 2_000:
+        raise ValueError("external structure provider base URL is required")
+    parsed = urlsplit(text)
+    if parsed.username or parsed.password:
+        raise ValueError("external structure provider URLs must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("external structure provider base URLs cannot contain query/fragment")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("external structure provider URL requires a host")
+    if parsed.scheme != "https":
+        if not (
+            allow_loopback_http
+            and parsed.scheme == "http"
+            and _is_loopback_host(host)
+        ):
+            raise ValueError(
+                "external structure provider URLs require HTTPS; "
+                "loopback HTTP requires explicit opt-in"
+            )
+    if require_optimade_version and not re.search(
+        r"/v1(?:\.\d+(?:\.\d+)?)?$",
+        parsed.path.rstrip("/"),
+    ):
+        raise ValueError("OPTIMADE lookup requires an explicit versioned v1 base URL")
+    return text
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _provider_id_from_url(prefix: str, url: str) -> str:
+    host = (urlsplit(url).hostname or "provider").lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", host).strip("-") or "provider"
+    return f"{prefix}-{slug}"[:256]
+
+
+def _validated_provider_next_url(base_url: str, next_link: str) -> str:
+    if not next_link or len(next_link) > 4_096:
+        raise ValueError("provider next link is blank or too long")
+    absolute = urljoin(base_url.rstrip("/") + "/", next_link)
+    base = urlsplit(base_url)
+    target = urlsplit(absolute)
+    if (
+        target.scheme != base.scheme
+        or target.netloc != base.netloc
+        or target.username
+        or target.password
+        or target.fragment
+    ):
+        raise ValueError("provider next link leaves the configured origin")
+    base_path = base.path.rstrip("/")
+    if not (
+        target.path == base_path
+        or target.path.startswith(base_path + "/")
+    ):
+        raise ValueError("provider next link leaves the configured versioned base path")
+    return absolute
+
+
+def _bounded_json_response(response: object, *, max_bytes: int) -> object:
+    status_code = getattr(response, "status_code", 200)
+    if (
+        isinstance(status_code, bool)
+        or not isinstance(status_code, int)
+        or not 200 <= status_code < 300
+    ):
+        raise ValueError("provider returned a non-success HTTP status")
+    raise_for_status = getattr(response, "raise_for_status", None)
+    if callable(raise_for_status):
+        raise_for_status()
+    raw = _read_bounded_response_bytes(response, max_bytes=max_bytes)
+    if raw:
+        try:
+            payload = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("provider response is not valid UTF-8 JSON") from exc
+    else:
+        loader = getattr(response, "json", None)
+        if not callable(loader):
+            raise TypeError("provider response has no JSON decoder")
+        payload = loader()
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(encoded) > max_bytes:
+        raise ValueError("provider decoded JSON exceeds the configured byte limit")
+    return payload
+
+
+def _bounded_text_response(response: object, *, max_bytes: int) -> str:
+    status_code = getattr(response, "status_code", 200)
+    if (
+        isinstance(status_code, bool)
+        or not isinstance(status_code, int)
+        or not 200 <= status_code < 300
+    ):
+        raise ValueError("provider returned a non-success HTTP status")
+    raise_for_status = getattr(response, "raise_for_status", None)
+    if callable(raise_for_status):
+        raise_for_status()
+    content = _read_bounded_response_bytes(response, max_bytes=max_bytes)
+    if content:
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("provider text response is not UTF-8") from exc
+    else:
+        text = str(getattr(response, "text", ""))
+        if len(text.encode("utf-8")) > max_bytes:
+            raise ValueError("provider text response exceeds the configured byte limit")
+    if not text.strip() or "\x00" in text:
+        raise ValueError("provider text response is empty or invalid")
+    return text
+
+
+def _read_bounded_response_bytes(response: object, *, max_bytes: int) -> bytes:
+    iterator = getattr(response, "iter_content", None)
+    if callable(iterator):
+        chunks: list[bytes] = []
+        size = 0
+        try:
+            for chunk in iterator(chunk_size=min(64 * 1024, max_bytes + 1)):
+                if not chunk:
+                    continue
+                raw = bytes(chunk)
+                size += len(raw)
+                if size > max_bytes:
+                    raise ValueError(
+                        "provider response exceeds the configured byte limit"
+                    )
+                chunks.append(raw)
+            return b"".join(chunks)
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+    content = getattr(response, "content", None)
+    if isinstance(content, (bytes, bytearray)):
+        raw = bytes(content)
+        if len(raw) > max_bytes:
+            raise ValueError("provider response exceeds the configured byte limit")
+        return raw
+    return b""
+
+
+def _bounded_text(value: object, *, limit: int = 2_000) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _external_candidate_query_context(
+    candidate: Candidate,
+) -> tuple[_ExternalCandidateQueryContext | None, str | None]:
+    representation = _representation(candidate, RepresentationKind.CIF)
+    fmt = "cif"
+    if representation is None:
+        representation = _representation(candidate, RepresentationKind.POSCAR)
+        fmt = "poscar"
+    if representation is None:
+        return None, "candidate_has_no_cif_or_poscar_representation"
+    try:
+        structure = parse_crystal_structure(representation.value, fmt=fmt)
+        validate_crystal_geometry(structure)
+        occupancy = inspect_crystal_occupancy(structure)
+    except PymatgenRequiredError:
+        return None, "crystal_identity_dependency_not_installed"
+    except CrystalIdentityError as exc:
+        return None, f"candidate_crystal_identity_failed:{type(exc).__name__}"
+    if not occupancy.is_fully_occupied_ordered:
+        suffix = ",".join(occupancy.reason_codes) or "unsupported_occupancy"
+        return (
+            None,
+            "candidate_disorder_or_partial_occupancy_unsupported:" + suffix,
+        )
+    try:
+        counts = _ordered_structure_element_counts(structure)
+    except ValueError:
+        return None, "candidate_species_not_supported_for_external_identity"
+    normalized = _normalized_representation_value(representation)
+    return (
+        _ExternalCandidateQueryContext(
+            representation=representation,
+            fmt=fmt,
+            structure=structure,
+            structure_sha256=stable_hash(
+                {
+                    "format": fmt,
+                    "representation": normalized,
+                }
+            ),
+            optimade_reduced_formula=_formula_from_counts(
+                counts,
+                order="alphabetical",
+                separator="",
+            ),
+            cod_hill_formula=_formula_from_counts(
+                counts,
+                order="hill",
+                separator=" ",
+            ),
+        ),
+        None,
+    )
+
+
+def _ordered_structure_element_counts(structure: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for site in structure:
+        species = list(site.species.items())
+        if len(species) != 1 or abs(float(species[0][1]) - 1.0) > 1e-8:
+            raise ValueError("strict external identity requires one full species per site")
+        specie = species[0][0]
+        symbol = getattr(specie, "symbol", None)
+        if symbol is None:
+            element = getattr(specie, "element", None)
+            symbol = getattr(element, "symbol", None)
+        text = str(symbol).strip() if symbol is not None else ""
+        if not re.fullmatch(r"[A-Z][a-z]?", text):
+            raise ValueError("strict external identity requires chemical element species")
+        counts[text] = counts.get(text, 0) + 1
+    if not counts:
+        raise ValueError("crystal contains no supported elements")
+    divisor = 0
+    for amount in counts.values():
+        divisor = amount if divisor == 0 else _greatest_common_divisor(divisor, amount)
+    return {key: value // max(1, divisor) for key, value in counts.items()}
+
+
+def _greatest_common_divisor(first: int, second: int) -> int:
+    left, right = abs(int(first)), abs(int(second))
+    while right:
+        left, right = right, left % right
+    return max(1, left)
+
+
+def _formula_from_counts(
+    counts: Mapping[str, int],
+    *,
+    order: str,
+    separator: str,
+) -> str:
+    if order == "alphabetical":
+        symbols = sorted(counts)
+    elif order == "hill":
+        if "C" in counts:
+            symbols = [
+                "C",
+                *(["H"] if "H" in counts else []),
+                *sorted(key for key in counts if key not in {"C", "H"}),
+            ]
+        else:
+            symbols = sorted(counts)
+    else:
+        raise ValueError("unknown formula ordering")
+    return separator.join(
+        symbol + (str(counts[symbol]) if counts[symbol] != 1 else "")
+        for symbol in symbols
+    )
+
+
+def _optimade_record_id(resource: Mapping[str, Any]) -> str | None:
+    record_id = _bounded_text(resource.get("id"), limit=512)
+    record_type = _bounded_text(resource.get("type"), limit=128)
+    if record_id is None or record_type != "structures":
+        return None
+    return record_id
+
+
+def _jsonapi_link_href(value: object) -> str | None:
+    if isinstance(value, str):
+        return _bounded_text(value, limit=4_096)
+    if isinstance(value, Mapping):
+        return _bounded_text(value.get("href"), limit=4_096)
+    return None
+
+
+def _optimade_local_recheck(
+    *,
+    provider_id: str,
+    candidate_structure: str,
+    resource: Mapping[str, Any],
+) -> tuple[NoveltyMatch | None, bool]:
+    record_id = _optimade_record_id(resource)
+    if record_id is None:
+        return None, True
+    remote, payload_metadata, issue = _optimade_resource_to_structure(resource)
+    if issue is not None or remote is None:
+        return (
+            NoveltyMatch(
+                source_id=provider_id,
+                record_id=record_id,
+                match_kind="optimade-structure-unverified",
+                metadata={
+                    **payload_metadata,
+                    "strict_recheck": issue or "structure_payload_unavailable",
+                    "hard_identity": "false",
+                },
+            ),
+            True,
+        )
+    try:
+        assessment = classify_crystal_structure_relation(
+            candidate_structure,
+            remote,
+        )
+    except Exception as exc:
+        return (
+            NoveltyMatch(
+                source_id=provider_id,
+                record_id=record_id,
+                match_kind="optimade-structure-unverified",
+                metadata={
+                    **payload_metadata,
+                    "strict_recheck": f"failed:{type(exc).__name__}",
+                    "hard_identity": "false",
+                },
+            ),
+            True,
+        )
+    finding = _assessment_finding(
+        provider_id=provider_id,
+        record_id=record_id,
+        assessment=assessment,
+        metadata=payload_metadata,
+    )
+    return finding, assessment.relation == CrystalMatchRelation.AMBIGUOUS
+
+
+def _optimade_resource_to_structure(
+    resource: Mapping[str, Any],
+) -> tuple[Any | None, dict[str, str], str | None]:
+    attributes = resource.get("attributes")
+    if not isinstance(attributes, Mapping):
+        return None, {}, "attributes_missing"
+    immutable_id = _bounded_text(attributes.get("immutable_id"), limit=1_000)
+    last_modified = _bounded_text(attributes.get("last_modified"), limit=128)
+    formula = _bounded_text(
+        attributes.get("chemical_formula_reduced"),
+        limit=512,
+    )
+    features_raw = attributes.get("structure_features")
+    features = (
+        sorted(
+            {
+                str(item).strip().lower()
+                for item in features_raw
+                if str(item).strip()
+            }
+        )
+        if isinstance(features_raw, list)
+        else []
+    )
+    metadata = {
+        "immutable_id": immutable_id or "not-reported",
+        "last_modified": last_modified or "not-reported",
+        "chemical_formula_reduced": formula or "not-reported",
+        "structure_features": ",".join(features) or "none",
+    }
+    unsupported = {"disorder", "implicit_atoms", "assemblies"}
+    if unsupported.intersection(features):
+        return None, metadata, "unsupported_structure_features"
+    assemblies = attributes.get("assemblies")
+    if assemblies not in (None, []):
+        return None, metadata, "assemblies_not_supported"
+    dimensions = attributes.get("dimension_types")
+    if dimensions is not None and dimensions != [1, 1, 1]:
+        return None, metadata, "non_three_dimensional_structure"
+    periodic_dimensions = attributes.get("nperiodic_dimensions")
+    if periodic_dimensions is not None and periodic_dimensions != 3:
+        return None, metadata, "non_three_dimensional_structure"
+
+    lattice = attributes.get("lattice_vectors")
+    positions = attributes.get("cartesian_site_positions")
+    species_at_sites = attributes.get("species_at_sites")
+    species_rows = attributes.get("species")
+    nsites = attributes.get("nsites")
+    if not (
+        isinstance(lattice, list)
+        and len(lattice) == 3
+        and all(isinstance(row, list) and len(row) == 3 for row in lattice)
+    ):
+        return None, metadata, "lattice_vectors_missing_or_invalid"
+    if not isinstance(positions, list) or not isinstance(species_at_sites, list):
+        return None, metadata, "site_positions_or_species_at_sites_missing"
+    if (
+        len(positions) != len(species_at_sites)
+        or not positions
+        or not isinstance(nsites, int)
+        or isinstance(nsites, bool)
+        or nsites != len(positions)
+    ):
+        return None, metadata, "site_count_or_site_arrays_inconsistent"
+    if not isinstance(species_rows, list):
+        return None, metadata, "species_definitions_missing"
+
+    species_by_name: dict[str, str] = {}
+    for raw in species_rows:
+        if not isinstance(raw, Mapping):
+            return None, metadata, "species_definition_not_an_object"
+        name = _bounded_text(raw.get("name"), limit=256)
+        symbols = raw.get("chemical_symbols")
+        concentrations = raw.get("concentration")
+        if (
+            name is None
+            or name in species_by_name
+            or not isinstance(symbols, list)
+            or not isinstance(concentrations, list)
+            or len(symbols) != 1
+            or len(concentrations) != 1
+        ):
+            return None, metadata, "disordered_or_invalid_species_definition"
+        symbol = str(symbols[0]).strip()
+        try:
+            concentration = float(concentrations[0])
+        except (TypeError, ValueError):
+            return None, metadata, "invalid_species_concentration"
+        if (
+            not re.fullmatch(r"[A-Z][a-z]?", symbol)
+            or abs(concentration - 1.0) > 1e-8
+        ):
+            return None, metadata, "partial_or_non_element_species_definition"
+        species_by_name[name] = symbol
+    try:
+        site_species = [species_by_name[str(item)] for item in species_at_sites]
+    except (KeyError, TypeError):
+        return None, metadata, "species_at_sites_reference_unknown_definition"
+    try:
+        lattice_values = [[float(item) for item in row] for row in lattice]
+        position_values = [[float(item) for item in row] for row in positions]
+    except (TypeError, ValueError):
+        return None, metadata, "non_numeric_lattice_or_site_position"
+    if any(
+        not all(_finite_number(item) for item in row)
+        for row in [*lattice_values, *position_values]
+    ):
+        return None, metadata, "non_finite_lattice_or_site_position"
+    if any(len(row) != 3 for row in position_values):
+        return None, metadata, "cartesian_site_position_shape_invalid"
+    try:
+        from pymatgen.core import Lattice, Structure
+
+        remote = Structure(
+            Lattice(lattice_values),
+            site_species,
+            position_values,
+            coords_are_cartesian=True,
+            to_unit_cell=True,
+        )
+        validate_crystal_geometry(remote)
+        occupancy = inspect_crystal_occupancy(remote)
+    except Exception as exc:
+        return (
+            None,
+            metadata,
+            f"local_structure_reconstruction_failed:{type(exc).__name__}",
+        )
+    if not occupancy.is_fully_occupied_ordered:
+        return None, metadata, "partial_or_disordered_reconstructed_structure"
+    payload = {
+        "lattice_vectors": lattice_values,
+        "cartesian_site_positions": position_values,
+        "species_at_sites": site_species,
+    }
+    metadata["structure_payload_sha256"] = stable_hash(payload)
+    return remote, metadata, None
+
+
+def _finite_number(value: float) -> bool:
+    return value == value and value not in {float("inf"), float("-inf")}
+
+
+def _cod_record_identity(
+    row: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    raw_id = (
+        row.get("file")
+        or row.get("id")
+        or row.get("cod_id")
+        or row.get("codid")
+    )
+    record_id = str(raw_id).strip() if raw_id is not None else ""
+    record_id = re.sub(r"\.cif(?:@\d+)?$", "", record_id, flags=re.IGNORECASE)
+    if not re.fullmatch(r"\d{5,12}", record_id):
+        record_id = ""
+    raw_revision = (
+        row.get("svnrevision")
+        or row.get("revision")
+        or row.get("rev")
+    )
+    revision = str(raw_revision).strip() if raw_revision is not None else ""
+    if not re.fullmatch(r"\d{1,20}", revision):
+        revision = ""
+    return record_id or None, revision or None
+
+
+def _cod_local_recheck(
+    *,
+    candidate_structure: str,
+    record_id: str,
+    revision: str,
+    row: Mapping[str, Any],
+    remote_cif: str,
+    cif_url: str,
+) -> tuple[NoveltyMatch | None, bool]:
+    stable_record_id = f"{record_id}@{revision}"
+    metadata = {
+        "cod_id": record_id,
+        "revision": revision,
+        "source_url": cif_url,
+        "theoretical": _bounded_text(
+            row.get("theoretical")
+            or row.get("is_theoretical"),
+            limit=64,
+        )
+        or "not-reported",
+        "duplicate_of": _bounded_text(
+            row.get("duplicateof") or row.get("duplicate_of"),
+            limit=512,
+        )
+        or "none",
+        "structure_payload_sha256": stable_hash(
+            remote_cif.replace("\r\n", "\n").replace("\r", "\n").strip()
+        ),
+    }
+    if len(re.findall(r"(?im)^\s*data_", remote_cif)) != 1:
+        return (
+            NoveltyMatch(
+                source_id="cod",
+                record_id=stable_record_id,
+                match_kind="cod-structure-unverified",
+                metadata={
+                    **metadata,
+                    "strict_recheck": "cif_requires_exactly_one_data_block",
+                    "hard_identity": "false",
+                },
+            ),
+            True,
+        )
+    try:
+        validate_crystal_geometry(remote_cif, fmt="cif")
+        occupancy = inspect_crystal_occupancy(remote_cif, fmt="cif")
+    except Exception as exc:
+        return (
+            NoveltyMatch(
+                source_id="cod",
+                record_id=stable_record_id,
+                match_kind="cod-structure-unverified",
+                metadata={
+                    **metadata,
+                    "strict_recheck": f"cif_parse_failed:{type(exc).__name__}",
+                    "hard_identity": "false",
+                },
+            ),
+            True,
+        )
+    if not occupancy.is_fully_occupied_ordered:
+        return (
+            NoveltyMatch(
+                source_id="cod",
+                record_id=stable_record_id,
+                match_kind="cod-structure-unverified",
+                metadata={
+                    **metadata,
+                    "strict_recheck": (
+                        "partial_or_disordered_structure:"
+                        + ",".join(occupancy.reason_codes)
+                    ),
+                    "hard_identity": "false",
+                },
+            ),
+            True,
+        )
+    try:
+        assessment = classify_crystal_structure_relation(
+            candidate_structure,
+            remote_cif,
+        )
+    except Exception as exc:
+        return (
+            NoveltyMatch(
+                source_id="cod",
+                record_id=stable_record_id,
+                match_kind="cod-structure-unverified",
+                metadata={
+                    **metadata,
+                    "strict_recheck": f"failed:{type(exc).__name__}",
+                    "hard_identity": "false",
+                },
+            ),
+            True,
+        )
+    finding = _assessment_finding(
+        provider_id="cod",
+        record_id=stable_record_id,
+        assessment=assessment,
+        metadata=metadata,
+    )
+    return finding, assessment.relation == CrystalMatchRelation.AMBIGUOUS
+
+
+def _assessment_finding(
+    *,
+    provider_id: str,
+    record_id: str,
+    assessment: Any,
+    metadata: Mapping[str, str],
+) -> NoveltyMatch:
+    return NoveltyMatch(
+        source_id=provider_id,
+        record_id=record_id,
+        match_kind=assessment.relation.value,
+        metadata={
+            **dict(metadata),
+            "strict_match": str(assessment.strict_match).lower(),
+            "scaled_match": str(assessment.scaled_match).lower(),
+            "relative_volume_difference": str(
+                assessment.relative_volume_difference
+            ),
+            "strict_settings_sha256": stable_hash(
+                asdict(assessment.strict_settings)
+            ),
+            "scaled_settings_sha256": stable_hash(
+                asdict(assessment.scaled_settings)
+            ),
+            "reason": assessment.reason or "none",
+            "hard_identity": str(
+                assessment.relation
+                == CrystalMatchRelation.STRICT_MATERIAL_DUPLICATE
+            ).lower(),
+        },
+    )
+
+
+def _downgrade_untrusted_matches(
+    matches: Sequence[NoveltyMatch],
+    *,
+    reason: str,
+) -> list[NoveltyMatch]:
+    return [
+        item.model_copy(
+            update={
+                "match_kind": "strict-local-match-provider-receipt-incomplete",
+                "metadata": {
+                    **item.metadata,
+                    "hard_identity": "false",
+                    "provider_receipt": reason,
+                },
+            }
+        )
+        for item in matches
+    ]
+
+
+def _unique_findings(
+    findings: Sequence[NoveltyMatch],
+) -> list[NoveltyMatch]:
+    by_key: dict[tuple[str, str], NoveltyMatch] = {}
+    for item in findings:
+        by_key[(item.source_id, item.record_id)] = item
+    return [by_key[key] for key in sorted(by_key)]
+
+
+def _environment_optional_text(
+    values: Mapping[str, str],
+    key: str,
+) -> str | None:
+    text = str(values.get(key, "")).strip()
+    return text or None
+
+
+def _environment_int(
+    values: Mapping[str, str],
+    key: str,
+    *,
+    default: int,
+) -> int:
+    text = str(values.get(key, "")).strip()
+    if not text:
+        return default
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+
+
+def _environment_float(
+    values: Mapping[str, str],
+    key: str,
+    *,
+    default: float,
+) -> float:
+    text = str(values.get(key, "")).strip()
+    if not text:
+        return default
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be a number") from exc
+
+
+def _environment_switch(
+    values: Mapping[str, str],
+    key: str,
+    *,
+    default: bool,
+) -> bool:
+    text = str(values.get(key, "")).strip()
+    if not text:
+        return default
+    if text == "1":
+        return True
+    if text == "0":
+        return False
+    raise ValueError(f"{key} must be '0' or '1'")
+
+
 __all__ = [
+    "CodStructureLookup",
     "ExternalNoveltyLookup",
     "ExternalNoveltyOutcome",
     "LIVE_MOVING_SNAPSHOT_UNPINNED",
@@ -1444,9 +3338,11 @@ __all__ = [
     "NoveltyStage",
     "NoveltyStageResult",
     "NoveltyStatus",
+    "OptimadeStructureLookup",
     "ProjectNoveltyIndex",
     "ScientificNoveltyAssessment",
     "StagedNoveltyAssessor",
+    "build_external_novelty_lookups_from_environment",
     "reserve_external_no_match_portfolio_slot",
     "scientific_fingerprint",
 ]

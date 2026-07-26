@@ -5,6 +5,8 @@ import json
 import pytest
 
 from discovery_os.cli import main
+from discovery_os.fusion_schemas import ContentArtifactRef
+from discovery_os.hashing import stable_hash
 from discovery_os.material_domains import (
     MATERIAL_EVIDENCE_STAGES,
     MATERIAL_FIELD_PROFILES,
@@ -18,6 +20,16 @@ from discovery_os.material_domains import (
     resolve_material_field,
 )
 from discovery_os.schemas import MaterialField
+from discovery_os.specialist_validation import (
+    ScientificGateReceipt,
+    SpecialistExecutionReceipt,
+    SpecialistOutputEvidence,
+    specialist_execution_receipt_sha256,
+)
+from discovery_os.specialist_workflows import (
+    SPECIALIST_WORKFLOW_POLICIES,
+    specialist_workflow_policy_sha256,
+)
 from discovery_os.validation_evidence import (
     ValidationEvidenceRequest,
     ValidationEvidenceRouter,
@@ -35,6 +47,113 @@ class _FieldModel:
 
     def complete_json(self, **_kwargs):
         return self.payload
+
+
+def _execution_receipt_binding(
+    *,
+    candidate_id: str,
+    property_name: str,
+    validator_id: str,
+    unit: str,
+    conditions: dict[str, object],
+    provenance_id: str,
+    raw_artifact_sha256: str,
+    converged: bool = True,
+    experimental: bool = False,
+) -> dict[str, object]:
+    matching_policies = [
+        policy
+        for policy in SPECIALIST_WORKFLOW_POLICIES.values()
+        if policy.property_name == property_name
+        and policy.validator_id == validator_id
+    ]
+    if len(matching_policies) != 1:
+        raise ValueError(
+            "test receipt fixture requires exactly one specialist workflow policy"
+        )
+    policy = matching_policies[0]
+    method = policy.allowed_methods[0]
+    convergence_sha = stable_hash(
+        ["convergence", candidate_id, property_name, conditions]
+    )
+    receipt = SpecialistExecutionReceipt(
+        receipt_id=f"receipt-{candidate_id}-{property_name}",
+        material_field=policy.material_field,
+        validator_id=validator_id,
+        validator_contract_version=policy.validator_contract_version,
+        workflow_policy_id=policy.policy_id,
+        workflow_policy_version=policy.policy_version,
+        execution_kind=(
+            "experimental_measurement"
+            if experimental
+            else "numerical_simulation"
+        ),
+        candidate_id=candidate_id,
+        candidate_input_sha256=stable_hash(["candidate-input", candidate_id]),
+        property_name=property_name,
+        unit=unit,
+        conditions=conditions,
+        conditions_sha256=stable_hash(conditions),
+        method_family=method.method_family,
+        method_id=method.method_id,
+        method_version="test-v1",
+        method_policy_sha256=specialist_workflow_policy_sha256(policy),
+        input_manifest_sha256=stable_hash(["input-manifest", candidate_id]),
+        workflow_engine="fixture-workflow",
+        workflow_version="test-v1",
+        workflow_code_revision="fixture-code-revision",
+        execution_status="completed",
+        workflow_exit_code=0,
+        parser_status="success",
+        output_artifacts=[
+            ContentArtifactRef(
+                artifact_id=f"result-{candidate_id}-{property_name}",
+                relative_path=f"external/{candidate_id}/{property_name}.json",
+                sha256=raw_artifact_sha256,
+                media_type="application/json",
+                byte_size=1,
+            )
+        ],
+        primary_output_sha256=raw_artifact_sha256,
+        convergence_status=(
+            "not_applicable"
+            if experimental
+            else ("passed" if converged else "failed")
+        ),
+        convergence_evidence_artifacts=[
+            ContentArtifactRef(
+                artifact_id=f"convergence-{candidate_id}-{property_name}",
+                relative_path=(
+                    f"external/{candidate_id}/{property_name}-convergence.json"
+                ),
+                sha256=convergence_sha,
+                media_type="application/json",
+                byte_size=1,
+            )
+        ],
+        output_evidence=[
+            SpecialistOutputEvidence(
+                evidence_label=label,
+                artifact_sha256=raw_artifact_sha256,
+                parser_locator=f"$.{label}",
+            )
+            for label in policy.required_output_evidence_labels
+        ],
+        scientific_gate_receipts=[
+            ScientificGateReceipt(
+                gate_id=gate_id,
+                status=("passed" if converged else "failed"),
+                evidence_labels=[policy.required_output_evidence_labels[0]],
+            )
+            for gate_id in policy.required_scientific_gate_ids
+        ],
+        quality_control_passed=converged,
+        provenance_id=provenance_id,
+    )
+    return {
+        "execution_receipt": receipt,
+        "execution_receipt_sha256": specialist_execution_receipt_sha256(receipt),
+    }
 
 
 def test_every_material_field_has_a_complete_fail_closed_route() -> None:
@@ -78,6 +197,16 @@ def test_every_material_field_has_a_complete_fail_closed_route() -> None:
             if validator.can_create_property_scores
             for property_name in validator.properties
         }
+        assert all(
+            validator.property_score_policy
+            == (
+                "execution-receipt-required"
+                if validator.can_create_property_scores
+                else "no-score-authority"
+            )
+            for route in profile.stage_routes
+            for validator in route.validators
+        )
         assert all(
             item.property_name in score_authorities
             for item in profile.properties
@@ -450,6 +579,198 @@ def test_domain_plan_rejects_secret_or_conflicting_context() -> None:
         )
 
 
+def test_successful_external_property_requires_a_bound_execution_receipt() -> None:
+    with pytest.raises(ValueError, match="requires a bound execution receipt"):
+        MaterialPropertyObservation(
+            observation_id="obs-unverified",
+            candidate_id="candidate-unverified",
+            material_field=MaterialField.GENERAL_INORGANIC,
+            property_name="energy_above_hull",
+            validator_id="reference-phase-dft-and-phase-diagram",
+            status="success",
+            value=0.01,
+            unit="eV/atom",
+            conditions={"pressure": 0.0, "temperature": 300.0},
+            provenance_id="prov-unverified",
+            raw_artifact_sha256="a" * 64,
+            authority_kind="numerical_validator",
+        )
+
+    unknown = MaterialPropertyObservation(
+        observation_id="obs-not-run",
+        candidate_id="candidate-unverified",
+        material_field=MaterialField.GENERAL_INORGANIC,
+        property_name="energy_above_hull",
+        validator_id="reference-phase-dft-and-phase-diagram",
+        status="unknown",
+        unit="eV/atom",
+        conditions={"pressure": 0.0, "temperature": 300.0},
+        provenance_id="prov-not-run",
+        raw_artifact_sha256="b" * 64,
+        authority_kind="numerical_validator",
+    )
+    assert unknown.execution_receipt is None
+
+    forged = unknown.model_copy(
+        update={
+            "status": "success",
+            "value": 0.01,
+            "observation_id": "obs-bypassed-validation",
+        }
+    )
+    assessment = assess_material_field_results(
+        MaterialField.GENERAL_INORGANIC,
+        candidate_id="candidate-unverified",
+        target_conditions={"pressure": 0.0, "temperature": 300.0},
+        observations=[forged],
+    )
+    assert assessment.decisions[0].status != "available"
+    assert assessment.decisions[0].accepted_observation_ids == []
+
+
+@pytest.mark.parametrize(
+    ("receipt_candidate", "receipt_conditions", "observation_raw_sha", "converged", "error"),
+    [
+        (
+            "other-candidate",
+            {"pressure": 0.0, "temperature": 300.0},
+            "a" * 64,
+            True,
+            "candidate_id does not match",
+        ),
+        (
+            "candidate-bound",
+            {"pressure": 1.0, "temperature": 300.0},
+            "a" * 64,
+            True,
+            "conditions do not match",
+        ),
+        (
+            "candidate-bound",
+            {"pressure": 0.0, "temperature": 300.0},
+            "b" * 64,
+            True,
+            "not the receipt primary output",
+        ),
+        (
+            "candidate-bound",
+            {"pressure": 0.0, "temperature": 300.0},
+            "a" * 64,
+            False,
+            "convergence or quality-control gate",
+        ),
+    ],
+)
+def test_successful_property_receipt_binding_is_fail_closed(
+    receipt_candidate: str,
+    receipt_conditions: dict[str, object],
+    observation_raw_sha: str,
+    converged: bool,
+    error: str,
+) -> None:
+    binding = _execution_receipt_binding(
+        candidate_id=receipt_candidate,
+        property_name="energy_above_hull",
+        validator_id="reference-phase-dft-and-phase-diagram",
+        unit="eV/atom",
+        conditions=receipt_conditions,
+        provenance_id="prov-bound",
+        raw_artifact_sha256="a" * 64,
+        converged=converged,
+    )
+    with pytest.raises(ValueError, match=error):
+        MaterialPropertyObservation(
+            observation_id="obs-bound",
+            candidate_id="candidate-bound",
+            material_field=MaterialField.GENERAL_INORGANIC,
+            property_name="energy_above_hull",
+            validator_id="reference-phase-dft-and-phase-diagram",
+            status="success",
+            value=0.01,
+            unit="eV/atom",
+            conditions={"pressure": 0.0, "temperature": 300.0},
+            provenance_id="prov-bound",
+            raw_artifact_sha256=observation_raw_sha,
+            authority_kind="numerical_validator",
+            **binding,
+        )
+
+
+def test_receipt_requires_method_input_and_exact_receipt_hash() -> None:
+    binding = _execution_receipt_binding(
+        candidate_id="candidate-method",
+        property_name="energy_above_hull",
+        validator_id="reference-phase-dft-and-phase-diagram",
+        unit="eV/atom",
+        conditions={"pressure": 0.0, "temperature": 300.0},
+        provenance_id="prov-method",
+        raw_artifact_sha256="c" * 64,
+    )
+    receipt = binding["execution_receipt"]
+    assert isinstance(receipt, SpecialistExecutionReceipt)
+    for field in ("method_policy_sha256", "input_manifest_sha256"):
+        payload = receipt.model_dump(mode="json")
+        payload.pop(field)
+        with pytest.raises(ValueError):
+            SpecialistExecutionReceipt.model_validate(payload)
+
+    with pytest.raises(ValueError, match="does not match the bound execution receipt"):
+        MaterialPropertyObservation(
+            observation_id="obs-method",
+            candidate_id="candidate-method",
+            material_field=MaterialField.GENERAL_INORGANIC,
+            property_name="energy_above_hull",
+            validator_id="reference-phase-dft-and-phase-diagram",
+            status="success",
+            value=0.01,
+            unit="eV/atom",
+            conditions={"pressure": 0.0, "temperature": 300.0},
+            provenance_id="prov-method",
+            raw_artifact_sha256="c" * 64,
+            authority_kind="numerical_validator",
+            execution_receipt=receipt,
+            execution_receipt_sha256="0" * 64,
+        )
+
+
+def test_experimental_property_uses_quality_control_not_fake_convergence() -> None:
+    conditions = {
+        "reaction": "oxygen evolution",
+        "temperature": 300.0,
+        "pressure": 1.0,
+        "electrode_potential": 1.6,
+        "ph": 14.0,
+    }
+    binding = _execution_receipt_binding(
+        candidate_id="candidate-catalyst",
+        property_name="durability",
+        validator_id="operando-durability-validation",
+        unit="h",
+        conditions=conditions,
+        provenance_id="prov-operando",
+        raw_artifact_sha256="d" * 64,
+        experimental=True,
+    )
+    observation = MaterialPropertyObservation(
+        observation_id="obs-operando",
+        candidate_id="candidate-catalyst",
+        material_field=MaterialField.HETEROGENEOUS_CATALYST,
+        property_name="durability",
+        validator_id="operando-durability-validation",
+        status="success",
+        value=100.0,
+        unit="h",
+        conditions=conditions,
+        provenance_id="prov-operando",
+        raw_artifact_sha256="d" * 64,
+        authority_kind="experimental_validator",
+        **binding,
+    )
+    assert observation.execution_receipt is not None
+    assert observation.execution_receipt.convergence_status == "not_applicable"
+    assert observation.execution_receipt.quality_control_passed is True
+
+
 def test_field_property_ranking_requires_named_validators_units_and_conditions() -> None:
     common = {
         "candidate_id": "candidate-te-1",
@@ -481,6 +802,19 @@ def test_field_property_ranking_requires_named_validators_units_and_conditions()
                     "carrier_concentration": 1e19,
                     "carrier_type": "n",
                 },
+                **_execution_receipt_binding(
+                    candidate_id="candidate-te-1",
+                    property_name="power_factor",
+                    validator_id="electronic-boltzmann-transport",
+                    unit="W/(m K^2)",
+                    conditions={
+                        "temperature": 800,
+                        "carrier_concentration": 1e19,
+                        "carrier_type": "n",
+                    },
+                    provenance_id="prov-1",
+                    raw_artifact_sha256="a" * 64,
+                ),
             ),
             MaterialPropertyObservation(
                 **common,
@@ -493,6 +827,18 @@ def test_field_property_ranking_requires_named_validators_units_and_conditions()
                     "temperature": 800,
                     "microstructure": "dense polycrystal",
                 },
+                **_execution_receipt_binding(
+                    candidate_id="candidate-te-1",
+                    property_name="lattice_thermal_conductivity",
+                    validator_id="anharmonic-phonon-transport",
+                    unit="W/(m K)",
+                    conditions={
+                        "temperature": 800,
+                        "microstructure": "dense polycrystal",
+                    },
+                    provenance_id="prov-1",
+                    raw_artifact_sha256="a" * 64,
+                ),
             ),
             MaterialPropertyObservation(
                 **common,
@@ -506,6 +852,19 @@ def test_field_property_ranking_requires_named_validators_units_and_conditions()
                     "carrier_concentration": 1e19,
                     "microstructure": "dense polycrystal",
                 },
+                **_execution_receipt_binding(
+                    candidate_id="candidate-te-1",
+                    property_name="zt",
+                    validator_id="thermoelectric-zt-integration",
+                    unit="dimensionless",
+                    conditions={
+                        "temperature": 800,
+                        "carrier_concentration": 1e19,
+                        "microstructure": "dense polycrystal",
+                    },
+                    provenance_id="prov-1",
+                    raw_artifact_sha256="a" * 64,
+                ),
             ),
         ],
     )
@@ -514,28 +873,23 @@ def test_field_property_ranking_requires_named_validators_units_and_conditions()
     assert assessment.claim_level == "computational-triage-only"
     assert assessment.missing_target_conditions == []
 
-    wrong_unit = assess_material_field_results(
-        MaterialField.THERMOELECTRIC,
-        candidate_id="candidate-te-1",
-        observations=[
-            MaterialPropertyObservation(
-                **common,
-                observation_id="obs-wrong-unit",
-                property_name="power_factor",
-                validator_id="electronic-boltzmann-transport",
-                value=4.0,
-                unit="mW/(m K^2)",
-                conditions={
-                    "temperature": 800,
-                    "carrier_concentration": 1e19,
-                    "carrier_type": "n",
-                },
-            )
-        ],
-    )
-    assert wrong_unit.ready_for_field_computational_ranking is False
-    assert wrong_unit.decisions[0].status == "incomparable"
-    assert wrong_unit.literature_or_mcp_property_substitution_performed is False
+    with pytest.raises(
+        ValueError,
+        match="unit does not match the code-owned workflow policy",
+    ):
+        _execution_receipt_binding(
+            candidate_id="candidate-te-1",
+            property_name="power_factor",
+            validator_id="electronic-boltzmann-transport",
+            unit="mW/(m K^2)",
+            conditions={
+                "temperature": 800,
+                "carrier_concentration": 1e19,
+                "carrier_type": "n",
+            },
+            provenance_id="prov-1",
+            raw_artifact_sha256="a" * 64,
+        )
 
 
 def test_field_property_assessment_does_not_merge_operating_conditions() -> None:
@@ -569,6 +923,19 @@ def test_field_property_assessment_does_not_merge_operating_conditions() -> None
                     "carrier_concentration": 1e19,
                     "carrier_type": "n",
                 },
+                **_execution_receipt_binding(
+                    candidate_id="candidate-te-conditions",
+                    property_name="power_factor",
+                    validator_id="electronic-boltzmann-transport",
+                    unit="W/(m K^2)",
+                    conditions={
+                        "temperature": 300,
+                        "carrier_concentration": 1e19,
+                        "carrier_type": "n",
+                    },
+                    provenance_id="prov-conditions",
+                    raw_artifact_sha256="b" * 64,
+                ),
             ),
             MaterialPropertyObservation(
                 **common,
@@ -579,6 +946,19 @@ def test_field_property_assessment_does_not_merge_operating_conditions() -> None
                     "carrier_concentration": 1e19,
                     "carrier_type": "n",
                 },
+                **_execution_receipt_binding(
+                    candidate_id="candidate-te-conditions",
+                    property_name="power_factor",
+                    validator_id="electronic-boltzmann-transport",
+                    unit="W/(m K^2)",
+                    conditions={
+                        "temperature": 800,
+                        "carrier_concentration": 1e19,
+                        "carrier_type": "n",
+                    },
+                    provenance_id="prov-conditions",
+                    raw_artifact_sha256="b" * 64,
+                ),
             ),
         ],
     )
@@ -602,6 +982,19 @@ def test_field_property_assessment_does_not_merge_operating_conditions() -> None
                     "carrier_concentration": 1e19,
                     "carrier_type": "n",
                 },
+                **_execution_receipt_binding(
+                    candidate_id="candidate-te-conditions",
+                    property_name="power_factor",
+                    validator_id="electronic-boltzmann-transport",
+                    unit="W/(m K^2)",
+                    conditions={
+                        "temperature": 300,
+                        "carrier_concentration": 1e19,
+                        "carrier_type": "n",
+                    },
+                    provenance_id="prov-conditions",
+                    raw_artifact_sha256="b" * 64,
+                ),
             ),
             MaterialPropertyObservation(
                 **common,
@@ -612,6 +1005,19 @@ def test_field_property_assessment_does_not_merge_operating_conditions() -> None
                     "carrier_concentration": 1e19,
                     "carrier_type": "n",
                 },
+                **_execution_receipt_binding(
+                    candidate_id="candidate-te-conditions",
+                    property_name="power_factor",
+                    validator_id="electronic-boltzmann-transport",
+                    unit="W/(m K^2)",
+                    conditions={
+                        "temperature": 800,
+                        "carrier_concentration": 1e19,
+                        "carrier_type": "n",
+                    },
+                    provenance_id="prov-conditions",
+                    raw_artifact_sha256="b" * 64,
+                ),
             ),
         ],
     )

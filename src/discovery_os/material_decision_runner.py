@@ -58,6 +58,11 @@ from .material_recommendation import (
     candidates_from_application_seeds,
     rank_material_application_candidates,
 )
+from .material_stage_research import (
+    StageResearchPolicy,
+    build_stage_query_blueprints,
+    stage_research_policy,
+)
 from .schemas import Identifier, JsonValue, MaterialField, StrictSchema
 
 
@@ -81,6 +86,16 @@ class MaterialDecisionArtifact(StrictSchema):
 
 class ApplicationRagStageReceipt(StrictSchema):
     evidence_stage: MaterialEvidenceStage
+    research_policy_id: Identifier
+    research_policy_version: Identifier
+    required_intent_ids: list[Identifier] = Field(min_length=1)
+    missing_intent_ids: list[Identifier] = Field(default_factory=list)
+    mcp_scope_argument: Identifier
+    mcp_accepted_arguments: list[Identifier] = Field(min_length=1)
+    mcp_allowed_record_types: list[Identifier] = Field(min_length=1)
+    mcp_required_record_fields: list[Identifier] = Field(min_length=1)
+    mcp_required_provenance_fields: list[Identifier] = Field(min_length=1)
+    mcp_required_stage_metadata_fields: list[Identifier] = Field(min_length=1)
     task_ids: list[Identifier] = Field(min_length=1)
     role_ids: list[Identifier] = Field(min_length=1)
     allowed_literature_sources: list[
@@ -92,6 +107,8 @@ class ApplicationRagStageReceipt(StrictSchema):
     status: Literal[
         "completed",
         "completed_with_source_failures",
+        "completed_with_missing_intents",
+        "completed_with_source_failures_and_missing_intents",
         "failed",
     ]
     source_bundle_id: Identifier | None = None
@@ -101,6 +118,49 @@ class ApplicationRagStageReceipt(StrictSchema):
 
     @model_validator(mode="after")
     def _receipt_is_consistent(self) -> "ApplicationRagStageReceipt":
+        policy = stage_research_policy(self.evidence_stage)
+        if self.research_policy_id != policy.policy_id:
+            raise ValueError("application RAG receipt cites another stage policy")
+        if self.research_policy_version != policy.policy_version:
+            raise ValueError("application RAG receipt policy version is invalid")
+        if self.required_intent_ids != [
+            item.intent_id for item in policy.query_intents
+        ]:
+            raise ValueError(
+                "application RAG receipt intents must follow the stage policy"
+            )
+        if any(
+            item not in self.required_intent_ids
+            for item in self.missing_intent_ids
+        ):
+            raise ValueError("missing application RAG intent is not required")
+        for label, values in (
+            ("required intents", self.required_intent_ids),
+            ("missing intents", self.missing_intent_ids),
+            ("MCP accepted arguments", self.mcp_accepted_arguments),
+            ("MCP record types", self.mcp_allowed_record_types),
+            ("MCP record fields", self.mcp_required_record_fields),
+            ("MCP provenance fields", self.mcp_required_provenance_fields),
+            (
+                "MCP stage metadata fields",
+                self.mcp_required_stage_metadata_fields,
+            ),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"application RAG {label} must be unique")
+        expected_contract = _application_stage_policy_receipt_fields(policy)
+        for name in (
+            "mcp_scope_argument",
+            "mcp_accepted_arguments",
+            "mcp_allowed_record_types",
+            "mcp_required_record_fields",
+            "mcp_required_provenance_fields",
+            "mcp_required_stage_metadata_fields",
+        ):
+            if getattr(self, name) != expected_contract[name]:
+                raise ValueError(
+                    "application RAG receipt MCP contract differs from stage policy"
+                )
         if len(self.task_ids) != len(set(self.task_ids)):
             raise ValueError("application RAG task identifiers must be unique")
         if len(self.role_ids) != len(set(self.role_ids)):
@@ -110,6 +170,16 @@ class ApplicationRagStageReceipt(StrictSchema):
                 raise ValueError("failed application RAG stage needs only an error")
         elif self.source_bundle_id is None or self.error is not None:
             raise ValueError("completed application RAG stage needs a source bundle")
+        missing_status = self.status in {
+            "completed_with_missing_intents",
+            "completed_with_source_failures_and_missing_intents",
+        }
+        if self.status != "failed" and missing_status != bool(
+            self.missing_intent_ids
+        ):
+            raise ValueError(
+                "application RAG missing-intent status does not match coverage"
+            )
         return self
 
 
@@ -355,6 +425,13 @@ class MaterialDecisionRunner:
             tuple[MaterialEvidenceStage, RagEvidenceBundle]
         ] = []
         for stage in MATERIAL_EVIDENCE_STAGES:
+            policy = stage_research_policy(stage)
+            policy_receipt_fields = _application_stage_policy_receipt_fields(
+                policy
+            )
+            required_intent_ids = [
+                item.intent_id for item in policy.query_intents
+            ]
             tasks = [
                 task
                 for role in brief.roles
@@ -365,6 +442,8 @@ class MaterialDecisionRunner:
                 receipts.append(
                     ApplicationRagStageReceipt(
                         evidence_stage=stage,
+                        **policy_receipt_fields,
+                        missing_intent_ids=required_intent_ids,
                         task_ids=[f"{stage}-missing-task"],
                         role_ids=[brief.roles[0].role_id],
                         allowed_literature_sources=["crossref"],
@@ -417,6 +496,27 @@ class MaterialDecisionRunner:
                 mcp_requested=request_mcp,
             )
             prompt = _application_stage_rag_prompt(brief, stage, tasks)
+            query_blueprints = build_stage_query_blueprints(
+                stage=stage,
+                chemical_system=_application_rag_chemical_system(brief),
+                material_field=brief.material_field,
+                application_subtype=_application_rag_application_subtype(
+                    brief
+                ),
+                problem_context=brief.target_context,
+                focus_terms=list(
+                    dict.fromkeys(
+                        [
+                            brief.user_question,
+                            *(
+                                question
+                                for task in tasks
+                                for question in task.questions
+                            ),
+                        ]
+                    )
+                )[:12],
+            )
             request_hash = stable_hash(
                 {
                     "brief_id": brief.brief_id,
@@ -428,12 +528,23 @@ class MaterialDecisionRunner:
                     "from_date": from_date,
                     "to_date": to_date,
                     "max_results_per_query": max_results_per_query,
+                    "research_policy_id": policy.policy_id,
+                    "research_policy_version": policy.policy_version,
+                    "query_blueprints": [
+                        item.model_dump(mode="json")
+                        for item in query_blueprints
+                    ],
+                    "mcp_record_contract": policy.mcp.runtime_contract(
+                        stage
+                    ).model_dump(mode="json"),
                 }
             )
             if not selected_literature and not selected_tool:
                 receipts.append(
                     ApplicationRagStageReceipt(
                         evidence_stage=stage,
+                        **policy_receipt_fields,
+                        missing_intent_ids=required_intent_ids,
                         task_ids=[item.task_id for item in tasks],
                         role_ids=list(
                             dict.fromkeys(item.role_id for item in tasks)
@@ -461,6 +572,7 @@ class MaterialDecisionRunner:
                 pipeline = build_literature_rag_from_environment(
                     environ=stage_environment,
                     require_model=False,
+                    mcp_record_contract=policy.mcp.runtime_contract(stage),
                 )
                 selected_sources = list(selected_literature)
                 if (
@@ -492,7 +604,30 @@ class MaterialDecisionRunner:
                     # The composite below discards any generic planner branches.
                     max_branches=1,
                     index=index,
+                    query_blueprints=query_blueprints,
+                    query_policy_id=policy.policy_id,
+                    query_policy_version=policy.policy_version,
                 )
+                if (
+                    bundle.search_plan.query_policy_id != policy.policy_id
+                    or bundle.search_plan.query_policy_version
+                    != policy.policy_version
+                    or bundle.search_plan.required_intent_ids
+                    != required_intent_ids
+                ):
+                    raise ValueError(
+                        "application RAG bundle does not satisfy its stage "
+                        "research policy"
+                    )
+                coverage_by_intent = {
+                    item.intent_id: item for item in bundle.intent_coverage
+                }
+                missing_intent_ids = [
+                    intent_id
+                    for intent_id in required_intent_ids
+                    if intent_id not in coverage_by_intent
+                    or coverage_by_intent[intent_id].status != "covered"
+                ]
                 failed_sources = any(
                     item.status in {SourceRunStatus.FAILED, SourceRunStatus.SKIPPED}
                     for item in bundle.source_statuses
@@ -500,6 +635,8 @@ class MaterialDecisionRunner:
                 receipts.append(
                     ApplicationRagStageReceipt(
                         evidence_stage=stage,
+                        **policy_receipt_fields,
+                        missing_intent_ids=missing_intent_ids,
                         task_ids=[item.task_id for item in tasks],
                         role_ids=list(
                             dict.fromkeys(item.role_id for item in tasks)
@@ -516,10 +653,9 @@ class MaterialDecisionRunner:
                         ),
                         selected_mcp_tool=selected_tool,
                         request_hash=request_hash,
-                        status=(
-                            "completed_with_source_failures"
-                            if failed_sources
-                            else "completed"
+                        status=_application_rag_completion_status(
+                            failed_sources=failed_sources,
+                            missing_intent_ids=missing_intent_ids,
                         ),
                         source_bundle_id=bundle.bundle_id,
                     )
@@ -529,6 +665,8 @@ class MaterialDecisionRunner:
                 receipts.append(
                     ApplicationRagStageReceipt(
                         evidence_stage=stage,
+                        **policy_receipt_fields,
+                        missing_intent_ids=required_intent_ids,
                         task_ids=[item.task_id for item in tasks],
                         role_ids=list(
                             dict.fromkeys(item.role_id for item in tasks)
@@ -603,6 +741,84 @@ class MaterialDecisionRunner:
         ]
 
 
+def _application_stage_policy_receipt_fields(
+    policy: StageResearchPolicy,
+) -> dict[str, object]:
+    return {
+        "research_policy_id": policy.policy_id,
+        "research_policy_version": policy.policy_version,
+        "required_intent_ids": [
+            item.intent_id for item in policy.query_intents
+        ],
+        "mcp_scope_argument": policy.mcp.scope_argument,
+        "mcp_accepted_arguments": list(policy.mcp.accepted_arguments),
+        "mcp_allowed_record_types": list(policy.mcp.allowed_record_types),
+        "mcp_required_record_fields": list(
+            policy.mcp.required_record_fields
+        ),
+        "mcp_required_provenance_fields": list(
+            policy.mcp.required_provenance_fields
+        ),
+        "mcp_required_stage_metadata_fields": list(
+            policy.mcp.required_stage_metadata_fields
+        ),
+    }
+
+
+def _application_rag_chemical_system(
+    brief: MaterialApplicationBrief,
+) -> str:
+    for context in (
+        brief.target_context,
+        brief.field_plan.problem_context,
+    ):
+        value = context.get("chemical_system")
+        if value is None:
+            continue
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if normalized:
+            return normalized[:512]
+    return f"unspecified {brief.material_field} chemical system"
+
+
+def _application_rag_application_subtype(
+    brief: MaterialApplicationBrief,
+) -> str:
+    resolved = brief.field_plan.resolution.application_subtype
+    if resolved:
+        return str(resolved)
+    role_scope = "+".join(item.role_id for item in brief.roles)
+    return role_scope[:256]
+
+
+def _application_rag_completion_status(
+    *,
+    failed_sources: bool,
+    missing_intent_ids: Sequence[str],
+) -> Literal[
+    "completed",
+    "completed_with_source_failures",
+    "completed_with_missing_intents",
+    "completed_with_source_failures_and_missing_intents",
+]:
+    if failed_sources and missing_intent_ids:
+        return "completed_with_source_failures_and_missing_intents"
+    if failed_sources:
+        return "completed_with_source_failures"
+    if missing_intent_ids:
+        return "completed_with_missing_intents"
+    return "completed"
+
+
 def _application_stage_rag_environment(
     base_environment: Mapping[str, str],
     stage: MaterialEvidenceStage,
@@ -651,9 +867,28 @@ def _application_stage_rag_prompt(
 ) -> str:
     if not tasks or any(item.evidence_stage != stage for item in tasks):
         raise ValueError("application RAG request must contain exactly one stage")
+    research_policy = stage_research_policy(stage)
     rows = [
         "Stage-bounded material application evidence request.",
         f"Validation stage: {stage}.",
+        (
+            f"Code-owned research policy: {research_policy.policy_id}@"
+            f"{research_policy.policy_version}."
+        ),
+        (
+            "Required query intents: "
+            + ", ".join(
+                item.intent_id for item in research_policy.query_intents
+            )
+            + "."
+        ),
+        (
+            "Typed MCP record scope: "
+            + research_policy.mcp.scope_argument
+            + "; allowed record types: "
+            + ", ".join(research_policy.mcp.allowed_record_types)
+            + "."
+        ),
         "Do not answer or perform work for another validation stage.",
         f"User question: {brief.user_question}",
         f"Code-owned material field: {brief.material_field}.",
@@ -732,8 +967,20 @@ def _compose_application_rag_bundles(
     ]
     source_bundle_ids: list[dict[str, str]] = []
     for stage, bundle in stage_bundles:
+        stage_policy_id = bundle.search_plan.query_policy_id
+        stage_policy_version = bundle.search_plan.query_policy_version
+        intent_by_query_id = {
+            item.query_id: item.intent_id
+            for item in bundle.search_plan.queries
+            if item.intent_id is not None
+        }
         source_bundle_ids.append(
-            {"stage": str(stage), "bundle_id": bundle.bundle_id}
+            {
+                "stage": str(stage),
+                "bundle_id": bundle.bundle_id,
+                "research_policy_id": stage_policy_id or "",
+                "research_policy_version": stage_policy_version or "",
+            }
         )
         query_map = {
             item.query_id: (
@@ -756,7 +1003,14 @@ def _compose_application_rag_bundles(
         for item in bundle.search_plan.queries:
             queries.append(
                 item.model_copy(
-                    update={"query_id": query_map[item.query_id]},
+                    update={
+                        "query_id": query_map[item.query_id],
+                        # This combined plan is citation-only and intentionally
+                        # has no executable multi-stage intent contract.
+                        "intent_id": None,
+                        "expected_record_types": [],
+                        "mcp_arguments": {},
+                    },
                     deep=True,
                 )
             )
@@ -785,6 +1039,19 @@ def _compose_application_rag_bundles(
             raw_metadata = dict(item.raw_metadata)
             raw_metadata["application_evidence_stage"] = str(stage)
             raw_metadata["source_bundle_id"] = bundle.bundle_id
+            raw_metadata["application_research_policy_id"] = (
+                stage_policy_id
+            )
+            raw_metadata["application_research_policy_version"] = (
+                stage_policy_version
+            )
+            raw_metadata["application_query_intent_ids"] = sorted(
+                {
+                    intent_by_query_id[query_id]
+                    for query_id in item.source_queries
+                    if query_id in intent_by_query_id
+                }
+            )
             records.append(
                 item.model_copy(
                     update={
@@ -799,6 +1066,10 @@ def _compose_application_rag_bundles(
             qualifiers = dict(item.qualifiers)
             qualifiers["application_evidence_stage"] = str(stage)
             qualifiers["source_bundle_id"] = bundle.bundle_id
+            qualifiers["application_research_policy_id"] = stage_policy_id
+            qualifiers["application_research_policy_version"] = (
+                stage_policy_version
+            )
             claims.append(
                 item.model_copy(
                     update={

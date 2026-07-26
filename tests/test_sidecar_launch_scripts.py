@@ -164,6 +164,7 @@ def _run_powershell(*arguments: str, environ: dict[str, str] | None = None) -> s
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         timeout=30,
         check=False,
     )
@@ -576,7 +577,7 @@ def test_powershell_https_weight_binding_is_exact_and_fail_closed(tmp_path: Path
     )
     assert tampered.returncode != 0
     assert "Verified HTTPS weight bytes changed" in (
-        tampered.stdout + tampered.stderr
+        (tampered.stdout or "") + (tampered.stderr or "")
     )
 
 
@@ -594,7 +595,7 @@ def test_powershell_rejects_external_install_root_without_opt_in(tmp_path: Path)
         "-DryRun",
     )
     assert result.returncode != 0
-    assert "InstallRoot is outside the workspace" in (result.stdout + result.stderr)
+    assert "InstallRoot is outside the workspace" in ((result.stdout or "") + (result.stderr or ""))
 
 
 def test_powershell_has_explicit_wsl_delegation_for_linux_profiles() -> None:

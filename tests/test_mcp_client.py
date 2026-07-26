@@ -253,7 +253,75 @@ def test_mcp_contract_requires_adapter_fields_and_records_collection():
         "tool_name": "search_materials",
         "input_contract": "schema-validated",
         "output_contract": "schema-and-runtime-validated",
+        "required_record_fields": [],
     }
+
+
+def test_mcp_contract_requires_declared_stage_record_shape_when_published():
+    descriptor = _tool_descriptor()
+    input_properties = descriptor["inputSchema"]["properties"]
+    input_properties.update(
+        {
+            "stage": {"type": "string"},
+            "intent_id": {"type": "string"},
+        }
+    )
+    record_fields = (
+        "source_id",
+        "title",
+        "record_type",
+        "support_text",
+        "provenance",
+        "stage_metadata",
+    )
+    descriptor["outputSchema"]["properties"]["records"]["items"] = {
+        "type": "object",
+        "properties": {name: {} for name in record_fields},
+        "required": list(record_fields),
+        "additionalProperties": True,
+    }
+    session = Session()
+    session.responses[2] = Response(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [descriptor]},
+        }
+    )
+    client = StreamableHttpMcpClient(
+        "https://mcp.example/evidence",
+        session=session,
+    )
+    contract = client.require_tool_contract(
+        "search_materials",
+        accepted_arguments=("query", "stage", "intent_id"),
+        result_collection="records",
+        required_record_fields=record_fields,
+    )
+    assert contract["required_record_fields"] == list(record_fields)
+
+    descriptor["outputSchema"]["properties"]["records"]["items"][
+        "required"
+    ].remove("provenance")
+    session = Session()
+    session.responses[2] = Response(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [descriptor]},
+        }
+    )
+    client = StreamableHttpMcpClient(
+        "https://mcp.example/evidence",
+        session=session,
+    )
+    with pytest.raises(McpClientError, match="stage fields"):
+        client.require_tool_contract(
+            "search_materials",
+            accepted_arguments=("query", "stage", "intent_id"),
+            result_collection="records",
+            required_record_fields=record_fields,
+        )
 
 
 def test_mcp_literature_records_are_strict_and_source_grounded():

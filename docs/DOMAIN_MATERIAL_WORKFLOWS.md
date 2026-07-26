@@ -155,6 +155,14 @@ that has not been calculated remains in
 Every field uses the same ordered stages, but the questions, MCP capabilities,
 and final validators are extended by the selected profile.
 
+Each stage also owns a versioned set of five deterministic query intents and a
+different structured MCP record contract. The planner expands every required
+intent across that stage's allowed scholarly sources; it does not reuse a
+generic query list. Missing intent coverage degrades evidence to `partial` or
+`unknown` and never becomes negative evidence. The exact executable intent,
+input, record, provenance, and stage-metadata fields are documented in
+[MCP evidence sources for material RAG](MCP_RAG.md).
+
 Each stage request also preserves the code-validated `application_subtype` and
 the declared non-secret problem context. These values become bounded search
 constraints in the RAG/MCP prompt; they do not select a tool and do not become
@@ -415,6 +423,10 @@ humidity, and activation state.
   same-composition relative energies after unit normalization.
 - Preparing CIF, POSCAR, Quantum ESPRESSO, NEB, phonon, EPW, defect, or transport
   inputs is a handoff, not an executed result.
+- A specialist `completed` flag is insufficient. A property value is usable
+  only when its receipt matches the closed field/property/validator workflow
+  policy, exact method family and ID, required condition set, semantic output
+  roles, immutable artifacts, and every required scientific gate.
 - A field claim is allowed only after all properties marked
   `required_for_field_claim` have authoritative, condition-complete results and
   the profile's experimental boundary is stated.

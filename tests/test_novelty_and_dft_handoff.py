@@ -24,13 +24,16 @@ from discovery_os.dft_handoff import (
 from discovery_os.fusion_schemas import ContentArtifactRef
 from discovery_os.hashing import candidate_content_hash
 from discovery_os.novelty import (
+    CodStructureLookup,
     ExternalNoveltyOutcome,
     LIVE_MOVING_SNAPSHOT_UNPINNED,
     MaterialsProjectStructureLookup,
     NoveltyMatch,
     NoveltyStatus,
+    OptimadeStructureLookup,
     ProjectNoveltyIndex,
     StagedNoveltyAssessor,
+    build_external_novelty_lookups_from_environment,
     reserve_external_no_match_portfolio_slot,
     scientific_fingerprint,
 )
@@ -72,6 +75,47 @@ Direct
 0.0 0.0 0.0
 0.5 0.5 0.5
 """
+
+
+class _HttpResponse:
+    def __init__(
+        self,
+        *,
+        payload=None,
+        text: str | None = None,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
+        if text is None:
+            self.content = json.dumps(payload).encode("utf-8")
+            self.text = self.content.decode("utf-8")
+        else:
+            self.content = text.encode("utf-8")
+            self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("response is not JSON")
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if not 200 <= self.status_code < 300:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _SequenceSession:
+    def __init__(self, responses: list[_HttpResponse]) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def get(self, url: str, **kwargs):
+        self.calls.append((url, kwargs))
+        if not self.responses:
+            raise AssertionError("unexpected HTTP request")
+        return self.responses.pop(0)
 
 
 def _candidate(
@@ -200,6 +244,100 @@ def _fixture_crystal_assessment(
         strict_settings=strict,
         scaled_settings=scaled,
     )
+
+
+def _optimade_resource(
+    record_id: str = "fixture-structure-1",
+    *,
+    structure_features: list[str] | None = None,
+    include_payload: bool = True,
+) -> dict:
+    attributes = {
+        "immutable_id": f"fixture:{record_id}@1",
+        "last_modified": "2026-07-01T00:00:00Z",
+        "chemical_formula_reduced": "LiO",
+        "elements": ["Li", "O"],
+        "nelements": 2,
+        "nsites": 2,
+        "dimension_types": [1, 1, 1],
+        "nperiodic_dimensions": 3,
+        "structure_features": structure_features or [],
+        "assemblies": [],
+    }
+    if include_payload:
+        attributes.update(
+            {
+                "lattice_vectors": [
+                    [4.0, 0.0, 0.0],
+                    [0.0, 4.0, 0.0],
+                    [0.0, 0.0, 4.0],
+                ],
+                "cartesian_site_positions": [
+                    [0.0, 0.0, 0.0],
+                    [2.0, 2.0, 2.0],
+                ],
+                "species_at_sites": ["Li", "O"],
+                "species": [
+                    {
+                        "name": "Li",
+                        "chemical_symbols": ["Li"],
+                        "concentration": [1.0],
+                    },
+                    {
+                        "name": "O",
+                        "chemical_symbols": ["O"],
+                        "concentration": [1.0],
+                    },
+                ],
+            }
+        )
+    return {
+        "type": "structures",
+        "id": record_id,
+        "attributes": attributes,
+    }
+
+
+def _optimade_page(
+    data: list[dict],
+    *,
+    more_data_available: bool = False,
+    next_link: str | None = None,
+    include_database_version: bool = True,
+) -> dict:
+    database = (
+        {"id": "fixture-db", "version": "fixture-optimade-release-2026-07"}
+        if include_database_version
+        else {"id": "fixture-db"}
+    )
+    return {
+        "data": data,
+        "meta": {
+            "api_version": "1.3.0",
+            "query": {
+                "representation": (
+                    '/structures?filter=chemical_formula_reduced="LiO"'
+                )
+            },
+            "provider": {
+                "name": "Fixture provider",
+                "description": "Read-only fixture",
+                "prefix": "fixture",
+            },
+            "database": database,
+            "implementation": {
+                "name": "fixture-optimade",
+                "version": "1.0.0",
+            },
+            "time_stamp": "2026-07-26T00:00:00Z",
+            "data_returned": len(data),
+            "data_available": len(data),
+            "more_data_available": more_data_available,
+        },
+        "links": {"next": next_link},
+    }
+
+
 class _NoMatchLookup:
     provider_id = "fixture-database"
     client_version = "fixture-client-1.0"
@@ -220,6 +358,111 @@ class _NoMatchLookup:
             method="fixture-structure-match-v1",
             query_count=1,
         )
+
+
+def test_external_lookup_environment_builder_skips_blank_providers() -> None:
+    assert (
+        build_external_novelty_lookups_from_environment(
+            {
+                "MP_API_KEY": " ",
+                "OPTIMADE_API_URL": "",
+                "COD_API_URL": " ",
+                # Irrelevant controls are not parsed when no provider is enabled.
+                "EXTERNAL_NOVELTY_TIMEOUT_SECONDS": "not-a-number",
+            }
+        )
+        == []
+    )
+
+
+def test_external_lookup_environment_builder_constructs_fixed_provider_order() -> None:
+    optimade_session = _SequenceSession([])
+    cod_session = _SequenceSession([])
+    factory_calls: list[str] = []
+
+    def rester_factory(key: str):
+        factory_calls.append(key)
+        raise AssertionError("the environment builder must not open a provider")
+
+    lookups = build_external_novelty_lookups_from_environment(
+        {
+            "MP_API_KEY": "runtime-mp-secret",
+            "MP_DATABASE_VERSION_OR_RELEASE": "fixture-mp-release",
+            "OPTIMADE_API_URL": "https://optimade.example/api/v1.3.0",
+            "OPTIMADE_PROVIDER_ID": "optimade-fixture",
+            "OPTIMADE_DATABASE_VERSION_OR_RELEASE": "fixture-optimade-release",
+            "OPTIMADE_PAGE_LIMIT": "25",
+            "OPTIMADE_MAX_PAGES": "4",
+            "OPTIMADE_MAX_RECORDS": "80",
+            "COD_API_URL": "https://cod.example/cod",
+            "COD_DATABASE_VERSION_OR_RELEASE": "fixture-cod-release",
+            "COD_MAX_RECORDS": "60",
+            "COD_INCLUDE_THEORETICAL": "0",
+            "EXTERNAL_NOVELTY_TIMEOUT_SECONDS": "12.5",
+        },
+        mp_rester_factory=rester_factory,
+        optimade_session=optimade_session,
+        cod_session=cod_session,
+    )
+
+    assert [type(item) for item in lookups] == [
+        MaterialsProjectStructureLookup,
+        OptimadeStructureLookup,
+        CodStructureLookup,
+    ]
+    assert [item.provider_id for item in lookups] == [
+        "materials-project",
+        "optimade-fixture",
+        "cod",
+    ]
+    assert lookups[0].database_version_or_release == "fixture-mp-release"
+    assert lookups[1].database_version_or_release == "fixture-optimade-release"
+    assert lookups[1].page_limit == 25
+    assert lookups[1].max_pages == 4
+    assert lookups[1].max_records == 80
+    assert lookups[1].timeout_seconds == pytest.approx(12.5)
+    assert lookups[2].database_version_or_release == "fixture-cod-release"
+    assert lookups[2].max_records == 60
+    assert lookups[2].include_theoretical is False
+    assert lookups[2].timeout_seconds == pytest.approx(12.5)
+    assert factory_calls == []
+    assert optimade_session.calls == []
+    assert cod_session.calls == []
+
+
+@pytest.mark.parametrize(
+    ("environ", "message"),
+    [
+        (
+            {"OPTIMADE_API_URL": "https://optimade.example/api"},
+            "explicit versioned v1 base URL",
+        ),
+        (
+            {"COD_API_URL": "http://cod.example/cod"},
+            "require HTTPS",
+        ),
+        (
+            {
+                "COD_API_URL": "https://cod.example/cod",
+                "COD_INCLUDE_THEORETICAL": "maybe",
+            },
+            "must be '0' or '1'",
+        ),
+        (
+            {
+                "OPTIMADE_API_URL": "https://optimade.example/api/v1",
+                "OPTIMADE_MAX_PAGES": "many",
+            },
+            "must be an integer",
+        ),
+    ],
+)
+def test_external_lookup_environment_builder_fails_fast_for_malformed_provider(
+    environ: dict[str, str],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_external_novelty_lookups_from_environment(environ)
 
 
 def test_crystal_novelty_groups_reordered_and_supercell_batch_and_history() -> None:
@@ -408,6 +651,333 @@ def test_materials_project_structure_ids_are_preserved_as_external_matches(
     assert outcome.matcher_settings["remote_scaled_prefilter"]["scale"] is True
     assert outcome.matcher_settings["local_strict_recheck"]["scale"] is False
     assert outcome.similarity_findings == []
+
+
+def test_optimade_formula_prefilter_is_locally_strictly_rechecked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+    original_classifier = novelty_module.classify_crystal_structure_relation
+
+    def classify(candidate, remote):
+        calls.append((candidate, remote))
+        return original_classifier(candidate, remote)
+
+    monkeypatch.setattr(
+        novelty_module,
+        "classify_crystal_structure_relation",
+        classify,
+    )
+    session = _SequenceSession(
+        [_HttpResponse(payload=_optimade_page([_optimade_resource()]))]
+    )
+    lookup = OptimadeStructureLookup(
+        "https://fixture.example/optimade/v1",
+        provider_id="optimade-fixture",
+        database_version_or_release="fixture-optimade-release-2026-07",
+        client_version="fixture-http-1",
+        session=session,
+    )
+
+    outcome = lookup.lookup(_candidate("candidate-optimade-match"))
+
+    assert outcome.status == NoveltyStatus.MATCH
+    assert outcome.database_version_or_release == "fixture-optimade-release-2026-07"
+    assert outcome.query_count == 1
+    assert outcome.structure_match_count == 1
+    assert outcome.matches[0].source_id == "optimade-fixture"
+    assert outcome.matches[0].record_id == "fixture-structure-1"
+    assert outcome.matches[0].match_kind == "strict_material_duplicate"
+    assert outcome.matches[0].metadata["structure_payload_sha256"]
+    assert calls and calls[0][0] == CIF.strip()
+    request_url, request_kwargs = session.calls[0]
+    assert request_url.endswith("/v1/structures")
+    assert request_kwargs["params"]["filter"] == 'chemical_formula_reduced="LiO"'
+    receipt = outcome.matcher_settings["provider_receipt"]
+    assert receipt["pagination_complete"] is True
+    assert receipt["api_version"] == "1.3.0"
+    assert receipt["provider_prefix"] == "fixture"
+
+
+def test_optimade_requires_complete_pagination_and_database_version() -> None:
+    missing_next = _SequenceSession(
+        [
+            _HttpResponse(
+                payload=_optimade_page(
+                    [],
+                    more_data_available=True,
+                    next_link=None,
+                )
+            )
+        ]
+    )
+    incomplete = OptimadeStructureLookup(
+        "https://fixture.example/optimade/v1",
+        provider_id="optimade-incomplete",
+        database_version_or_release="fixture-optimade-release-2026-07",
+        session=missing_next,
+    ).lookup(_candidate("candidate-optimade-incomplete"))
+    assert incomplete.status == NoveltyStatus.UNKNOWN
+    assert "optimade_next_link_missing" in (incomplete.reason or "")
+    assert incomplete.matcher_settings["provider_receipt"]["pagination_complete"] is False
+
+    missing_version = _SequenceSession(
+        [
+            _HttpResponse(
+                payload=_optimade_page(
+                    [],
+                    include_database_version=False,
+                )
+            )
+        ]
+    )
+    unpinned = OptimadeStructureLookup(
+        "https://fixture.example/optimade/v1",
+        provider_id="optimade-unpinned",
+        session=missing_version,
+    ).lookup(_candidate("candidate-optimade-unpinned"))
+    assert unpinned.status == NoveltyStatus.UNKNOWN
+    assert "optimade_database_version_missing" in (unpinned.reason or "")
+    assert (
+        unpinned.database_version_or_release
+        == LIVE_MOVING_SNAPSHOT_UNPINNED
+    )
+
+
+@pytest.mark.parametrize(
+    ("resource", "expected_reason"),
+    [
+        (
+            _optimade_resource(include_payload=False),
+            "optimade_structure_payloads_not_all_strictly_resolved",
+        ),
+        (
+            _optimade_resource(structure_features=["disorder"]),
+            "optimade_structure_payloads_not_all_strictly_resolved",
+        ),
+    ],
+)
+def test_optimade_missing_or_disordered_structure_payload_is_unknown(
+    resource: dict,
+    expected_reason: str,
+) -> None:
+    outcome = OptimadeStructureLookup(
+        "https://fixture.example/optimade/v1",
+        provider_id="optimade-unsupported-payload",
+        database_version_or_release="fixture-optimade-release-2026-07",
+        session=_SequenceSession(
+            [_HttpResponse(payload=_optimade_page([resource]))]
+        ),
+    ).lookup(_candidate("candidate-optimade-payload"))
+
+    assert outcome.status == NoveltyStatus.UNKNOWN
+    assert outcome.reason == expected_reason
+    assert outcome.matches == []
+    assert len(outcome.similarity_findings) == 1
+    assert outcome.similarity_findings[0].metadata["hard_identity"] == "false"
+
+
+def test_external_lookup_rejects_partial_candidate_before_any_http_call() -> None:
+    partial_cif = CIF.replace(
+        "_atom_site_fract_z\n",
+        "_atom_site_fract_z\n_atom_site_occupancy\n",
+    ).replace(
+        "Li1 Li 0 0 0\n",
+        "Li1 Li 0 0 0 0.5\n",
+    ).replace(
+        "O1 O 0.5 0.5 0.5\n",
+        "O1 O 0.5 0.5 0.5 1.0\n",
+    )
+    candidate = _candidate("candidate-partial-occupancy", cif=partial_cif)
+    optimade_session = _SequenceSession([])
+    cod_session = _SequenceSession([])
+    mp_factory_calls: list[str] = []
+
+    def mp_factory(key: str):
+        mp_factory_calls.append(key)
+        raise AssertionError("partial candidate must fail before MP client creation")
+
+    materials_project = MaterialsProjectStructureLookup(
+        "runtime-secret",
+        rester_factory=mp_factory,
+    ).lookup(candidate)
+    optimade = OptimadeStructureLookup(
+        "https://fixture.example/optimade/v1",
+        provider_id="optimade-partial-candidate",
+        database_version_or_release="fixture-optimade-release-2026-07",
+        session=optimade_session,
+    ).lookup(candidate)
+    cod = CodStructureLookup(
+        base_url="https://cod.example/cod",
+        database_version_or_release="fixture-cod-release-2026-07",
+        session=cod_session,
+    ).lookup(candidate)
+
+    assert materials_project.status == NoveltyStatus.UNKNOWN
+    assert optimade.status == NoveltyStatus.UNKNOWN
+    assert cod.status == NoveltyStatus.UNKNOWN
+    assert "partial_occupancy" in (materials_project.reason or "")
+    assert "partial_occupancy" in (optimade.reason or "")
+    assert "partial_occupancy" in (cod.reason or "")
+    assert mp_factory_calls == []
+    assert optimade_session.calls == []
+    assert cod_session.calls == []
+
+
+def test_optimade_follows_same_provider_next_link_before_no_match() -> None:
+    session = _SequenceSession(
+        [
+            _HttpResponse(
+                payload=_optimade_page(
+                    [],
+                    more_data_available=True,
+                    next_link=(
+                        "https://fixture.example/optimade/v1/structures?"
+                        "page_offset=100"
+                    ),
+                )
+            ),
+            _HttpResponse(payload=_optimade_page([])),
+        ]
+    )
+    outcome = OptimadeStructureLookup(
+        "https://fixture.example/optimade/v1",
+        provider_id="optimade-paginated",
+        database_version_or_release="fixture-optimade-release-2026-07",
+        session=session,
+    ).lookup(_candidate("candidate-optimade-clear"))
+
+    assert outcome.status == NoveltyStatus.NO_MATCH
+    assert outcome.query_count == 2
+    assert len(session.calls) == 2
+    assert session.calls[1][1]["params"] is None
+    assert outcome.matcher_settings["provider_receipt"]["pagination_complete"] is True
+
+
+def test_cod_fetches_revision_pinned_cif_and_rechecks_locally() -> None:
+    session = _SequenceSession(
+        [
+            _HttpResponse(
+                payload=[
+                    {
+                        "file": "1000000",
+                        "svnrevision": "12",
+                        "formula": "Li O",
+                        "theoretical": "0",
+                    }
+                ],
+                headers={"ETag": '"fixture-search-etag"'},
+            ),
+            _HttpResponse(text=CIF),
+        ]
+    )
+    outcome = CodStructureLookup(
+        base_url="https://cod.example/cod",
+        database_version_or_release="fixture-cod-release-2026-07",
+        client_version="fixture-http-1",
+        session=session,
+    ).lookup(_candidate("candidate-cod-match"))
+
+    assert outcome.status == NoveltyStatus.MATCH
+    assert outcome.query_count == 2
+    assert outcome.matches[0].record_id == "1000000@12"
+    assert outcome.matches[0].match_kind == "strict_material_duplicate"
+    assert session.calls[0][0] == "https://cod.example/cod/result"
+    assert session.calls[0][1]["params"]["formula"] == "Li O"
+    assert session.calls[1][0] == "https://cod.example/cod/1000000.cif@12"
+    receipt = outcome.matcher_settings["provider_receipt"]
+    assert receipt["pagination_complete"] is True
+    assert receipt["cif_fetch_count"] == 1
+    assert receipt["etag"] == '"fixture-search-etag"'
+
+
+def test_cod_missing_snapshot_revision_or_structure_is_fail_closed() -> None:
+    unpinned = CodStructureLookup(
+        base_url="https://cod.example/cod",
+        session=_SequenceSession([_HttpResponse(payload=[])]),
+    ).lookup(_candidate("candidate-cod-unpinned"))
+    assert unpinned.status == NoveltyStatus.UNKNOWN
+    assert "cod_database_snapshot_unavailable" in (unpinned.reason or "")
+
+    session = _SequenceSession(
+        [_HttpResponse(payload=[{"file": "1000000", "formula": "Li O"}])]
+    )
+    missing_revision = CodStructureLookup(
+        base_url="https://cod.example/cod",
+        database_version_or_release="fixture-cod-release-2026-07",
+        session=session,
+    ).lookup(_candidate("candidate-cod-missing-revision"))
+    assert missing_revision.status == NoveltyStatus.UNKNOWN
+    assert missing_revision.reason == (
+        "cod_records_not_all_revision_pinned_and_strictly_resolved"
+    )
+    assert len(session.calls) == 1
+    assert missing_revision.similarity_findings[0].metadata["strict_recheck"] == (
+        "record_revision_missing"
+    )
+
+    partial_cif = CIF.replace(
+        "_atom_site_fract_z\n",
+        "_atom_site_fract_z\n_atom_site_occupancy\n",
+    ).replace(
+        "Li1 Li 0 0 0\n",
+        "Li1 Li 0 0 0 0.5\n",
+    ).replace(
+        "O1 O 0.5 0.5 0.5\n",
+        "O1 O 0.5 0.5 0.5 1.0\n",
+    )
+    partial_remote = CodStructureLookup(
+        base_url="https://cod.example/cod",
+        database_version_or_release="fixture-cod-release-2026-07",
+        session=_SequenceSession(
+            [
+                _HttpResponse(
+                    payload=[{"file": "1000001", "svnrevision": "7"}]
+                ),
+                _HttpResponse(text=partial_cif),
+            ]
+        ),
+    ).lookup(_candidate("candidate-cod-partial-remote"))
+    assert partial_remote.status == NoveltyStatus.UNKNOWN
+    assert "not_all_revision_pinned" in (partial_remote.reason or "")
+    assert "partial_or_disordered_structure" in (
+        partial_remote.similarity_findings[0].metadata["strict_recheck"]
+    )
+
+
+def test_real_provider_adapters_keep_aggregate_unknown_when_one_is_unresolved() -> None:
+    optimade = OptimadeStructureLookup(
+        "https://fixture.example/optimade/v1",
+        provider_id="optimade-unresolved",
+        session=_SequenceSession(
+            [
+                _HttpResponse(
+                    payload=_optimade_page(
+                        [],
+                        include_database_version=False,
+                    )
+                )
+            ]
+        ),
+    )
+    cod = CodStructureLookup(
+        base_url="https://cod.example/cod",
+        database_version_or_release="fixture-cod-release-2026-07",
+        session=_SequenceSession([_HttpResponse(payload=[])]),
+    )
+
+    stage = StagedNoveltyAssessor([optimade, cod]).assess(
+        [_candidate("candidate-provider-aggregate")],
+        project_history=ProjectNoveltyIndex(),
+    )[0].external_database
+
+    assert stage.status == NoveltyStatus.UNKNOWN
+    assert [item.provider_id for item in stage.provider_results] == [
+        "optimade-unresolved",
+        "cod",
+    ]
+    assert stage.provider_results[0].status == NoveltyStatus.UNKNOWN
+    assert stage.provider_results[1].status == NoveltyStatus.NO_MATCH
 
 
 def _external_outcome(
@@ -606,6 +1176,47 @@ def test_materials_project_unpinned_no_match_is_explicitly_qualified() -> None:
     assert outcome.database_version_or_release == LIVE_MOVING_SNAPSHOT_UNPINNED
     assert LIVE_MOVING_SNAPSHOT_UNPINNED in (outcome.reason or "")
     assert "not_reproducible" in (outcome.reason or "")
+
+
+def test_materials_project_partial_remote_structure_is_unresolved() -> None:
+    partial_cif = CIF.replace(
+        "_atom_site_fract_z\n",
+        "_atom_site_fract_z\n_atom_site_occupancy\n",
+    ).replace(
+        "Li1 Li 0 0 0\n",
+        "Li1 Li 0 0 0 0.5\n",
+    ).replace(
+        "O1 O 0.5 0.5 0.5\n",
+        "O1 O 0.5 0.5 0.5 1.0\n",
+    )
+
+    class Client:
+        db_version = "fixture-mp-release-2026-07"
+
+        def find_structure(self, *_args, **_kwargs):
+            return ["mp-partial"]
+
+        def get_material_ids(self, _formula):
+            return ["mp-partial"]
+
+        def get_structure_by_material_id(self, material_id):
+            assert material_id == "mp-partial"
+            return partial_cif
+
+        def close(self):
+            return None
+
+    outcome = MaterialsProjectStructureLookup(
+        "runtime-secret",
+        rester_factory=lambda _key: Client(),
+    ).lookup(_candidate("candidate-mp-partial-remote"))
+
+    assert outcome.status == NoveltyStatus.UNKNOWN
+    assert outcome.matches == []
+    assert outcome.similarity_findings[0].record_id == "mp-partial"
+    assert "remote_disorder_or_partial_occupancy_unsupported" in (
+        outcome.similarity_findings[0].metadata["strict_recheck"]
+    )
 
 
 def test_periodic_dft_handoff_writes_only_top_candidates_and_null_results(tmp_path) -> None:

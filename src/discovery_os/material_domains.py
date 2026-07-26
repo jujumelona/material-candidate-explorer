@@ -27,6 +27,11 @@ from .schemas import (
     StrictSchema,
 )
 from .hashing import stable_hash
+from .specialist_validation import (
+    SpecialistExecutionReceipt,
+    specialist_execution_receipt_sha256,
+)
+from .specialist_workflows import specialist_workflow_policy
 
 
 MaterialEvidenceStage = Literal[
@@ -79,11 +84,19 @@ class DomainValidatorSpec(StrictSchema):
         "control",
     ]
     can_create_property_scores: bool = False
+    property_score_policy: Literal[
+        "no-score-authority",
+        "execution-receipt-required",
+    ] = "no-score-authority"
     result_if_not_executed: Literal["unknown"] = "unknown"
 
     @model_validator(mode="after")
     def _score_authority_is_explicit(self) -> "DomainValidatorSpec":
         if self.can_create_property_scores:
+            if self.property_score_policy != "execution-receipt-required":
+                raise ValueError(
+                    "a score-producing domain validator must require an execution receipt"
+                )
             if not self.properties:
                 raise ValueError(
                     "a score-producing domain validator must declare its properties"
@@ -101,6 +114,10 @@ class DomainValidatorSpec(StrictSchema):
                 raise ValueError(
                     "generation-prior validators cannot create field-property scores"
                 )
+        elif self.property_score_policy != "no-score-authority":
+            raise ValueError(
+                "a non-scoring domain validator cannot declare property-score authority"
+            )
         return self
 
 
@@ -197,6 +214,24 @@ class MaterialFieldProfile(StrictSchema):
                 "required field properties need a named score-producing validator: "
                 + ", ".join(missing_score_authorities)
             )
+        for requirement in self.properties:
+            if not requirement.required_for_field_claim:
+                continue
+            validator_ids = [
+                validator.validator_id
+                for route in self.stage_routes
+                for validator in route.validators
+                if validator.can_create_property_scores
+                and requirement.property_name in validator.properties
+            ]
+            if not validator_ids:
+                continue
+            for validator_id in validator_ids:
+                specialist_workflow_policy(
+                    self.material_field,
+                    requirement.property_name,
+                    validator_id,
+                )
         return self
 
 
@@ -511,6 +546,11 @@ class MaterialPropertyObservation(StrictSchema):
     provenance_id: Identifier
     raw_artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     authority_kind: Literal["numerical_validator", "experimental_validator"]
+    execution_receipt: SpecialistExecutionReceipt | None = None
+    execution_receipt_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     literature_or_mcp_derived: Literal[False] = False
 
     @model_validator(mode="after")
@@ -524,6 +564,62 @@ class MaterialPropertyObservation(StrictSchema):
             raise ValueError("successful material property observation requires a value")
         if self.status != "success" and self.value is not None:
             raise ValueError("non-success property observation cannot expose a value")
+
+        if (self.execution_receipt is None) != (
+            self.execution_receipt_sha256 is None
+        ):
+            raise ValueError(
+                "execution receipt and execution_receipt_sha256 must be supplied together"
+            )
+        receipt = self.execution_receipt
+        if receipt is None:
+            if self.status == "success":
+                raise ValueError(
+                    "successful material property observation requires a bound execution receipt"
+                )
+            return self
+
+        expected_receipt_hash = specialist_execution_receipt_sha256(receipt)
+        if self.execution_receipt_sha256 != expected_receipt_hash:
+            raise ValueError(
+                "execution_receipt_sha256 does not match the bound execution receipt"
+            )
+        if receipt.candidate_id != self.candidate_id:
+            raise ValueError("execution receipt candidate_id does not match observation")
+        if receipt.material_field != self.material_field:
+            raise ValueError(
+                "execution receipt material_field does not match observation"
+            )
+        if receipt.validator_id != self.validator_id:
+            raise ValueError("execution receipt validator_id does not match observation")
+        if receipt.property_name != self.property_name:
+            raise ValueError("execution receipt property_name does not match observation")
+        if receipt.unit != self.unit:
+            raise ValueError("execution receipt unit does not match observation")
+        if stable_hash(receipt.conditions) != stable_hash(self.conditions):
+            raise ValueError("execution receipt conditions do not match observation")
+        if receipt.provenance_id != self.provenance_id:
+            raise ValueError("execution receipt provenance_id does not match observation")
+        expected_kind = (
+            "numerical_simulation"
+            if self.authority_kind == "numerical_validator"
+            else "experimental_measurement"
+        )
+        if receipt.execution_kind != expected_kind:
+            raise ValueError(
+                "execution receipt kind does not match observation authority_kind"
+            )
+        if (
+            receipt.primary_output_sha256 is not None
+            and receipt.primary_output_sha256 != self.raw_artifact_sha256
+        ):
+            raise ValueError(
+                "observation raw artifact is not the receipt primary output"
+            )
+        if self.status == "success" and not receipt.permits_property_value():
+            raise ValueError(
+                "execution receipt did not complete the required convergence or quality-control gate"
+            )
         return self
 
 
@@ -556,6 +652,35 @@ class MaterialPropertyDecision(StrictSchema):
         if self.status in {"unknown", "incomparable"} and self.accepted_observation_ids:
             raise ValueError("unknown/incomparable decisions cannot accept observations")
         return self
+
+
+def _has_usable_execution_receipt(
+    observation: MaterialPropertyObservation,
+) -> bool:
+    """Defense-in-depth for callers that bypass Pydantic model validation."""
+
+    receipt = observation.execution_receipt
+    if not isinstance(receipt, SpecialistExecutionReceipt):
+        return False
+    expected_kind = (
+        "numerical_simulation"
+        if observation.authority_kind == "numerical_validator"
+        else "experimental_measurement"
+    )
+    return bool(
+        observation.execution_receipt_sha256
+        == specialist_execution_receipt_sha256(receipt)
+        and receipt.candidate_id == observation.candidate_id
+        and receipt.material_field == observation.material_field
+        and receipt.validator_id == observation.validator_id
+        and receipt.property_name == observation.property_name
+        and receipt.unit == observation.unit
+        and stable_hash(receipt.conditions) == stable_hash(observation.conditions)
+        and receipt.provenance_id == observation.provenance_id
+        and receipt.execution_kind == expected_kind
+        and receipt.primary_output_sha256 == observation.raw_artifact_sha256
+        and receipt.permits_property_value()
+    )
 
 
 class MaterialFieldResultAssessment(StrictSchema):
@@ -677,6 +802,11 @@ def _validator(
         availability=availability,
         evidence_kind=evidence_kind,
         can_create_property_scores=scores,
+        property_score_policy=(
+            "execution-receipt-required"
+            if scores
+            else "no-score-authority"
+        ),
     )
 
 
@@ -2340,6 +2470,10 @@ def assess_material_field_results(
                 requirement.property_name,
                 set(),
             )
+            execution_receipt_usable = (
+                item.status != "success"
+                or _has_usable_execution_receipt(item)
+            )
             conditions_complete = all(
                 not _context_value_is_missing(item.conditions.get(name))
                 for name in requirement.required_context
@@ -2355,6 +2489,7 @@ def assess_material_field_results(
                 or item.unit != requirement.unit
                 or not conditions_complete
                 or not target_matches
+                or not execution_receipt_usable
             ):
                 rejected_ids.append(item.observation_id)
                 incomparable = True
@@ -2407,8 +2542,9 @@ def assess_material_field_results(
                 if incompatible_condition_sets
                 else (
                     "Available rows used an unapproved validator, incompatible "
-                    "unit, missing required condition, or a condition different "
-                    "from the requested target."
+                    "unit, missing required condition, a condition different "
+                    "from the requested target, or a missing/invalid execution "
+                    "receipt."
                 )
             )
         else:
