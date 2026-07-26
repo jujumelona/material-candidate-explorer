@@ -97,6 +97,7 @@ from .material_decision_runner import (
     MaterialDecisionRun,
     MaterialDecisionRunner,
 )
+from .rich_report import format_material_candidate_markdown_report
 from .material_recommendation import (
     CandidateCriterionResult,
     MaterialApplicationCandidate,
@@ -863,7 +864,30 @@ def _material_fusion_search(args: argparse.Namespace) -> int:
         brief=brief,
         request=request,
     )
-    print(persisted.model_dump_json(indent=2))
+def _material_goal_run(args: argparse.Namespace) -> int:
+    runner = MaterialDecisionRunner(artifact_root=args.artifacts)
+    run, reports = runner.run_material_goal_discovery(
+        args.goal,
+        run_rag=not args.no_rag,
+    )
+    print(f"Executed Material Discovery Goal Run: {run.run_id}")
+    print(f"Domain: {run.brief.material_field}")
+    print(f"Discovered {len(reports)} rich candidate report(s).")
+    for idx, report in enumerate(reports, 1):
+        print(f"\n--- Candidate #{idx}: {report.formula} ({report.target_role}) ---")
+        md_content = format_material_candidate_markdown_report(report)
+        if args.export_markdown:
+            p = Path(args.export_markdown)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(md_content, encoding="utf-8")
+            print(f"Exported Markdown report to: {p}")
+        if args.export_json:
+            p = Path(args.export_json)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+            print(f"Exported JSON report to: {p}")
+        if not args.export_markdown and not args.export_json:
+            print(md_content)
     return 0
 
 
@@ -1261,6 +1285,18 @@ def make_parser() -> argparse.ArgumentParser:
         default=".discovery/fusion",
     )
     material_fusion_search.set_defaults(handler=_material_fusion_search)
+
+    material_goal_run = subparsers.add_parser(
+        "material-goal-run",
+        help="execute natural-language material goal discovery and output rich standardized candidate reports",
+    )
+    material_goal_run.add_argument("--goal", required=True, help="natural-language material goal request")
+    material_goal_run.add_argument("--artifacts", default=".discovery/goals", help="artifact output root directory")
+    material_goal_run.add_argument("--no-rag", action="store_true", help="disable automatic literature RAG stage execution")
+    material_goal_run.add_argument("--export-markdown", help="export Markdown report to file path")
+    material_goal_run.add_argument("--export-json", help="export JSON report to file path")
+    material_goal_run.set_defaults(handler=_material_goal_run)
+
     return parser
 
 

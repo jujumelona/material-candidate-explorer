@@ -46,6 +46,17 @@ from .dft_handoff import (
     PortablePeriodicDFTInputBackend,
     UncalculatedPeriodicProperties,
 )
+from .rich_report import (
+    CrystallographicIdentityDetails,
+    DatabaseNoveltyCheckSummary,
+    DftHandoffSpecSummary,
+    EvaluatedPropertiesSummary,
+    MultiExpertReliabilitySummary,
+    RichMaterialCandidateReport,
+    StageLiteratureEvidenceSummary,
+    build_rich_candidate_report,
+    format_material_candidate_markdown_report,
+)
 from .configured_fusion import (
     build_fusion_backend_from_environment,
     build_generator_from_environment,
@@ -576,6 +587,15 @@ __all__ = [
     "specialist_workflow_policy",
     "specialist_workflow_policy_sha256",
     "validate_specialist_policy_coverage",
+    "RichMaterialCandidateReport",
+    "CrystallographicIdentityDetails",
+    "EvaluatedPropertiesSummary",
+    "MultiExpertReliabilitySummary",
+    "DatabaseNoveltyCheckSummary",
+    "StageLiteratureEvidenceSummary",
+    "DftHandoffSpecSummary",
+    "build_rich_candidate_report",
+    "format_material_candidate_markdown_report",
     "stage_research_policy",
     "validate_crystal_geometry",
     "__version__",
